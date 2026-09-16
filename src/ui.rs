@@ -31,6 +31,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if app.active().pending_diff.is_some() {
         render_diff_modal(f, app);
     }
+    if app.mode == Mode::Picker {
+        render_picker_modal(f, app);
+    }
 }
 
 fn render_tabs(f: &mut Frame, app: &App, area: Rect) {
@@ -40,7 +43,7 @@ fn render_tabs(f: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(i, s)| {
             let dot = if s.busy { "● " } else { "○ " };
-            let label = format!("{}{} ({})", dot, s.name, i + 1);
+            let label = format!("{}{}:{} ({})", dot, s.name, s.backend.label(), i + 1);
             Line::from(label)
         })
         .collect();
@@ -58,24 +61,43 @@ fn render_tabs(f: &mut Frame, app: &App, area: Rect) {
 fn render_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     let width = area.width.max(1) as usize;
     app.viewport_height = area.height.max(1) as usize;
-    let s = app.active();
-    let end = (s.scroll + app.viewport_height).min(s.lines.len());
-    let items: Vec<ListItem> = s.lines[s.scroll.min(s.lines.len())..end]
-        .iter()
-        .map(|l| {
-            let t: String = l.chars().take(width).collect();
-            let style = if l.starts_with('>') {
-                Style::default().fg(Color::Cyan)
-            } else if l.starts_with("mock: approved") {
-                Style::default().fg(Color::Green)
-            } else if l.starts_with("mock: ") {
-                Style::default().fg(Color::DarkGray)
-            } else {
-                Style::default()
-            };
-            ListItem::new(Line::from(Span::styled(t, style)))
-        })
-        .collect();
+    app.viewport_width = width;
+    let vh = app.viewport_height;
+    let s = app.active_mut();
+    s.ensure_cache(width);
+    // Walk the height cache to the first visible row (grok-build-style
+    // virtualized window: only visible rows are laid out, never the tail).
+    let mut li = 0usize;
+    let mut consumed = 0usize;
+    while li < s.lines.len() && consumed + s.row_cache[li] <= s.scroll {
+        consumed += s.row_cache[li];
+        li += 1;
+    }
+    let mut sub = s.scroll.saturating_sub(consumed);
+    let mut items = Vec::new();
+    while items.len() < vh && li < s.lines.len() {
+        let line = &s.lines[li];
+        let style = if line.starts_with('>') {
+            Style::default().fg(Color::Cyan)
+        } else if line.starts_with("mock: approved") || line.starts_with("muse: approved") {
+            Style::default().fg(Color::Green)
+        } else if line.starts_with("mock: ") || line.starts_with("muse: ") {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default()
+        };
+        for chunk in crate::app::Session::wrap_line(line, width).iter().skip(sub) {
+            items.push(ListItem::new(Line::from(Span::styled(
+                chunk.clone(),
+                style,
+            ))));
+            if items.len() >= vh {
+                break;
+            }
+        }
+        li += 1;
+        sub = 0;
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" {} transcript ", s.name));
@@ -84,12 +106,13 @@ fn render_transcript(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
     let s = app.active();
-    let total = s.lines.len();
+    let total = s.total_rows;
     let state = if s.busy { "BUSY" } else { "idle" };
     let mode_color = match app.mode {
         Mode::Normal => Color::Green,
         Mode::Insert => Color::Yellow,
         Mode::Search => Color::Magenta,
+        Mode::Picker => Color::Cyan,
     };
     let line = Line::from(vec![
         Span::styled(
@@ -116,9 +139,10 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_input(f: &mut Frame, app: &mut App, area: Rect) {
     let (title, content) = match app.mode {
-        Mode::Normal => (" input — NORMAL (i/a type, / search, 1-3 tabs) ", app.active().input.clone()),
+        Mode::Normal => (" input — NORMAL (i/a type, / search, P provider, 1-3 tabs) ", app.active().input.clone()),
         Mode::Insert => (" input — INSERT (Esc done, Enter send) ", app.active().input.clone()),
         Mode::Search => (" search — (Enter find, Esc cancel) ", format!("/{}", app.search_input)),
+        Mode::Picker => (" provider — (j/k move, Enter switch, 1-3 quick, Esc cancel) ", String::new()),
     };
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
@@ -147,6 +171,37 @@ fn render_diff_modal(f: &mut Frame, app: &App) {
         .style(Style::default().bg(Color::Black));
     f.render_widget(
         Paragraph::new(text).block(block).wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_picker_modal(f: &mut Frame, app: &App) {
+    use crate::app::BackendKind;
+    let area = centered(f.area(), 60, 40);
+    f.render_widget(Clear, area);
+    let cur = app.sessions[app.active].backend;
+    let lines: Vec<Line> = BackendKind::ALL
+        .iter()
+        .enumerate()
+        .map(|(i, (b, desc))| {
+            let cursor = if i == app.picker_sel { "> " } else { "  " };
+            let here = if *b == cur { " (current)" } else { "" };
+            let style = if i == app.picker_sel {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(
+                format!("{cursor}{}: {desc}{here}", i + 1),
+                style,
+            ))
+        })
+        .collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" PROVIDER — switch starts a fresh session ");
+    f.render_widget(
+        Paragraph::new(lines).block(block).wrap(Wrap { trim: false }),
         area,
     );
 }

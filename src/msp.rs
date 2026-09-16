@@ -31,6 +31,9 @@ impl std::error::Error for RpcError {}
 #[derive(Debug)]
 pub enum ServerMsg {
     Notif { method: String, params: Value },
+    /// Server→client request (e.g. Codex approvals): must be answered with
+    /// [`Host::respond`]; the id space is the server's own.
+    Request { id: Value, method: String, params: Value },
     /// Transport/parse failure or an id-less error frame.
     Transport(String),
 }
@@ -111,6 +114,18 @@ impl Host {
         }))
     }
 
+    /// Answer a server→client request (Codex approvals).
+    pub async fn respond(&self, id: Value, result: Value) -> Result<(), RpcError> {
+        let frame = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result});
+        let mut w = self.writer.lock().await;
+        w.write_all(format!("{frame}\n").as_bytes())
+            .await
+            .map_err(|e| RpcError {
+                code: -32000,
+                message: format!("serve write: {e}"),
+            })
+    }
+
     pub async fn notify(&self, method: &str) {
         let frame = serde_json::json!({"jsonrpc": "2.0", "method": method});
         let mut w = self.writer.lock().await;
@@ -149,12 +164,20 @@ async fn route_line(
     };
     if let Some(method) = v.get("method").and_then(|m| m.as_str()) {
         let params = v.get("params").cloned().unwrap_or(Value::Null);
-        let _ = events_tx
-            .send(ServerMsg::Notif {
+        // A method frame WITH an id is a server→client request (Codex
+        // approvals); without one it is a plain notification.
+        let msg = match v.get("id") {
+            Some(id) if !id.is_null() => ServerMsg::Request {
+                id: id.clone(),
                 method: method.to_string(),
                 params,
-            })
-            .await;
+            },
+            _ => ServerMsg::Notif {
+                method: method.to_string(),
+                params,
+            },
+        };
+        let _ = events_tx.send(msg).await;
         return;
     }
     if let Some(id) = v.get("id").and_then(|i| i.as_u64()) {

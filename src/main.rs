@@ -4,11 +4,14 @@
 //! approval/requested to the diff modal, turn/completed to the bell).
 //! Select via `~/.config/polyforge/config.toml` (`[polyforge] provider`).
 
+mod agy;
 mod app;
+mod codex;
 mod config;
 mod mock;
 mod msp;
 mod provider;
+mod store;
 mod ui;
 
 use std::io::{self, Write};
@@ -23,10 +26,18 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc;
 
-use app::{App, BackendKind, Mode, OutboxDecide};
+use agy::{agy_submit, apply_agy_notif, spawn_agy, AgyHandle};
+use app::{App, BackendKind, DecisionKind, Mode, OutboxDecide};
 use config::Config;
 use msp::ServerMsg;
-use provider::{DecisionKind, map_decision, muse_bringup, muse_decide, muse_submit};
+use codex::{
+    apply_codex_approval, apply_codex_notif, codex_bringup, codex_respond,
+    codex_resume_thread, codex_start_thread, map_codex_decision,
+};
+use provider::{
+    map_decision, muse_bringup, muse_decide, muse_resume_session, muse_start_session,
+    muse_submit,
+};
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -50,9 +61,257 @@ async fn main() -> io::Result<()> {
     res
 }
 
-struct MuseCtx {
+struct LiveBackend {
     host: msp::Host,
     rx: mpsc::Receiver<ServerMsg>,
+}
+
+#[derive(Default)]
+struct Backends {
+    muse: Option<LiveBackend>,
+    codex: Option<LiveBackend>,
+    /// One agy child per tab (each holds its own conversation).
+    agy: Vec<Option<AgyHandle>>,
+}
+
+impl Backends {
+    fn get(&self, kind: BackendKind) -> Option<&LiveBackend> {
+        match kind {
+            BackendKind::Muse => self.muse.as_ref(),
+            BackendKind::Codex => self.codex.as_ref(),
+            BackendKind::Mock | BackendKind::Agy => None,
+        }
+    }
+}
+
+/// Mark every tab of `kind` degraded with the exact fix (spec Q9 grey-out).
+fn grey_out(app: &mut App, kind: BackendKind, reason: &str) {
+    let tag = kind.label();
+    for s in &mut app.sessions {
+        if s.backend == kind {
+            s.tab_degraded = Some(reason.to_string());
+            s.push_line(format!("{tag}: {reason}"));
+        }
+    }
+    app.flash = format!("{tag}: {reason}");
+}
+
+/// Bring up the serve/app-server host for `kind` if not running.
+async fn ensure_host(backends: &mut Backends, kind: BackendKind, cfg: &Config) -> Result<(), String> {
+    let present = match kind {
+        BackendKind::Muse => backends.muse.is_some(),
+        BackendKind::Codex => backends.codex.is_some(),
+        // Agy children are per-tab (see open_tab_session); nothing shared.
+        BackendKind::Agy | BackendKind::Mock => true,
+    };
+    if present {
+        return Ok(());
+    }
+    let (tx, rx) = mpsc::channel(256);
+    match kind {
+        BackendKind::Muse => {
+            let (host, ids, degraded) = muse_bringup(
+                &cfg.muse_bin(),
+                0,
+                cfg.muse_provider_id(),
+                cfg.muse_cfg.model.clone(),
+                cfg.workspace_root(),
+                vec![],
+                tx,
+            )
+            .await?;
+            let _ = (ids, degraded);
+            backends.muse = Some(LiveBackend { host, rx });
+            Ok(())
+        }
+        BackendKind::Codex => {
+            let (host, ids, degraded) = codex_bringup(
+                &cfg.codex_bin(),
+                0,
+                cfg.codex_model(),
+                cfg.workspace_root(),
+                vec![],
+                tx,
+            )
+            .await?;
+            let _ = (ids, degraded);
+            backends.codex = Some(LiveBackend { host, rx });
+            Ok(())
+        }
+        // Agy is unreachable here (the respawn drain routes it to
+        // open_tab_session first); keep the total match honest.
+        BackendKind::Agy | BackendKind::Mock => Ok(()),
+    }
+}
+
+/// Spawn (or replace) the agy child for one tab. The conversation id
+/// arrives later via the init event.
+async fn ensure_agy_tab(
+    backends: &mut Backends,
+    tab: usize,
+    cfg: &Config,
+    events_tx: &mpsc::Sender<ServerMsg>,
+    resume: Option<String>,
+) -> Result<(), String> {
+    if backends.agy.len() <= tab {
+        backends.agy.resize_with(tab + 1, || None);
+    }
+    if backends.agy[tab].is_some() {
+        return Ok(());
+    }
+    let mut args = vec![
+        "--input-format".to_string(),
+        "stream-json".to_string(),
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+    ];
+    if let Some(m) = cfg.agy_cfg.model.clone() {
+        args.push("--model".to_string());
+        args.push(m);
+    }
+    if let Some(a) = cfg.agy_cfg.agent.clone() {
+        args.push("--agent".to_string());
+        args.push(a);
+    }
+    if let Some(id) = resume {
+        args.push("--conversation".to_string());
+        args.push(id);
+    }
+    match spawn_agy(&cfg.agy_bin(), &args, &cfg.workspace_root(), events_tx.clone()).await
+    {
+        Ok(h) => {
+            backends.agy[tab] = Some(h);
+            Ok(())
+        }
+        Err(e) => Err(format!("could not spawn `agy`: {e}")),
+    }
+}
+
+/// Open (or re-open) the remote session for one tab. Mock tabs need nothing.
+/// A stored remote id resumes the previous session (Q10); a failed resume
+/// falls back to a fresh session and says so. Failures grey out just this
+/// tab with the exact fix.
+async fn open_tab_session(
+    backends: &mut Backends,
+    app: &mut App,
+    tab: usize,
+    cfg: &Config,
+    agy_tx: &mpsc::Sender<ServerMsg>,
+) {
+    let (backend, workspace) = (app.sessions[tab].backend, cfg.workspace_root());
+    // Resume candidate from the store; cleared so a stale id never lingers.
+    let resume = app.sessions[tab].remote_id.clone();
+    let s = &mut app.sessions[tab];
+    s.remote_id = None;
+    s.tab_degraded = None;
+    let tag = backend.label();
+    let fail = |app: &mut App, reason: &str| {
+        let s = &mut app.sessions[tab];
+        s.tab_degraded = Some(reason.to_string());
+        s.push_line(format!("{tag}: {reason}"));
+        app.flash = format!("{tag}: {reason}");
+    };
+    // Record the outcome for the next boot.
+    let opened = |app: &mut App, id: String, resumed: bool| {
+        let s = &mut app.sessions[tab];
+        s.remote_id = Some(id);
+        if resumed {
+            s.push_line(format!("{tag}: resumed previous session"));
+        }
+        app.save_tab_meta(tab);
+    };
+    match backend {
+        BackendKind::Mock => app.save_tab_meta(tab),
+        BackendKind::Muse => {
+            let Some(ctx) = backends.get(backend) else {
+                fail(app, "host not running — press P to respawn");
+                return;
+            };
+            let fresh = || {
+                muse_start_session(
+                    &ctx.host,
+                    cfg.muse_provider_id(),
+                    cfg.muse_cfg.model.clone(),
+                    workspace.clone(),
+                )
+            };
+            match resume {
+                Some(old) => match muse_resume_session(&ctx.host, &old).await {
+                    Ok(id) => opened(app, id, true),
+                    Err(rerr) => match fresh().await {
+                        Ok(id) => {
+                            let s = &mut app.sessions[tab];
+                            s.push_line(format!("{tag}: resume failed ({rerr}) — started fresh"));
+                            opened(app, id, false);
+                        }
+                        Err(e) => fail(app, &e),
+                    },
+                },
+                None => match fresh().await {
+                    Ok(id) => opened(app, id, false),
+                    Err(e) => fail(app, &e),
+                },
+            }
+        }
+        BackendKind::Codex => {
+            let Some(ctx) = backends.get(backend) else {
+                fail(app, "host not running — press P to respawn");
+                return;
+            };
+            match resume {
+                Some(old) => match codex_resume_thread(&ctx.host, &old).await {
+                    Ok(id) => opened(app, id, true),
+                    Err(rerr) => {
+                        match codex_start_thread(&ctx.host, cfg.codex_model(), workspace).await {
+                            Ok(id) => {
+                                let s = &mut app.sessions[tab];
+                                s.push_line(format!(
+                                    "{tag}: resume failed ({rerr}) — started fresh"
+                                ));
+                                opened(app, id, false);
+                            }
+                            Err(e) => fail(app, &e),
+                        }
+                    }
+                },
+                None => match codex_start_thread(&ctx.host, cfg.codex_model(), workspace).await {
+                    Ok(id) => opened(app, id, false),
+                    Err(e) => fail(app, &e),
+                },
+            }
+        }
+        BackendKind::Agy => {
+            // A fresh child per switch: kill the old conversation first.
+            // A stored conversation id is passed through for continuation.
+            if backends.agy.len() > tab {
+                if let Some(old) = backends.agy[tab].take() {
+                    old.shutdown().await;
+                }
+            }
+            app.sessions[tab].pending_agy_init = false;
+            // Keep expected resume id so init can match by conversation_id.
+            if let Some(ref id) = resume {
+                app.sessions[tab].remote_id = Some(id.clone());
+                app.sessions[tab]
+                    .push_line(format!("{tag}: continuing previous conversation"));
+            }
+            let had_resume = resume.is_some();
+            match ensure_agy_tab(backends, tab, cfg, agy_tx, resume).await {
+                Ok(()) => {
+                    app.sessions[tab].pending_agy_init = true;
+                    // Resume tabs match by conversation_id; only fresh
+                    // spawns claim a FIFO slot.
+                    if !had_resume {
+                        app.agy_init_fifo.push_back(tab);
+                    }
+                }
+                Err(e) => {
+                    app.sessions[tab].remote_id = None;
+                    fail(app, &e);
+                }
+            }
+        }
+    }
 }
 
 async fn run(
@@ -60,47 +319,42 @@ async fn run(
     app: &mut App,
     cfg: &Config,
 ) -> io::Result<()> {
-    let use_muse = cfg.polyforge.provider == "muse";
-    app.backend = if use_muse {
-        BackendKind::Muse
+    let def = cfg.default_backend();
+    // Q10 resume: restore each tab's backend + transcript from the store
+    // before any bringup, so open_tab_session can re-attach the remote
+    // session it records. Storageless falls back to the configured default.
+    if let Some(store) = store::Store::open() {
+        app.store = Some(store);
+        for tab in 0..app.sessions.len() {
+            app.restore_tab(tab, def);
+        }
     } else {
-        BackendKind::Mock
-    };
+        for s in &mut app.sessions {
+            s.backend = def;
+        }
+    }
 
-    let mut muse: Option<MuseCtx> = None;
-    if use_muse {
-        let (tx, rx) = mpsc::channel(256);
-        let tabs = app.sessions.len();
-        match muse_bringup(
-            &cfg.muse_bin(),
-            tabs,
-            cfg.muse_provider_id(),
-            cfg.muse_cfg.model.clone(),
-            cfg.workspace_root(),
-            vec![],
-            tx,
-        )
-        .await
-        {
-            Ok((host, ids, degraded)) => {
-                app.muse_sessions = ids;
-                if let Some(d) = degraded.clone() {
-                    app.muse_degraded = Some(d.clone());
-                    for s in &mut app.sessions {
-                        s.push_line(format!("muse: {d}"));
-                    }
-                    app.flash = d;
-                }
-                muse = Some(MuseCtx { host, rx });
-            }
-            Err(e) => {
-                app.muse_degraded = Some(e.clone());
-                for s in &mut app.sessions {
-                    s.push_line(format!("muse: {e}"));
-                }
-                app.flash = e;
+    let mut backends = Backends::default();
+    // One shared channel for all agy tab children.
+    let (agy_tx, mut agy_rx) = mpsc::channel::<ServerMsg>(256);
+    // Bring up every Muse/Codex host actually needed after restore (not just
+    // the configured default). Grey-out only the backends whose ensure fails.
+    for kind in App::backends_needed(&app.sessions) {
+        if matches!(kind, BackendKind::Muse | BackendKind::Codex) {
+            if let Err(e) = ensure_host(&mut backends, kind, cfg).await {
+                grey_out(app, kind, &e);
             }
         }
+    }
+    for tab in 0..app.sessions.len() {
+        let kind = app.sessions[tab].backend;
+        // Host already greyed out: skip so we don't clobber the ensure error.
+        if matches!(kind, BackendKind::Muse | BackendKind::Codex)
+            && backends.get(kind).is_none()
+        {
+            continue;
+        }
+        open_tab_session(&mut backends, app, tab, cfg, &agy_tx).await;
     }
 
     // Crossterm reads block; isolate them on a thread, forward as messages.
@@ -120,10 +374,13 @@ async fn run(
 
     // Render is the most expensive thing this loop does (full-screen redraw
     // through tmux, 20x/sec unconditionally, is what "feels slow"). Draw
-    // only when state actually changed, and batch bursty server messages
-    // into a single frame.
+    // only when state actually changed, batch bursty server messages into a
+    // single frame, and cap the paint rate grok-build-style (16ms min draw
+    // interval ≈ 60fps; skipped frames stay dirty and land on a later tick).
+    const MIN_DRAW: Duration = Duration::from_millis(16);
     let mut ticker = tokio::time::interval(Duration::from_millis(50));
     let mut dirty = true;
+    let mut last_draw: Option<std::time::Instant> = None;
     terminal.draw(|f| ui::render(f, app))?;
     loop {
         tokio::select! {
@@ -151,30 +408,30 @@ async fn run(
                 }
                 apply_mouse_capture(app)?;
             }
-            msg = async {
-                match &mut muse {
-                    Some(ctx) => ctx.rx.recv().await,
-                    None => std::future::pending().await,
+            muse_msg = backend_msg(&mut backends.muse) => {
+                let had = muse_msg.is_some();
+                if backend_frame(app, BackendKind::Muse, &mut backends.muse, muse_msg) {
+                    ring_bell();
                 }
-            } => {
-                if let Some(msg) = msg {
-                    let mut bell = false;
-                    let mut first = Some(msg);
-                    // Drain the whole burst: one frame per batch, not per delta.
-                    loop {
-                        let next = first.take().or_else(|| {
-                            muse.as_mut().and_then(|ctx| ctx.rx.try_recv().ok())
-                        });
-                        let Some(m) = next else { break };
-                        match m {
-                            ServerMsg::Notif { method, params } => {
-                                let tab = tab_for_session(app, &params).unwrap_or(app.active);
-                                bell |= provider::apply_notif(app, tab, &method, &params);
-                            }
-                            ServerMsg::Transport(e) => {
-                                app.flash = format!("muse: {e}");
-                            }
-                        }
+                if had {
+                    dirty = true;
+                }
+            }
+            codex_msg = backend_msg(&mut backends.codex) => {
+                let had = codex_msg.is_some();
+                if backend_frame(app, BackendKind::Codex, &mut backends.codex, codex_msg) {
+                    ring_bell();
+                }
+                if had {
+                    dirty = true;
+                }
+            }
+            agy_msg = agy_rx.recv() => {
+                if let Some(msg) = agy_msg {
+                    // Agy children share one channel; drain the burst.
+                    let mut bell = handle_server_msg(app, BackendKind::Agy, msg);
+                    while let Ok(m) = agy_rx.try_recv() {
+                        bell |= handle_server_msg(app, BackendKind::Agy, m);
                     }
                     if bell {
                         ring_bell();
@@ -184,8 +441,7 @@ async fn run(
             }
             _ = ticker.tick() => {
                 // Mock streaming only; an idle TUI paints nothing.
-                if app.backend == BackendKind::Mock
-                    && app.sessions.iter().any(|s| s.busy)
+                if app.sessions.iter().any(|s| s.backend == BackendKind::Mock && s.busy)
                 {
                     if let Some(tab) = app.tick() {
                         ring_bell();
@@ -195,29 +451,143 @@ async fn run(
                 }
             }
         }
-        if drain_outbox(app, muse.as_ref()).await {
+        if drain_outbox(app, &mut backends, cfg, &agy_tx).await {
             dirty = true;
         }
-        if dirty {
+        // Persist transcript lines toward disk (free when buffers are empty).
+        app.flush_store();
+        let due = last_draw.map(|t| t.elapsed() >= MIN_DRAW).unwrap_or(true);
+        if dirty && due {
             terminal.draw(|f| ui::render(f, app))?;
+            last_draw = Some(std::time::Instant::now());
             dirty = false;
         }
         if app.should_quit {
             break;
         }
     }
-    if let Some(ctx) = muse {
+    if let Some(ctx) = backends.muse {
         ctx.host.shutdown().await;
+    }
+    if let Some(ctx) = backends.codex {
+        ctx.host.shutdown().await;
+    }
+    for slot in backends.agy.iter_mut() {
+        if let Some(h) = slot.take() {
+            h.shutdown().await;
+        }
     }
     Ok(())
 }
 
-/// Route a notification to the tab whose muse session it names.
-fn tab_for_session(app: &App, params: &serde_json::Value) -> Option<usize> {
-    let sid = params.get("sessionId")?.as_str()?;
-    app.muse_sessions
-        .iter()
-        .position(|o| o.as_deref() == Some(sid))
+/// Await one server frame, or park forever when the backend is down.
+async fn backend_msg(slot: &mut Option<LiveBackend>) -> Option<ServerMsg> {
+    match slot {
+        Some(ctx) => ctx.rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Apply one frame plus any burst queued behind it. Returns bell.
+fn backend_frame(
+    app: &mut App,
+    kind: BackendKind,
+    slot: &mut Option<LiveBackend>,
+    first: Option<ServerMsg>,
+) -> bool {
+    let Some(msg) = first else { return false };
+    let mut bell = false;
+    let mut next = Some(msg);
+    // Drain the whole burst: one frame per batch, not per delta.
+    loop {
+        let m = match next.take() {
+            Some(m) => m,
+            None => match slot.as_mut().and_then(|ctx| ctx.rx.try_recv().ok()) {
+                Some(m) => m,
+                None => break,
+            },
+        };
+        bell |= handle_server_msg(app, kind, m);
+    }
+    bell
+}
+
+fn handle_server_msg(app: &mut App, kind: BackendKind, msg: ServerMsg) -> bool {
+    let tag = kind.label();
+    match msg {
+        ServerMsg::Notif { method, params } => {
+            let tab = match (kind, method.as_str()) {
+                // Prefer conversation_id match (resume), else spawn-order
+                // FIFO, else the sole waiting agy tab.
+                (BackendKind::Agy, "agy/init") => tab_for_session(app, kind, &params)
+                    .or_else(|| {
+                        while let Some(t) = app.agy_init_fifo.pop_front() {
+                            if app
+                                .sessions
+                                .get(t)
+                                .is_some_and(|s| s.backend == BackendKind::Agy && s.pending_agy_init)
+                            {
+                                return Some(t);
+                            }
+                        }
+                        None
+                    })
+                    .or_else(|| {
+                        let waiting: Vec<usize> = app
+                            .sessions
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, s)| {
+                                s.backend == BackendKind::Agy && s.remote_id.is_none()
+                            })
+                            .map(|(i, _)| i)
+                            .collect();
+                        (waiting.len() == 1).then_some(waiting[0])
+                    })
+                    .unwrap_or(app.active),
+                _ => tab_for_session(app, kind, &params).unwrap_or(app.active),
+            };
+            match kind {
+                BackendKind::Muse => provider::apply_notif(app, tab, &method, &params),
+                BackendKind::Codex => apply_codex_notif(app, tab, &method, &params),
+                BackendKind::Agy => apply_agy_notif(app, tab, &method, &params),
+                BackendKind::Mock => false,
+            }
+        }
+        ServerMsg::Request { id, method, params } => match kind {
+            BackendKind::Codex => {
+                let tab = tab_for_session(app, kind, &params).unwrap_or(app.active);
+                apply_codex_approval(app, tab, &method, id, &params)
+            }
+            _ => {
+                app.flash = format!("{tag}: unexpected server request {method}");
+                false
+            }
+        },
+        ServerMsg::Transport(e) => {
+            app.flash = format!("{tag}: {e}");
+            false
+        }
+    }
+}
+
+/// Route a frame to the tab whose remote session it names (muse:
+/// `sessionId`; codex: `threadId`, falling back to `conversationId`).
+fn tab_for_session(
+    app: &App,
+    kind: BackendKind,
+    params: &serde_json::Value,
+) -> Option<usize> {
+    let keys: &[&str] = match kind {
+        BackendKind::Muse => &["sessionId"],
+        BackendKind::Codex => &["threadId", "conversationId"],
+        BackendKind::Agy => &["conversation_id"],
+        BackendKind::Mock => return None,
+    };
+    let sid = keys.iter().filter_map(|k| params.get(k)?.as_str()).next()?;
+    app.sessions.iter().position(|s| {
+        s.backend == kind && s.remote_id.as_deref() == Some(sid)
+    })
 }
 
 /// Wheel = 3 lines, Shift+wheel = page (M1 spec, unchanged).
@@ -229,42 +599,106 @@ fn wheel_step(m: &crossterm::event::MouseEvent, app: &App) -> i32 {
     }
 }
 
-/// Perform queued muse work: turn submits and approval decisions.
+/// Perform queued provider work: respawns, turn submits, decisions.
 /// Returns true when anything was sent or recorded (caller repaints).
-async fn drain_outbox(app: &mut App, muse: Option<&MuseCtx>) -> bool {
-    let Some(ctx) = muse else { return false };
+async fn drain_outbox(
+    app: &mut App,
+    backends: &mut Backends,
+    cfg: &Config,
+    agy_tx: &mpsc::Sender<ServerMsg>,
+) -> bool {
     let mut did = false;
+    while let Some(r) = app.outbox.respawns.pop() {
+        did = true;
+        if r.backend == BackendKind::Agy {
+            open_tab_session(backends, app, r.tab, cfg, agy_tx).await;
+            continue;
+        }
+        if r.backend != BackendKind::Mock {
+            if let Err(e) = ensure_host(backends, r.backend, cfg).await {
+                grey_out(app, r.backend, &e);
+                continue;
+            }
+        }
+        open_tab_session(backends, app, r.tab, cfg, agy_tx).await;
+    }
     while let Some(sub) = app.outbox.submits.pop() {
         did = true;
-        let sid = app.muse_sessions.get(sub.tab).and_then(|o| o.clone());
-        match sid {
-            Some(id) => {
-                if let Err(e) = muse_submit(&ctx.host, &id, &sub.prompt).await {
+        let tag = sub.backend.label();
+        if sub.backend == BackendKind::Agy {
+            let handle = backends.agy.get(sub.tab).and_then(|o| o.as_ref());
+            match handle {
+                Some(h) => {
+                    if let Err(e) = agy_submit(h, sub.prompt).await {
+                        let s = &mut app.sessions[sub.tab];
+                        s.busy = false;
+                        s.push_line(format!("{tag}: submit failed: {e}"));
+                    }
+                }
+                None => {
                     let s = &mut app.sessions[sub.tab];
                     s.busy = false;
-                    s.push_line(format!("muse: turn/start failed: {e}"));
+                    s.push_line(format!("{tag}: no session for this tab — press P to respawn"));
                 }
             }
-            None => {
+            continue;
+        }
+        let sid = app.sessions[sub.tab].remote_id.clone();
+        let host = backends.get(sub.backend).map(|c| &c.host);
+        match (host, sid) {
+            (Some(host), Some(id)) => {
+                let res = match sub.backend {
+                    BackendKind::Muse => {
+                        muse_submit(host, &id, &sub.prompt).await.map_err(|e| e.to_string())
+                    }
+                    BackendKind::Codex => {
+                        codex::codex_submit(host, &id, &sub.prompt)
+                            .await
+                            .map_err(|e| e.to_string())
+                    }
+                    BackendKind::Mock | BackendKind::Agy => Ok(()),
+                };
+                if let Err(e) = res {
+                    let s = &mut app.sessions[sub.tab];
+                    s.busy = false;
+                    s.push_line(format!("{tag}: turn/start failed: {e}"));
+                }
+            }
+            _ => {
                 let s = &mut app.sessions[sub.tab];
                 s.busy = false;
-                s.push_line("muse: no session for this tab".to_string());
+                s.push_line(format!("{tag}: no session for this tab — press P to respawn"));
             }
         }
     }
     while let Some(d) = app.outbox.decides.pop() {
         did = true;
-        let sid = app.muse_sessions.get(d.tab).and_then(|o| o.clone());
-        match sid {
-            Some(id) => {
-                if let Err(e) = muse_decide(&ctx.host, &id, &d).await {
+        let tag = d.backend.label();
+        let sid = app.sessions[d.tab].remote_id.clone();
+        let host = backends.get(d.backend).map(|c| &c.host);
+        match (host, sid) {
+            (Some(host), Some(id)) => {
+                let res = match d.backend {
+                    BackendKind::Muse => {
+                        muse_decide(host, &id, &d).await.map_err(|e| e.to_string())
+                    }
+                    BackendKind::Codex => codex_respond(
+                        host,
+                        d.requirement_id.clone(),
+                        serde_json::json!({"decision": d.choice_id}),
+                    )
+                    .await
+                    .map_err(|e| e.to_string()),
+                    BackendKind::Mock | BackendKind::Agy => Ok(()),
+                };
+                if let Err(e) = res {
                     let s = &mut app.sessions[d.tab];
-                    s.push_line(format!("muse: decide failed: {e} (card may reappear)"));
-                    app.flash = format!("muse: decide failed: {e}");
+                    s.push_line(format!("{tag}: decide failed: {e} (card may reappear)"));
+                    app.flash = format!("{tag}: decide failed: {e}");
                 }
             }
-            None => {
-                app.flash = "muse: no session for this tab".to_string();
+            _ => {
+                app.flash = format!("{tag}: no session for this tab");
             }
         }
     }
@@ -290,22 +724,24 @@ fn clear_pending_g(app: &mut App) {
 }
 
 /// Queue a UI-side approval decision: transcript lines now, wire decide via
-/// the outbox (muse) or the immediate mock close-out.
+/// the outbox (live backends) or the immediate mock close-out.
 fn decide_ui(app: &mut App, kind: DecisionKind, label: &str) {
-    match app.backend {
+    let tab = app.active;
+    let backend = app.sessions[tab].backend;
+    match backend {
         BackendKind::Mock => {
             if app.decide_diff(label) {
                 ring_bell();
             }
         }
         BackendKind::Muse => {
-            let tab = app.active;
             let approval = app.active().pending_approval.clone();
             match approval {
                 Some(a) => match map_decision(&a, kind) {
                     Some((choice_id, feedback)) => {
                         app.outbox.decides.push(OutboxDecide {
                             tab,
+                            backend,
                             approval_id: a.approval_id,
                             requirement_id: a.requirement_id,
                             choice_id,
@@ -332,6 +768,45 @@ fn decide_ui(app: &mut App, kind: DecisionKind, label: &str) {
                     }
                 }
             }
+        }
+        BackendKind::Codex => {
+            let approval = app.active().pending_approval.clone();
+            match approval {
+                Some(a) => match map_codex_decision(&a, kind) {
+                    Some((req_id, decision)) => {
+                        app.outbox.decides.push(OutboxDecide {
+                            tab,
+                            backend,
+                            approval_id: a.approval_id,
+                            requirement_id: req_id,
+                            choice_id: decision,
+                            feedback: None,
+                        });
+                        if app.approved("codex", label) {
+                            ring_bell();
+                        }
+                    }
+                    None => {
+                        app.approved("codex", label);
+                        app.flash = format!(
+                            "codex: closed locally — server offered no way to send `{label}`"
+                        );
+                        ring_bell();
+                    }
+                },
+                None => {
+                    if app.approved("codex", label) {
+                        ring_bell();
+                    }
+                }
+            }
+        }
+        BackendKind::Agy => {
+            // Agy has no interactive approvals (vendor policy decides); the
+            // modal can never appear, so any key here just ensures closure.
+            app.flash =
+                "agy: approvals aren't interactive — vendor policy decides (see transcript)"
+                    .to_string();
         }
     }
 }
@@ -435,6 +910,16 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 app.mouse = !app.mouse;
                 app.flash = format!("mouse {}", if app.mouse { "on" } else { "off" });
             }
+            KeyCode::Char('P') if no_mods => {
+                clear_pending_g(app);
+                // Preselect the tab's current backend in the picker.
+                let cur = app.sessions[app.active].backend;
+                app.picker_sel = BackendKind::ALL
+                    .iter()
+                    .position(|(b, _)| *b == cur)
+                    .unwrap_or(0);
+                app.mode = Mode::Picker;
+            }
             KeyCode::Char(c) if no_mods && ['1', '2', '3'].contains(&c) => {
                 clear_pending_g(app);
                 app.active = (c as usize - '1' as usize).min(app.sessions.len() - 1);
@@ -504,6 +989,26 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             }
             _ => {}
         },
+        Mode::Picker => match code {
+            KeyCode::Esc => app.mode = Mode::Normal,
+            KeyCode::Char('[') if ctrl => app.mode = Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down if no_mods => {
+                app.picker_sel = (app.picker_sel + 1) % BackendKind::ALL.len();
+            }
+            KeyCode::Char('k') | KeyCode::Up if no_mods => {
+                app.picker_sel =
+                    (app.picker_sel + BackendKind::ALL.len() - 1) % BackendKind::ALL.len();
+            }
+            KeyCode::Enter => {
+                let (backend, _) = BackendKind::ALL[app.picker_sel];
+                app.respawn_active(backend);
+            }
+            KeyCode::Char(c) if no_mods && ['1', '2', '3', '4'].contains(&c) => {
+                let i = (c as usize - '1' as usize).min(BackendKind::ALL.len() - 1);
+                app.respawn_active(BackendKind::ALL[i].0);
+            }
+            _ => {}
+        },
     }
 }
 
@@ -525,7 +1030,7 @@ mod tests {
 
     fn muse_modal_app() -> App {
         let mut app = App::new();
-        app.backend = BackendKind::Muse;
+        app.active_mut().backend = BackendKind::Muse;
         app.active_mut().pending_diff = Some(PendingDiff {
             file: "tool".into(),
             body: "body".into(),
@@ -567,6 +1072,134 @@ mod tests {
         assert!(app.active().pending_diff.is_none());
         assert_eq!(app.outbox.decides.len(), 1);
         assert_eq!(app.outbox.decides[0].choice_id, "c-allow");
+    }
+
+    /// ApproveAll with only once-approved offered: local-close, no wire send.
+    #[test]
+    fn approve_all_without_session_choice_closes_locally() {
+        let mut app = muse_modal_app();
+        handle_key(&mut app, KeyCode::Char('a'), NONE);
+        assert!(app.active().pending_diff.is_none());
+        assert!(app.outbox.decides.is_empty());
+        assert!(!app.flash.is_empty());
+    }
+
+    /// Codex q/Later queues wire `denied` when choices exist.
+    #[test]
+    fn codex_later_queues_denied() {
+        let mut app = App::new();
+        app.active_mut().backend = BackendKind::Codex;
+        app.active_mut().pending_diff = Some(PendingDiff {
+            file: "applyPatch".into(),
+            body: "body".into(),
+        });
+        app.active_mut().pending_approval = Some(PendingApproval {
+            approval_id: "applyPatchApproval".into(),
+            requirement_id: serde_json::json!(7),
+            choices: vec![
+                ApprovalChoice {
+                    choice_id: "approved".into(),
+                    decision: "approved".into(),
+                    scope: "once".into(),
+                    label: "Allow".into(),
+                    accepts_feedback: false,
+                },
+                ApprovalChoice {
+                    choice_id: "approved_for_session".into(),
+                    decision: "approved_for_session".into(),
+                    scope: "once".into(),
+                    label: "Allow for session".into(),
+                    accepts_feedback: false,
+                },
+                ApprovalChoice {
+                    choice_id: "denied".into(),
+                    decision: "denied".into(),
+                    scope: "once".into(),
+                    label: "Deny".into(),
+                    accepts_feedback: false,
+                },
+            ],
+        });
+        handle_key(&mut app, KeyCode::Char('q'), NONE);
+        assert!(app.active().pending_diff.is_none());
+        assert_eq!(app.outbox.decides.len(), 1);
+        assert_eq!(app.outbox.decides[0].choice_id, "denied");
+    }
+
+    /// P opens the picker; j/k move; Enter respawns the tab fresh.
+    #[test]
+    fn picker_respawns_tab_fresh() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('P'), SHIFT);
+        assert_eq!(app.mode, Mode::Picker);
+        handle_key(&mut app, KeyCode::Char('j'), NONE);
+        handle_key(&mut app, KeyCode::Char('j'), NONE);
+        assert_eq!(app.picker_sel, 2); // mock -> muse -> codex
+        handle_key(&mut app, KeyCode::Enter, NONE);
+        assert_eq!(app.mode, Mode::Normal);
+        let s = app.active();
+        assert_eq!(s.backend, BackendKind::Codex);
+        assert!(s.remote_id.is_none());
+        assert_eq!(s.lines.len(), 1); // marker only: history never carries over
+        assert!(s.lines[0].contains("fresh"));
+        assert_eq!(app.outbox.respawns.len(), 1);
+        assert_eq!(app.outbox.respawns[0].backend, BackendKind::Codex);
+    }
+
+    /// Picker Esc cancels without touching the tab.
+    #[test]
+    fn picker_esc_cancels() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('P'), SHIFT);
+        handle_key(&mut app, KeyCode::Esc, NONE);
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.active().backend, BackendKind::Mock);
+        assert!(app.outbox.respawns.is_empty());
+    }
+
+    /// Agy submit queues unconditionally (no session id needed up front;
+    /// the drain writes into the tab child's stdin).
+    #[test]
+    fn agy_submit_queues_without_session_id() {
+        let mut app = App::new();
+        app.active_mut().backend = BackendKind::Agy;
+        app.active_mut().input = "hi".to_string();
+        app.submit();
+        assert_eq!(app.outbox.submits.len(), 1);
+        assert_eq!(app.outbox.submits[0].backend, BackendKind::Agy);
+        assert!(app.active().busy);
+    }
+
+    /// Picker reaches all four backends.
+    #[test]
+    fn picker_lists_four_backends() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('P'), SHIFT);
+        handle_key(&mut app, KeyCode::Char('4'), NONE);
+        assert_eq!(app.active().backend, BackendKind::Agy);
+        assert_eq!(app.outbox.respawns.len(), 1);
+    }
+
+    /// Submit on a codex tab queues a backend-tagged submit (async drain
+    /// sends turn/start); submit on a dead tab reports instead of hanging.
+    #[test]
+    fn submit_routes_per_tab_backend() {
+        let mut app = App::new();
+        app.active_mut().backend = BackendKind::Codex;
+        app.active_mut().remote_id = Some("thread-1".into());
+        app.active_mut().input = "hi".to_string();
+        app.submit();
+        assert_eq!(app.outbox.submits.len(), 1);
+        assert_eq!(app.outbox.submits[0].backend, BackendKind::Codex);
+        assert!(app.active().busy);
+
+        let mut dead = App::new();
+        dead.active_mut().backend = BackendKind::Codex;
+        dead.active_mut().input = "hi".to_string();
+        dead.submit();
+        assert!(dead.outbox.submits.is_empty());
+        assert!(!dead.active().busy);
+        assert!(dead.active().lines.iter().any(|l| l.contains("codex")));
     }
 
     /// Crossterm delivers `G` as Char('G')+SHIFT; it must jump to bottom.

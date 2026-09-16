@@ -11,6 +11,10 @@ pub struct Config {
     pub polyforge: Core,
     #[serde(default, rename = "muse")]
     pub muse_cfg: MuseCfg,
+    #[serde(default, rename = "codex")]
+    pub codex_cfg: CodexCfg,
+    #[serde(default, rename = "agy")]
+    pub agy_cfg: AgyCfg,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -50,6 +54,29 @@ pub struct MuseCfg {
     pub model: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+pub struct AgyCfg {
+    /// `agy` binary. Default: "agy" on PATH.
+    #[serde(default)]
+    pub bin: Option<String>,
+    /// Model override (`--model`). Omitted = server default.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Agent override (`--agent`). Omitted = server default.
+    #[serde(default)]
+    pub agent: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+pub struct CodexCfg {
+    /// `codex` binary. Default: "codex" on PATH.
+    #[serde(default)]
+    pub bin: Option<String>,
+    /// Model override. Omitted = server default.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
 impl Config {
     pub fn path() -> PathBuf {
         let base = std::env::var("XDG_CONFIG_HOME")
@@ -81,6 +108,36 @@ impl Config {
         std::env::var("POLYFORGE_MUSE_PROVIDER")
             .ok()
             .or_else(|| self.muse_cfg.provider_id.clone())
+    }
+
+    pub fn codex_bin(&self) -> String {
+        std::env::var("POLYFORGE_CODEX_BIN")
+            .ok()
+            .or_else(|| self.codex_cfg.bin.clone())
+            .unwrap_or_else(|| "codex".to_string())
+    }
+
+    pub fn codex_model(&self) -> Option<String> {
+        std::env::var("POLYFORGE_CODEX_MODEL")
+            .ok()
+            .or_else(|| self.codex_cfg.model.clone())
+    }
+
+    /// Default backend for fresh tabs (the picker can switch per tab).
+    pub fn default_backend(&self) -> crate::app::BackendKind {
+        match self.polyforge.provider.as_str() {
+            "mock" => crate::app::BackendKind::Mock,
+            "codex" => crate::app::BackendKind::Codex,
+            "agy" | "antigravity" => crate::app::BackendKind::Agy,
+            _ => crate::app::BackendKind::Muse,
+        }
+    }
+
+    pub fn agy_bin(&self) -> String {
+        std::env::var("POLYFORGE_AGY_BIN")
+            .ok()
+            .or_else(|| self.agy_cfg.bin.clone())
+            .unwrap_or_else(|| "agy".to_string())
     }
 
     pub fn workspace_root(&self) -> String {

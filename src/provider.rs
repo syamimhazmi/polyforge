@@ -5,7 +5,9 @@
 
 use serde_json::Value;
 
-use crate::app::{App, ApprovalChoice, OutboxDecide, PendingApproval, PendingDiff};
+use crate::app::{
+    App, ApprovalChoice, DecisionKind, OutboxDecide, PendingApproval, PendingDiff,
+};
 use crate::msp::{self, Host, RpcError, ServerMsg};
 
 /// Bring up the muse backend: spawn serve, handshake, start one session per
@@ -32,7 +34,7 @@ pub async fn muse_bringup(
     let mut session_ids = Vec::new();
     let mut degraded = None;
     for _ in 0..tabs {
-        match start_session(&host, provider_id.clone(), model.clone(), workspace.clone()).await
+        match muse_start_session(&host, provider_id.clone(), model.clone(), workspace.clone()).await
         {
             Ok(id) => {
                 // Best-effort live subscription; events arrive anyway.
@@ -53,7 +55,8 @@ pub async fn muse_bringup(
     Ok((host, session_ids, degraded))
 }
 
-async fn start_session(
+/// Open one muse session (also used when the picker respawns a tab).
+pub async fn muse_start_session(
     host: &Host,
     provider_id: Option<String>,
     model: Option<String>,
@@ -81,6 +84,30 @@ async fn start_session(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| "session/start: no sessionId in result".to_string())
+}
+
+/// Re-attach a session from a previous run (Q10 resume). The server
+/// replays nothing — our transcript store already holds the history; resume
+/// just re-subscribes the live tail. Falls back to a fresh start upstream.
+pub async fn muse_resume_session(host: &Host, session_id: &str) -> Result<String, String> {
+    let res = host
+        .call(
+            "session/resume",
+            serde_json::json!({"commandId": msp::uuid7(), "sessionId": session_id}),
+        )
+        .await
+        .map_err(|e| format!("muse session/resume failed: {e}"))?;
+    // Best-effort live subscription; events arrive anyway.
+    let _ = host
+        .call("view/subscribe", serde_json::json!({"sessionId": session_id}))
+        .await;
+    // The resumed id echoes the request; tolerate servers that omit it.
+    let resumed = res
+        .get("session")
+        .and_then(|s| s.get("sessionId"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(session_id);
+    Ok(resumed.to_string())
 }
 
 fn friendly_start_error(e: &RpcError) -> String {
@@ -262,6 +289,7 @@ pub fn map_decision(
         DecisionKind::Approve => pick("approved", Some("once"))
             .or_else(|| pick("approved", None))
             .map(|c| (c.choice_id.clone(), None)),
+        // Session-scoped only: never fall back to once-`approved`.
         DecisionKind::ApproveAll => pick("approvedForSession", None)
             .or_else(|| {
                 approval
@@ -269,7 +297,6 @@ pub fn map_decision(
                     .iter()
                     .find(|c| c.decision == "approved" && c.scope == "session")
             })
-            .or_else(|| pick("approved", None))
             .map(|c| (c.choice_id.clone(), None)),
         DecisionKind::Reject => pick("denied", None).map(|c| (c.choice_id.clone(), None)),
         DecisionKind::Later => {
@@ -309,19 +336,18 @@ fn str_field(v: &Value, key: &str) -> String {
         .to_string()
 }
 
-#[derive(Clone, Copy)]
-pub enum DecisionKind {
-    Approve,
-    ApproveAll,
-    Reject,
-    Later,
-}
-
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
-    format!("{}…[truncated {} chars]", &s[..max], s.len() - max)
+    let mut end = 0;
+    for (i, c) in s.char_indices() {
+        if i + c.len_utf8() > max {
+            break;
+        }
+        end = i + c.len_utf8();
+    }
+    format!("{}…[truncated {} chars]", &s[..end], s.len() - end)
 }
 
 #[cfg(test)]
@@ -377,6 +403,25 @@ mod tests {
         let (id, fb) = map_decision(&a, DecisionKind::Later).unwrap();
         assert_eq!(id, "c-deny");
         assert!(fb.unwrap().contains("deferred"));
+    }
+
+    #[test]
+    fn approve_all_without_session_choice_is_none() {
+        let mut a = approval();
+        a.choices.retain(|c| c.decision != "approvedForSession");
+        assert!(map_decision(&a, DecisionKind::ApproveAll).is_none());
+        // once-approved must not be used as a stand-in.
+        assert!(a.choices.iter().any(|c| c.decision == "approved"));
+    }
+
+    #[test]
+    fn truncate_stays_on_char_boundary() {
+        let s = "éééé"; // each char is 2 bytes
+        let out = truncate(s, 3);
+        assert!(out.starts_with('é'));
+        assert!(out.contains("truncated"));
+        // Must not panic on a mid-char cut.
+        let _ = truncate("你好世界", 3);
     }
 
     /// Live echo roundtrip against a real `muse serve`. Needs the binary
