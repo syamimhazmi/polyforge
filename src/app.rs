@@ -31,8 +31,88 @@ fn wrap_chunks(line: &str, width: usize) -> Vec<String> {
     chunks.push(cur);
     chunks
 }
-/// Max parallel mock sessions (agreed M1 scope: ~3).
+/// Max open tabs (agreed M1 scope: ~3). Boot opens exactly one.
 pub const MAX_SESSIONS: usize = 3;
+
+/// Mouse drag selection in the transcript: line index + char index
+/// endpoints (anchor = drag start, focus = current end).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Selection {
+    pub anchor_line: usize,
+    pub anchor_char: usize,
+    pub focus_line: usize,
+    pub focus_char: usize,
+}
+
+impl Selection {
+    /// Normalized ((top_line, top_char), (bottom_line, bottom_char)).
+    pub fn normalized(self) -> ((usize, usize), (usize, usize)) {
+        let (a_line, a_char) = (self.anchor_line, self.anchor_char);
+        let (f_line, f_char) = (self.focus_line, self.focus_char);
+        if (a_line, a_char) <= (f_line, f_char) {
+            ((a_line, a_char), (f_line, f_char))
+        } else {
+            ((f_line, f_char), (a_line, a_char))
+        }
+    }
+
+    /// Char span selected on `line`, or None when the line is untouched.
+    /// `line_len` clamps endpoints past the end (drag past EOL).
+    pub fn span_on_line(self, line: usize, line_len: usize) -> Option<(usize, usize)> {
+        let ((a_line, a_char), (f_line, f_char)) = self.normalized();
+        if line < a_line || line > f_line {
+            return None;
+        }
+        let s = if line == a_line { a_char } else { 0 }.min(line_len);
+        let e = if line == f_line { f_char } else { line_len }.min(line_len);
+        if s >= e {
+            return None;
+        }
+        Some((s, e))
+    }
+
+    pub fn is_empty(self) -> bool {
+        (self.anchor_line, self.anchor_char) == (self.focus_line, self.focus_char)
+    }
+}
+
+/// Display-column of the first `chars` chars of `s` (wide-char aware).
+/// Test-only for now: the render path splits pre-wrapped chunks by chars.
+#[cfg(test)]
+pub fn char_to_col(s: &str, chars: usize) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    s.chars()
+        .take(chars)
+        .map(|c| UnicodeWidthChar::width(c).unwrap_or(1).max(1))
+        .sum()
+}
+
+/// Char index containing display column `col` (click position → char).
+/// Columns past the end clamp to the string length.
+pub fn col_to_char(s: &str, col: usize) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    let mut acc = 0usize;
+    for (i, c) in s.chars().enumerate() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(1).max(1);
+        if acc + w > col {
+            return i;
+        }
+        acc += w;
+    }
+    s.chars().count()
+}
+/// First user prompt kept as the `/sessions` title (chars).
+pub const TITLE_LEN: usize = 48;
+
+/// Short display id for the `/sessions` list (store ids are ASCII
+/// `millis-pid-seq`, so byte slicing is safe).
+pub fn short_id(id: &str) -> String {
+    if id.len() <= 8 {
+        id.to_string()
+    } else {
+        id[id.len() - 8..].to_string()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -40,6 +120,7 @@ pub enum Mode {
     Insert,
     Search,
     Picker,
+    Sessions,
 }
 
 impl Mode {
@@ -49,6 +130,7 @@ impl Mode {
             Mode::Insert => "INSERT",
             Mode::Search => "SEARCH",
             Mode::Picker => "PICKER",
+            Mode::Sessions => "SESSIONS",
         }
     }
 }
@@ -94,14 +176,16 @@ pub enum BackendKind {
     Muse,
     Codex,
     Agy,
+    Grok,
 }
 
 impl BackendKind {
-    pub const ALL: [(BackendKind, &'static str); 4] = [
+    pub const ALL: [(BackendKind, &'static str); 5] = [
         (BackendKind::Mock, "mock — offline fake (no quota)"),
         (BackendKind::Muse, "muse — Muse Spark via `muse serve`"),
         (BackendKind::Codex, "codex — Codex via `codex app-server`"),
         (BackendKind::Agy, "agy — Antigravity via `agy` (visible, ungated)"),
+        (BackendKind::Grok, "grok — Grok via `grok agent stdio` (ACP)"),
     ];
 
     pub fn label(self) -> &'static str {
@@ -110,6 +194,7 @@ impl BackendKind {
             BackendKind::Muse => "muse",
             BackendKind::Codex => "codex",
             BackendKind::Agy => "agy",
+            BackendKind::Grok => "grok",
         }
     }
 
@@ -121,6 +206,7 @@ impl BackendKind {
             "muse" => Some(BackendKind::Muse),
             "codex" => Some(BackendKind::Codex),
             "agy" => Some(BackendKind::Agy),
+            "grok" => Some(BackendKind::Grok),
             _ => None,
         }
     }
@@ -190,9 +276,19 @@ pub struct Session {
     pub input: String,
     /// Char-index cursor inside `input` (insert mode).
     pub cursor: usize,
-    /// Append sink for the Q10 transcript store (None = storageless:
-    /// tests, or a store that failed to open). Attached AFTER replay so
-    /// a restore never duplicates history.
+    /// Store id this tab persists under (`sess-{id}` files). A tab gets a
+    /// FRESH id on boot, respawn, and new-tab; previous ids stay on disk
+    /// for `/sessions`. None = storageless (tests, failed store open).
+    pub store_id: Option<String>,
+    /// Creation time of the tab's stored session (millis, display only).
+    pub created_at: u64,
+    /// Last activity of the tab's stored session (the UPDATED column).
+    pub updated_at: u64,
+    /// First user prompt, truncated (the `/sessions` title).
+    pub title: String,
+    /// Append sink for the transcript store (None = storageless: tests,
+    /// or a store that failed to open). Attached AFTER replay so viewing
+    /// a previous session never duplicates history.
     pub sink: Option<std::io::BufWriter<std::fs::File>>,
     /// True when the sink has unflushed appends (idle loops skip flush).
     pub store_dirty: bool,
@@ -214,6 +310,10 @@ impl Session {
             backend: BackendKind::Mock,
             remote_id: None,
             tab_degraded: None,
+            store_id: None,
+            created_at: 0,
+            updated_at: 0,
+            title: String::new(),
             row_cache: Vec::new(),
             total_rows: 0,
             cache_width: None,
@@ -285,18 +385,34 @@ pub struct App {
     pub flash: String,
     pub viewport_height: usize,
     pub viewport_width: usize,
-    /// Q10 transcript store (None = storageless; main attaches it on boot).
+    /// Transcript store (None = storageless; main attaches it on boot).
     pub store: Option<crate::store::Store>,
     /// Spawn-order queue for agy init routing (resume matches by id first).
     pub agy_init_fifo: std::collections::VecDeque<usize>,
+    /// `/sessions` chooser state (newest first).
+    pub sess_list: Vec<crate::store::StoredSession>,
+    pub sess_sel: usize,
+    /// Vim keymap (j/k/g/G/i/a). Default off; `/vim` toggles + persists.
+    /// Picker/sessions modals keep j/k either way (list navigation).
+    pub vim: bool,
+    /// Closed agy tab indices awaiting child kill (main loop drains this;
+    /// handles live there, not in App, because shutdown is async).
+    pub pending_agy_kill: Vec<usize>,
+    /// Closed grok ACP session ids awaiting server-side close (best-effort;
+    /// ids, not indices, so later closes can't shift them).
+    pub pending_grok_close: Vec<String>,
+    /// Inner transcript rect (x, y, w, h) from the last render, for mouse
+    /// cell → text mapping. None before the first frame.
+    pub text_area: Option<(u16, u16, u16, u16)>,
+    /// Active mouse drag selection (highlight + copy source).
+    pub sel: Option<Selection>,
 }
 
 impl App {
     pub fn new() -> Self {
         let mut app = Self {
-            sessions: (1..=MAX_SESSIONS)
-                .map(|i| Session::new(&format!("s{i}")))
-                .collect(),
+            // Boot opens exactly one tab; `/tab new` grows to MAX_SESSIONS.
+            sessions: vec![Session::new("s1")],
             active: 0,
             outbox: Outbox::default(),
             picker_sel: 0,
@@ -314,10 +430,16 @@ impl App {
             viewport_width: DEFAULT_WIDTH,
             store: None,
             agy_init_fifo: std::collections::VecDeque::new(),
+            sess_list: Vec::new(),
+            sess_sel: 0,
+            pending_agy_kill: Vec::new(),
+            pending_grok_close: Vec::new(),
+            vim: false,
+            text_area: None,
+            sel: None,
         };
-        for s in &mut app.sessions {
-            crate::mock::seed(s);
-        }
+        // Fresh tabs open empty: no placeholder filler. Tests that need a
+        // scrollable transcript call mock::seed explicitly.
         app.stick_to_bottom();
         app
     }
@@ -376,6 +498,24 @@ impl App {
         if prompt.trim().is_empty() {
             return;
         }
+        // Slash commands never reach a backend. A command may set its
+        // own mode (e.g. `/sessions`); only fall back to Normal.
+        if prompt.trim_start().starts_with('/') {
+            self.run_command(prompt.trim());
+            if self.mode == Mode::Insert {
+                self.mode = Mode::Normal;
+            }
+            self.stick_to_bottom();
+            return;
+        }
+        // First prompt names the stored session (the `/sessions` title).
+        {
+            let s = self.active_mut();
+            if s.title.is_empty() {
+                s.title = prompt.chars().take(TITLE_LEN).collect();
+            }
+        }
+        self.save_tab_meta(self.active);
         let tab = self.active;
         let backend = self.sessions[tab].backend;
         let sid = self.sessions[tab].remote_id.clone();
@@ -384,7 +524,7 @@ impl App {
         s.push_line(format!("> {prompt}"));
         match backend {
             BackendKind::Mock => crate::mock::start_job(s, &prompt),
-            BackendKind::Muse | BackendKind::Codex => match sid {
+            BackendKind::Muse | BackendKind::Codex | BackendKind::Grok => match sid {
                 Some(_) => {
                     s.busy = true;
                     self.outbox.submits.push(OutboxSubmit { tab, backend, prompt });
@@ -407,59 +547,305 @@ impl App {
         self.stick_to_bottom();
     }
 
-    /// Switch the active tab to `backend`: fresh remote session, transcript
-    /// reset to a marker (a switch is a new session; history never carries
-    /// over). The async bringup runs via the outbox.
-    /// Restore one tab from the store: clear mock seed, load backend +
-    /// remote id from meta, replay transcript, then attach the append sink
-    /// (last so replay never duplicates). Falls back to `default` with no
-    /// stored state. No-op when storageless.
-    pub fn restore_tab(&mut self, tab: usize, default: BackendKind) {
-        if self.store.is_none() || tab >= self.sessions.len() {
-            if tab < self.sessions.len() {
-                self.sessions[tab].backend = default;
+    /// Slash commands (typed in Insert mode, never sent to a backend):
+    /// `/sessions [query]`, `/new`, `/tab new`, `/tab close`, `/vim`, `/help`.
+    pub fn run_command(&mut self, cmd: &str) {
+        let mut parts = cmd.split_whitespace();
+        match parts.next().unwrap_or("") {
+            "/sessions" => {
+                let query: Vec<&str> = parts.collect();
+                self.open_session_chooser(query.join(" "));
             }
+            // Fresh session in the ACTIVE tab (command form of R; `/tab
+            // new` puts the fresh session in a new tab instead).
+            "/new" => {
+                let cur = self.sessions[self.active].backend;
+                self.respawn_active(cur);
+            }
+            "/tab" => match parts.next().unwrap_or("") {
+                "new" => self.open_tab(),
+                "close" => {
+                    if let Err(msg) = self.close_active_tab() {
+                        self.flash = msg;
+                    }
+                }
+                _ => self.flash = "usage: /tab new · /tab close".to_string(),
+            },
+            "/vim" => self.toggle_vim(),
+            "/help" => self.show_help(),
+            _ => {
+                self.flash =
+                    "unknown command — /sessions · /new · /tab new · /tab close · /vim · /help"
+                        .to_string()
+            }
+        }
+    }
+
+    /// Flip the vim keymap and persist it to the config file so the
+    /// choice sticks across runs. A failed save keeps the in-memory
+    /// value and says so (never blocks typing).
+    pub fn toggle_vim(&mut self) {
+        self.vim = !self.vim;
+        let mut cfg = crate::config::Config::load();
+        cfg.polyforge.vim = self.vim;
+        match cfg.save() {
+            Ok(()) => {
+                self.flash = format!(
+                    "vim mode {} (saved to {})",
+                    if self.vim { "on" } else { "off" },
+                    crate::config::Config::path().display()
+                );
+            }
+            Err(e) => {
+                self.flash = format!(
+                    "vim mode {} (NOT saved: {e})",
+                    if self.vim { "on" } else { "off" }
+                );
+            }
+        }
+    }
+
+    /// Fill the `/sessions` chooser, most active first (grok's `sessions
+    /// list` ordering). An optional query filters title + preview + id
+    /// (grok's `sessions search`). Empty results flash instead of opening
+    /// a dead modal.
+    pub fn open_session_chooser(&mut self, query: String) {
+        let Some(store) = self.store.as_ref() else {
+            self.flash = "no session store (storageless)".to_string();
+            return;
+        };
+        let q = query.trim().to_lowercase();
+        self.sess_list = store
+            .list_sessions()
+            .into_iter()
+            .filter(|s| {
+                q.is_empty()
+                    || s.title.to_lowercase().contains(&q)
+                    || s.preview.to_lowercase().contains(&q)
+                    || s.id.to_lowercase().contains(&q)
+            })
+            .collect();
+        if self.sess_list.is_empty() {
+            self.flash = if q.is_empty() {
+                "no previous sessions yet".to_string()
+            } else {
+                format!("no sessions match: {query}")
+            };
             return;
         }
-        // Drop mock::seed (and any prior lines) before replay.
+        self.sess_sel = 0;
+        self.mode = Mode::Sessions;
+    }
+
+    /// Delete the chooser-selected stored session (`grok sessions delete`).
+    /// Refuses sessions open in a live tab (close the tab first): deleting
+    /// under a running tab would resurrect the files on the next flush.
+    pub fn delete_selected_session(&mut self) {
+        let Some(pick) = self.sess_list.get(self.sess_sel).cloned() else {
+            return;
+        };
+        if let Some(tab) = self
+            .sessions
+            .iter()
+            .position(|s| s.store_id.as_deref() == Some(pick.id.as_str()))
         {
-            let s = &mut self.sessions[tab];
+            self.flash = format!(
+                "session is open in {} — /tab close it first",
+                self.sessions[tab].name
+            );
+            return;
+        }
+        let Some(store) = self.store.as_ref() else {
+            self.flash = "no session store (storageless)".to_string();
+            return;
+        };
+        if store.delete_session(&pick.id) {
+            self.flash = format!("deleted session {}", short_id(&pick.id));
+            self.sess_list.remove(self.sess_sel);
+            self.sess_sel = self
+                .sess_sel
+                .min(self.sess_list.len().saturating_sub(1));
+            if self.sess_list.is_empty() {
+                self.mode = Mode::Normal;
+            }
+        } else {
+            self.flash = format!("deleted nothing ({})", short_id(&pick.id));
+        }
+    }
+
+    /// Load the chosen stored session into the ACTIVE tab (view + continue):
+    /// replay its transcript, re-attach its remote id, and queue a respawn
+    /// so the drain re-attaches the live session (resume, else fresh).
+    pub fn choose_session(&mut self, idx: usize) {
+        let Some(pick) = self.sess_list.get(idx).cloned() else {
+            return;
+        };
+        let tab = self.active;
+        // Drop queued work for this tab; it belongs to the old session.
+        self.outbox.submits.retain(|o| o.tab != tab);
+        self.outbox.decides.retain(|o| o.tab != tab);
+        self.outbox.respawns.retain(|o| o.tab != tab);
+        self.agy_init_fifo.retain(|&t| t != tab);
+        let backend = BackendKind::parse(&pick.backend).unwrap_or_default();
+        let store = self.store.as_ref().expect("chooser needs a store");
+        // Re-read meta at choose time: the listing may predate another
+        // run's writes (newer remote id / title / updated win).
+        let (remote_id, title, updated_at) = match store.load_meta(&pick.id) {
+            Some(meta) => (meta.remote_id, meta.title, meta.updated_at),
+            None => (
+                pick.remote_id.clone(),
+                pick.title.clone(),
+                pick.updated_at,
+            ),
+        };
+        {
+            let s = self.active_mut();
+            s.backend = backend;
+            s.remote_id = remote_id;
+            s.tab_degraded = None;
+            s.busy = false;
+            s.pending_agy_init = false;
+            s.queue.clear();
+            s.diff_after = None;
+            s.pending_diff = None;
+            s.pending_approval = None;
             s.lines.clear();
             s.row_cache.clear();
             s.total_rows = 0;
             s.scroll = 0;
+            s.store_id = Some(pick.id.clone());
+            s.created_at = pick.created_at;
+            s.updated_at = updated_at;
+            s.title = title;
+            s.sink = None;
         }
-        // Disjoint field borrows: the store outlives the session borrow.
-        let store = self.store.as_ref().expect("checked");
-        if let Some(meta) = store.load_meta(tab) {
-            if let Some(b) = BackendKind::parse(&meta.backend) {
-                self.sessions[tab].backend = b;
-            }
-            self.sessions[tab].remote_id = meta.remote_id;
-        } else {
-            self.sessions[tab].backend = default;
-        }
-        let lines = store.load_transcript(tab);
+        let store = self.store.as_ref().expect("chooser needs a store");
+        let lines = store.load_transcript(&pick.id);
         let n = lines.len();
         for line in lines {
             self.sessions[tab].push_line(line);
         }
-        self.sessions[tab].sink = store.open_sink(tab);
-        let backend = self.sessions[tab].backend;
-        if n > 0 {
-            // Banner is UI-only: detach sink so it never grows JSONL.
-            let sink = self.sessions[tab].sink.take();
-            self.sessions[tab].push_line(format!(
-                "(restored {n} lines — {} resumes, R respawns fresh)",
-                backend.label()
-            ));
-            self.sessions[tab].sink = sink;
-            // Pin the restored tab to its tail (render clamps any excess).
-            let tail = self.sessions[tab]
-                .total_rows
-                .saturating_sub(self.viewport_height.max(1));
-            self.sessions[tab].scroll = tail;
+        self.sessions[tab].sink = store.open_sink(&pick.id);
+        // Banner is UI-only: detach sink so it never grows JSONL.
+        let sink = self.sessions[tab].sink.take();
+        self.sessions[tab].push_line(format!(
+            "(viewing {n} lines from {} — {} continues, R starts fresh)",
+            crate::store::fmt_time(pick.created_at),
+            backend.label()
+        ));
+        self.sessions[tab].sink = sink;
+        self.outbox.respawns.push(OutboxRespawn { tab, backend });
+        self.mode = Mode::Normal;
+        self.stick_to_bottom();
+    }
+
+    /// Open a new tab (up to MAX_SESSIONS) with a fresh session id and
+    /// queue its bringup. The new tab becomes active.
+    pub fn open_tab(&mut self) {
+        if self.sessions.len() >= MAX_SESSIONS {
+            self.flash = format!("already {} tabs (max)", MAX_SESSIONS);
+            return;
         }
+        let n = self.sessions.len() + 1;
+        let mut s = Session::new(&format!("s{n}"));
+        s.backend = self.sessions[self.active].backend;
+        self.sessions.push(s);
+        self.active = self.sessions.len() - 1;
+        self.attach_fresh_store(self.active);
+        let backend = self.sessions[self.active].backend;
+        {
+            let s = self.active_mut();
+            s.push_line(format!("--- {} session (fresh) ---", backend.label()));
+        }
+        self.save_tab_meta(self.active);
+        self.outbox.respawns.push(OutboxRespawn {
+            tab: self.active,
+            backend,
+        });
+        self.stick_to_bottom();
+    }
+
+    /// Close the active tab and kill its session: queued work is dropped,
+    /// the agy child (if any) is queued for kill by the main loop, and the
+    /// muse/codex remote id is abandoned (no vendor kill API — the stored
+    /// transcript stays for `/sessions`). Refuses the last tab.
+    pub fn close_active_tab(&mut self) -> Result<(), String> {
+        if self.sessions.len() <= 1 {
+            return Err("can't close the last tab — R starts it fresh".to_string());
+        }
+        let tab = self.active;
+        let backend = self.sessions[tab].backend;
+        // Drop queued work for this tab; it belongs to the dead session.
+        self.outbox.submits.retain(|o| o.tab != tab);
+        self.outbox.decides.retain(|o| o.tab != tab);
+        self.outbox.respawns.retain(|o| o.tab != tab);
+        self.agy_init_fifo.retain(|&t| t != tab);
+        if backend == BackendKind::Agy {
+            self.pending_agy_kill.push(tab);
+        }
+        if backend == BackendKind::Grok {
+            if let Some(id) = self.sessions[tab].remote_id.clone() {
+                self.pending_grok_close.push(id);
+            }
+        }
+        // Flush before dropping the sink so the transcript keeps its tail.
+        if let Some(sink) = self.sessions[tab].sink.as_mut() {
+            use std::io::Write;
+            let _ = sink.flush();
+        }
+        self.sessions.remove(tab);
+        // Renumber everything above the gap (tabs, outbox, agy routing).
+        for s in self.outbox.submits.iter_mut() {
+            if s.tab > tab {
+                s.tab -= 1;
+            }
+        }
+        for d in self.outbox.decides.iter_mut() {
+            if d.tab > tab {
+                d.tab -= 1;
+            }
+        }
+        for r in self.outbox.respawns.iter_mut() {
+            if r.tab > tab {
+                r.tab -= 1;
+            }
+        }
+        for t in self.agy_init_fifo.iter_mut() {
+            if *t > tab {
+                *t -= 1;
+            }
+        }
+        // pending_agy_kill is deliberately NOT renumbered: entries refer to
+        // the layout at close time and the main loop compensates removals.
+        for (i, s) in self.sessions.iter_mut().enumerate() {
+            s.name = format!("s{}", i + 1);
+        }
+        self.active = tab.min(self.sessions.len() - 1);
+        self.flash = format!("closed tab ({} session killed)", backend.label());
+        self.stick_to_bottom();
+        Ok(())
+    }
+
+    /// UI-only command help (never persisted: detached from the sink).
+    fn show_help(&mut self) {
+        let sink = self.active_mut().sink.take();
+        let move_keys = if self.vim {
+            "j/k line · g/G top/bottom · Space/i/a type"
+        } else {
+            "arrows/HOME/END/PgUp/PgDn · Space/Enter types · /vim for vim keys"
+        };
+        for l in [
+            "commands (Insert mode, Enter sends):".to_string(),
+            "  /sessions [query] — browse previous sessions, Enter views + continues, d deletes".to_string(),
+            "  /new — fresh session in this tab (same as R)".to_string(),
+            "  /tab new — open a tab (max 3), same backend as current".to_string(),
+            "  /tab close — close this tab, killing its session".to_string(),
+            "  /vim — toggle vim keymap (saved to config)".to_string(),
+            format!("keys (Normal mode): {move_keys} · P provider · R fresh · q quit"),
+        ] {
+            self.active_mut().push_line(l);
+        }
+        self.active_mut().sink = sink;
     }
 
     /// Unique backends present across tabs (boot order preserved).
@@ -473,30 +859,50 @@ impl App {
         out
     }
 
-    /// Record a tab's current backend + remote id for the next boot.
-    /// No-op when storageless.
-    pub fn save_tab_meta(&self, tab: usize) {
+    /// Record a tab's stored session (backend + remote id + title) for
+    /// `/sessions`, bumping UPDATED to now. No-op when storageless or the
+    /// tab has no store id.
+    pub fn save_tab_meta(&mut self, tab: usize) {
+        let now = crate::store::now_millis();
+        if let Some(s) = self.sessions.get_mut(tab) {
+            s.updated_at = now;
+        }
         if let (Some(store), Some(s)) = (self.store.as_ref(), self.sessions.get(tab)) {
-            store.save_meta(
-                tab,
-                &crate::store::SessionMeta {
-                    backend: s.backend.label().to_string(),
-                    remote_id: s.remote_id.clone(),
-                },
-            );
+            if let Some(id) = s.store_id.as_deref() {
+                store.save_meta(
+                    id,
+                    &crate::store::SessionMeta {
+                        backend: s.backend.label().to_string(),
+                        remote_id: s.remote_id.clone(),
+                        created_at: s.created_at,
+                        updated_at: s.updated_at,
+                        title: s.title.clone(),
+                    },
+                );
+            }
         }
     }
 
-    /// Forget a tab's stored transcript + meta and reopen a fresh sink.
+    /// Give a tab a FRESH store id + sink + meta (boot, respawn, new tab).
+    /// The previous session's files stay on disk for `/sessions`.
     /// No-op when storageless.
-    pub fn reset_tab_store(&mut self, tab: usize) {
+    pub fn attach_fresh_store(&mut self, tab: usize) {
         if self.store.is_none() || tab >= self.sessions.len() {
             return;
         }
+        let id = crate::store::Store::new_session_id();
+        let created_at = crate::store::now_millis();
+        {
+            let s = &mut self.sessions[tab];
+            s.sink = None;
+            s.store_id = Some(id.clone());
+            s.created_at = created_at;
+            s.updated_at = created_at;
+            s.title = String::new();
+        }
         let store = self.store.as_ref().expect("checked");
-        self.sessions[tab].sink = None;
-        store.reset(tab);
-        self.sessions[tab].sink = store.open_sink(tab);
+        self.sessions[tab].sink = store.open_sink(&id);
+        self.save_tab_meta(tab);
     }
 
     /// Flush dirty transcript sinks only (idle loops must not File::flush).
@@ -520,8 +926,8 @@ impl App {
         self.outbox.decides.retain(|o| o.tab != tab);
         self.outbox.respawns.retain(|o| o.tab != tab);
         self.agy_init_fifo.retain(|&t| t != tab);
-        // Fresh transcript on disk too; the marker below opens the new file.
-        self.reset_tab_store(tab);
+        // Fresh session id on disk too (old files stay for `/sessions`).
+        self.attach_fresh_store(tab);
         {
             let s = self.active_mut();
             s.backend = backend;
@@ -620,7 +1026,105 @@ impl App {
         true
     }
 
+    // -- mouse drag selection (highlight + copy) --
+
+    /// Start a drag at terminal cell (col, row). Outside the transcript
+    /// viewport (or with mouse capture off) this is a no-op returning false.
+    pub fn sel_begin(&mut self, col: u16, row: u16) -> bool {
+        match self.cell_to_text(col, row) {
+            Some((line, ch)) => {
+                self.sel = Some(Selection {
+                    anchor_line: line,
+                    anchor_char: ch,
+                    focus_line: line,
+                    focus_char: ch,
+                });
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Extend the active drag to terminal cell (col, row). Clamps to the
+    /// viewport: drags outside keep the last in-bounds focus.
+    pub fn sel_extend(&mut self, col: u16, row: u16) {
+        if let Some((line, ch)) = self.cell_to_text(col, row) {
+            if let Some(sel) = self.sel.as_mut() {
+                sel.focus_line = line;
+                sel.focus_char = ch;
+            }
+        }
+    }
+
+    /// Map a terminal cell to (transcript line, char index), honoring the
+    /// last render's origin, the scroll offset, and wrapped rows.
+    pub fn cell_to_text(&self, col: u16, row: u16) -> Option<(usize, usize)> {
+        let (ax, ay, _w, h) = self.text_area?;
+        let c = col.checked_sub(ax)? as usize;
+        let vr = row.checked_sub(ay)? as usize;
+        if vr >= h as usize {
+            return None;
+        }
+        let s = self.active();
+        let target = s.scroll + vr;
+        // Walk the height cache to the visible row (same walk as render).
+        let mut li = 0usize;
+        let mut consumed = 0usize;
+        while li < s.lines.len() && consumed + s.row_cache.get(li).copied().unwrap_or(1) <= target
+        {
+            consumed += s.row_cache.get(li).copied().unwrap_or(1);
+            li += 1;
+        }
+        let line = s.lines.get(li)?;
+        let row_in_line = target - consumed;
+        // Chunk offset: char count of the chunks above this one. The render
+        // path wraps at viewport_width, so the mapping must use the same.
+        let width = self.viewport_width.max(1);
+        let chunks = Session::wrap_line(line, width);
+        let chunk = chunks.get(row_in_line)?;
+        let mut coff = 0usize;
+        for prev in chunks.iter().take(row_in_line) {
+            coff += prev.chars().count();
+        }
+        Some((li, coff + col_to_char(chunk, c)))
+    }
+
+    /// The selected text (lines joined with `\n`), or None when empty.
+    pub fn selected_text(&self) -> Option<String> {
+        let sel = self.sel?;
+        if sel.is_empty() {
+            return None;
+        }
+        let s = self.active();
+        let ((a_line, _), (f_line, _)) = sel.normalized();
+        let mut out = Vec::new();
+        for (li, line) in s.lines.iter().enumerate() {
+            if li < a_line || li > f_line {
+                continue;
+            }
+            let len = line.chars().count();
+            if let Some((cs, ce)) = sel.span_on_line(li, len) {
+                out.push(line.chars().skip(cs).take(ce - cs).collect::<String>());
+            }
+        }
+        if out.is_empty() {
+            return None;
+        }
+        Some(out.join("\n"))
+    }
+
     // -- search (/ + n/N) --
+
+    /// True when a failed search looks like a slash command typed in the
+    /// wrong mode (`/tab close` in Normal lands here as `tab close`).
+    fn looks_like_command(query: &str) -> bool {
+        let q = query.trim().to_lowercase();
+        q == "sessions"
+            || q == "vim"
+            || q == "help"
+            || q == "tab"
+            || q.starts_with("tab ")
+    }
 
     pub fn run_search(&mut self) {
         self.last_query = self.search_input.clone();
@@ -633,7 +1137,14 @@ impl App {
             .map(|(i, _)| i)
             .collect();
         if self.matches.is_empty() {
-            self.flash = format!("no match: {}", self.last_query);
+            self.flash = if Self::looks_like_command(&self.last_query) {
+                format!(
+                    "no match — commands run from INSERT mode: Enter, then /{}",
+                    self.last_query.trim()
+                )
+            } else {
+                format!("no match: {}", self.last_query)
+            };
             self.match_pos = None;
         } else {
             self.match_pos = Some(0);
@@ -694,12 +1205,15 @@ fn muse_mark(decision: &str) -> &'static str {
 mod tests {
     use super::*;
 
-    const VH: usize = 20; // fixed viewport: 62 seed lines -> max scroll 42
+    const VH: usize = 20; // fixed viewport
 
     fn bottom_app() -> App {
         let mut app = App::new();
+        // Production tabs open empty; scroll tests seed their own filler.
+        crate::mock::seed(&mut app.sessions[0]);
         app.viewport_height = VH;
         app.viewport_width = 100;
+        app.active_mut().ensure_cache(100);
         // Place the viewport explicitly: must not depend on stick_to_bottom().
         let tail = app.active().total_rows.saturating_sub(VH);
         app.active_mut().scroll = tail;
@@ -714,45 +1228,77 @@ mod tests {
     }
 
     #[test]
-    fn restore_replays_transcript_and_meta() {
-        let (store, _dir) = test_store("restore");
+    fn boot_opens_exactly_one_tab() {
+        let app = App::new();
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.sessions[0].name, "s1");
+        assert_eq!(app.active, 0);
+    }
+
+    /// Fresh tabs open with an empty transcript (no seed/hint filler).
+    #[test]
+    fn fresh_tabs_open_empty() {
+        let mut app = App::new();
+        assert!(app.sessions[0].lines.is_empty());
+        app.open_tab();
+        assert!(app.sessions[1]
+            .lines
+            .iter()
+            .all(|l| l.contains("fresh")));
+    }
+
+    #[test]
+    fn choose_session_replays_transcript_and_meta() {
+        let (store, _dir) = test_store("choose");
         // Pre-populate as a previous run would have left it.
-        let mut sink = store.open_sink(0).expect("sink");
+        let id = crate::store::Store::new_session_id();
+        let mut sink = store.open_sink(&id).expect("sink");
         crate::store::append_line(&mut sink, "old line 1");
         crate::store::append_line(&mut sink, "old \"quoted\" 2");
         use std::io::Write;
         sink.flush().expect("flush");
         drop(sink);
         store.save_meta(
-            0,
+            &id,
             &crate::store::SessionMeta {
                 backend: "codex".to_string(),
                 remote_id: Some("thread-9".to_string()),
+                created_at: 1000,
+                updated_at: 2000,
+                title: "old title".to_string(),
             },
         );
-        // Mock::seed must be cleared; restored lines start at index 0.
+        // Seed must be cleared; replayed lines start at index 0.
         let mut app = App::new();
+        crate::mock::seed(&mut app.sessions[0]);
         assert!(app.sessions[0].lines.len() > 2, "precondition: seed present");
         app.store = Some(store);
-        app.restore_tab(0, BackendKind::Mock);
+        app.open_session_chooser(String::new());
+        assert_eq!(app.mode, Mode::Sessions);
+        assert_eq!(app.sess_list.len(), 1);
+        app.choose_session(0);
+        assert_eq!(app.mode, Mode::Normal);
         let s = &app.sessions[0];
         assert_eq!(s.backend, BackendKind::Codex);
         assert_eq!(s.remote_id.as_deref(), Some("thread-9"));
+        assert_eq!(s.title, "old title");
         assert_eq!(s.lines[0], "old line 1");
         assert_eq!(s.lines[1], "old \"quoted\" 2");
-        assert!(s.lines[2].starts_with("(restored 2 lines"));
+        assert!(s.lines[2].starts_with("(viewing 2 lines"));
         assert!(s.sink.is_some());
-        // New pushes after restore append to the same file, no duplication.
+        // Re-attach is queued so the drain resumes the remote session.
+        assert_eq!(app.outbox.respawns.len(), 1);
+        // New pushes after viewing append to the same file, no duplication.
         // Banner must not have been written through the sink.
         app.sessions[0].push_line("new line".to_string());
         app.flush_store();
         let store = app.store.as_ref().expect("store");
-        let replayed = store.load_transcript(0);
+        let replayed = store.load_transcript(&id);
         assert_eq!(&replayed[..2], &["old line 1", "old \"quoted\" 2"]);
         assert!(replayed.iter().any(|l| l == "new line"));
         assert!(
-            !replayed.iter().any(|l| l.starts_with("(restored")),
-            "restore banner must not grow JSONL"
+            !replayed.iter().any(|l| l.starts_with("(viewing")),
+            "view banner must not grow JSONL"
         );
         let _ = std::fs::remove_dir_all(_dir);
     }
@@ -788,7 +1334,7 @@ mod tests {
         app.sessions[0].lines.clear();
         app.sessions[0].row_cache.clear();
         app.sessions[0].total_rows = 0;
-        app.sessions[0].sink = app.store.as_ref().unwrap().open_sink(0);
+        app.sessions[0].sink = app.store.as_ref().unwrap().open_sink("tab");
         app.sessions[0].store_dirty = false;
         app.flush_store(); // idle: no-op
         assert!(!app.sessions[0].store_dirty);
@@ -796,28 +1342,350 @@ mod tests {
         assert!(app.sessions[0].store_dirty);
         app.flush_store();
         assert!(!app.sessions[0].store_dirty);
-        let lines = app.store.as_ref().unwrap().load_transcript(0);
+        let lines = app.store.as_ref().unwrap().load_transcript("tab");
         assert_eq!(lines, vec!["only".to_string()]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn respawn_forgets_stored_transcript() {
+    fn respawn_keeps_history_under_a_new_id() {
         let (store, dir) = test_store("respawn");
         let mut app = App::new();
         app.store = Some(store);
-        app.restore_tab(1, BackendKind::Mock);
-        app.sessions[1].push_line("scratch".to_string());
+        app.attach_fresh_store(0);
+        let old_id = app.sessions[0].store_id.clone().expect("id");
+        app.sessions[0].push_line("scratch".to_string());
         app.flush_store();
-        app.active = 1;
         app.respawn_active(BackendKind::Mock);
         app.flush_store();
+        let new_id = app.sessions[0].store_id.clone().expect("id");
+        assert_ne!(old_id, new_id, "respawn must mint a fresh session id");
         let store = app.store.as_ref().expect("store");
-        let lines = store.load_transcript(1);
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].starts_with("--- mock session (fresh) ---"));
-        assert!(app.sessions[1].remote_id.is_none());
+        // Old session intact for `/sessions`; new one holds the marker.
+        let old = store.load_transcript(&old_id);
+        assert!(old.iter().any(|l| l == "scratch"));
+        let fresh = store.load_transcript(&new_id);
+        assert_eq!(fresh.len(), 1);
+        assert!(fresh[0].starts_with("--- mock session (fresh) ---"));
+        assert!(app.sessions[0].remote_id.is_none());
+        assert_eq!(store.list_sessions().len(), 2);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tab_new_grows_to_max_then_flashes() {
+        let mut app = App::new();
+        app.open_tab();
+        app.open_tab();
+        assert_eq!(app.sessions.len(), 3);
+        assert_eq!(app.active, 2);
+        assert_eq!(app.sessions[2].name, "s3");
+        assert_eq!(app.outbox.respawns.len(), 2);
+        app.open_tab();
+        assert_eq!(app.sessions.len(), 3);
+        assert!(app.flash.contains("max"));
+    }
+
+    #[test]
+    fn tab_close_removes_and_renumbers() {
+        let mut app = App::new();
+        app.open_tab();
+        app.open_tab();
+        // Queue work on the last tab; closing the middle must renumber it.
+        app.active = 2;
+        app.active_mut().input = "hi".to_string();
+        app.active_mut().backend = BackendKind::Agy;
+        app.submit();
+        assert_eq!(app.outbox.submits.len(), 1);
+        assert_eq!(app.outbox.submits[0].tab, 2);
+        app.active = 1;
+        app.active_mut().backend = BackendKind::Agy;
+        app.close_active_tab().expect("close");
+        assert_eq!(app.pending_agy_kill, vec![1], "agy child kill queued");
+        assert_eq!(app.sessions.len(), 2);
+        assert_eq!(app.sessions[0].name, "s1");
+        assert_eq!(app.sessions[1].name, "s2");
+        assert_eq!(app.outbox.submits.len(), 1);
+        assert_eq!(app.outbox.submits[0].tab, 1, "queued work follows its tab");
+        assert!(app.flash.contains("closed tab"));
+    }
+
+    #[test]
+    fn tab_close_queues_grok_session_close() {
+        let mut app = App::new();
+        app.open_tab();
+        app.active = 1;
+        app.active_mut().backend = BackendKind::Grok;
+        app.active_mut().remote_id = Some("acp-sess-9".into());
+        app.close_active_tab().expect("close");
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.pending_grok_close, vec!["acp-sess-9".to_string()]);
+        assert!(app.pending_agy_kill.is_empty());
+    }
+
+    #[test]
+    fn tab_close_refuses_the_last_tab() {
+        let mut app = App::new();
+        let err = app.close_active_tab().expect_err("must refuse");
+        assert!(err.contains("last tab"));
+        assert_eq!(app.sessions.len(), 1);
+    }
+
+    #[test]
+    fn slash_commands_never_reach_a_backend() {
+        let mut app = App::new();
+        app.active_mut().backend = BackendKind::Codex;
+        app.active_mut().remote_id = Some("thread-1".into());
+        app.active_mut().input = "/tab new".to_string();
+        app.submit();
+        assert_eq!(app.sessions.len(), 2, "/tab new opens a tab");
+        assert!(app.outbox.submits.is_empty());
+        assert!(
+            !app.sessions[0].lines.iter().any(|l| l.contains("/tab new")),
+            "command must not echo as a prompt"
+        );
+        app.active_mut().input = "/nope".to_string();
+        app.submit();
+        assert!(app.flash.contains("unknown command"));
+        assert!(app.outbox.submits.is_empty());
+    }
+
+    #[test]
+    fn vim_command_toggles_and_persists() {
+        // Isolate the real config file: nothing else in this suite reads
+        // XDG_CONFIG_HOME, so a scoped override is race-free here.
+        let dir = std::env::temp_dir().join(format!("pf-vim-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let old = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: nothing else in this suite reads XDG_CONFIG_HOME, and
+        // the original value is restored before this test returns.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+        let mut app = App::new();
+        assert!(!app.vim);
+        app.toggle_vim();
+        assert!(app.vim);
+        assert!(app.flash.contains("vim mode on"));
+        let raw = std::fs::read_to_string(dir.join("polyforge").join("config.toml"))
+            .expect("config saved");
+        assert!(raw.contains("vim = true"), "choice persisted: {raw}");
+        // Toggle back: the file follows, so a reboot stays in normal keys.
+        app.toggle_vim();
+        assert!(!app.vim);
+        let raw = std::fs::read_to_string(dir.join("polyforge").join("config.toml"))
+            .expect("config saved");
+        assert!(raw.contains("vim = false"), "choice persisted: {raw}");
+        // SAFETY: restores the pre-test environment (see above).
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_command_respawns_active_tab_fresh() {
+        let mut app = App::new();
+        app.active_mut().backend = BackendKind::Codex;
+        app.active_mut().remote_id = Some("thread-1".into());
+        app.active_mut().push_line("old".to_string());
+        app.active_mut().input = "/new".to_string();
+        app.submit();
+        assert_eq!(app.mode, Mode::Normal);
+        let s = app.active();
+        assert_eq!(s.backend, BackendKind::Codex, "same backend, new session");
+        assert!(s.remote_id.is_none());
+        assert_eq!(s.lines.len(), 1);
+        assert!(s.lines[0].contains("fresh"));
+        assert_eq!(app.outbox.respawns.len(), 1);
+        assert!(app.outbox.submits.is_empty(), "never sent to a backend");
+    }
+
+    #[test]
+    fn sessions_query_filters_like_grok_search() {
+        let (store, _dir) = test_store("sessions-query");
+        for (id, title) in [("aaa", "fix login bug"), ("bbb", "write docs")] {
+            store.save_meta(
+                id,
+                &crate::store::SessionMeta {
+                    backend: "mock".to_string(),
+                    remote_id: None,
+                    created_at: 1000,
+                    updated_at: 1000,
+                    title: title.to_string(),
+                },
+            );
+        }
+        let mut app = App::new();
+        app.store = Some(store);
+        app.mode = Mode::Insert;
+        app.active_mut().input = "/sessions login".to_string();
+        app.submit();
+        assert_eq!(app.mode, Mode::Sessions);
+        assert_eq!(app.sess_list.len(), 1);
+        assert_eq!(app.sess_list[0].id, "aaa");
+        // No match flashes instead of opening.
+        app.mode = Mode::Insert;
+        app.active_mut().input = "/sessions zzz".to_string();
+        app.submit();
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.flash.contains("no sessions match"));
+        let _ = std::fs::remove_dir_all(_dir);
+    }
+
+    #[test]
+    fn delete_selected_session_removes_and_guards_open() {
+        let (store, _dir) = test_store("sessions-delete");
+        let id = crate::store::Store::new_session_id();
+        store.save_meta(
+            &id,
+            &crate::store::SessionMeta {
+                backend: "mock".to_string(),
+                remote_id: None,
+                created_at: 1000,
+                updated_at: 1000,
+                title: "doomed".to_string(),
+            },
+        );
+        let mut app = App::new();
+        app.store = Some(store);
+        // Guard: the session is open in the live tab.
+        app.sessions[0].store_id = Some(id.clone());
+        app.open_session_chooser(String::new());
+        assert_eq!(app.mode, Mode::Sessions);
+        app.delete_selected_session();
+        assert!(app.flash.contains("open in s1"));
+        assert_eq!(app.sess_list.len(), 1, "guarded: files stay");
+        // After closing the reference (fresh id), delete succeeds.
+        app.sessions[0].store_id = Some("other".to_string());
+        app.delete_selected_session();
+        assert!(app.flash.contains("deleted session"));
+        assert!(app.sess_list.is_empty());
+        assert_eq!(app.mode, Mode::Normal, "empty chooser closes");
+        let store = app.store.as_ref().expect("store");
+        assert!(store.list_sessions().is_empty());
+        let _ = std::fs::remove_dir_all(_dir);
+    }
+
+    #[test]
+    fn short_id_shows_id_tail() {
+        assert_eq!(short_id("abc"), "abc");
+        assert_eq!(short_id("1789516800000-1234-5"), "0-1234-5");
+    }
+
+    #[test]
+    fn submitting_sessions_command_opens_the_chooser() {
+        let (store, _dir) = test_store("cmd-sessions");
+        let id = crate::store::Store::new_session_id();
+        store.save_meta(
+            &id,
+            &crate::store::SessionMeta {
+                backend: "mock".to_string(),
+                remote_id: None,
+                created_at: 1000,
+                updated_at: 1000,
+                title: "prior".to_string(),
+            },
+        );
+        let mut app = App::new();
+        app.store = Some(store);
+        app.mode = Mode::Insert;
+        app.active_mut().input = "/sessions".to_string();
+        app.submit();
+        assert_eq!(app.mode, Mode::Sessions, "submit must not clobber the mode");
+        assert_eq!(app.sess_list.len(), 1);
+        let _ = std::fs::remove_dir_all(_dir);
+    }
+
+    #[test]
+    fn session_chooser_empty_store_flashes() {
+        let (store, _dir) = test_store("chooser-empty");
+        let mut app = App::new();
+        app.store = Some(store);
+        app.open_session_chooser(String::new());
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.flash.contains("no previous sessions"));
+        let _ = std::fs::remove_dir_all(_dir);
+    }
+
+    /// Drag across lines with scroll + wrapping resolves exact text.
+    #[test]
+    fn drag_selection_extracts_text() {
+        let mut app = App::new();
+        // Deterministic transcript: 10-char lines, width 10 = 1 row each.
+        app.sessions[0].lines.clear();
+        app.sessions[0].row_cache.clear();
+        app.sessions[0].total_rows = 0;
+        for l in ["aaaabbbbcc", "ddddeeeeFF", "gggghhhhii"] {
+            app.sessions[0].push_line(l.to_string());
+        }
+        app.viewport_width = 10;
+        app.viewport_height = 10;
+        app.active_mut().ensure_cache(10);
+        app.text_area = Some((1, 1, 10, 10));
+        app.active_mut().scroll = 0;
+        // Drag from line 0 char 4 to line 1 char 4.
+        assert!(app.sel_begin(1 + 4, 1 + 0));
+        app.sel_extend(1 + 4, 1 + 1);
+        assert_eq!(app.selected_text().as_deref(), Some("bbbbcc\ndddd"));
+        // Reversed drag normalizes the same way.
+        assert!(app.sel_begin(1 + 4, 1 + 1));
+        app.sel_extend(1 + 4, 1 + 0);
+        assert_eq!(app.selected_text().as_deref(), Some("bbbbcc\ndddd"));
+        // Click without drag copies nothing.
+        assert!(app.sel_begin(1 + 2, 1 + 0));
+        assert_eq!(app.selected_text(), None);
+        // Outside the viewport: no selection.
+        assert!(!app.sel_begin(0, 0));
+        assert!(!app.sel_begin(1, 99));
+    }
+
+    /// Scrolled viewport maps cells to the right lines.
+    #[test]
+    fn drag_selection_honors_scroll() {
+        let mut app = App::new();
+        app.sessions[0].lines.clear();
+        app.sessions[0].row_cache.clear();
+        app.sessions[0].total_rows = 0;
+        for l in ["line-one", "line-two", "line-3"] {
+            app.sessions[0].push_line(l.to_string());
+        }
+        app.viewport_width = 20;
+        app.viewport_height = 20;
+        app.active_mut().ensure_cache(20);
+        app.text_area = Some((0, 5, 20, 20));
+        app.active_mut().scroll = 1; // first visible row is line-two
+        assert!(app.sel_begin(0, 5));
+        app.sel_extend(8, 5);
+        assert_eq!(app.selected_text().as_deref(), Some("line-two"));
+    }
+
+    /// Wide chars occupy two columns in both directions.
+    #[test]
+    fn col_char_mapping_handles_wide_chars() {
+        assert_eq!(col_to_char("aあb", 0), 0);
+        assert_eq!(col_to_char("aあb", 1), 1);
+        assert_eq!(col_to_char("aあb", 2), 1); // second cell of あ
+        assert_eq!(col_to_char("aあb", 3), 2);
+        assert_eq!(col_to_char("aあb", 99), 3); // past end clamps
+        assert_eq!(char_to_col("aあb", 2), 3);
+        // Selection slicing stays on char boundaries.
+        let mut app = App::new();
+        app.sessions[0].lines.clear();
+        app.sessions[0].row_cache.clear();
+        app.sessions[0].total_rows = 0;
+        app.sessions[0].push_line("aあb".to_string());
+        app.viewport_width = 20;
+        app.viewport_height = 20;
+        app.active_mut().ensure_cache(20);
+        app.active_mut().scroll = 0;
+        app.text_area = Some((0, 0, 20, 20));
+        assert!(app.sel_begin(0, 0));
+        app.sel_extend(4, 0); // one past b (end-exclusive)
+        assert_eq!(app.selected_text().as_deref(), Some("aあb"));
     }
 
     #[test]

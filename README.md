@@ -1,12 +1,22 @@
 # polyforge
 
-Vim-modal multi-tab TUI shell for the Muse Spark coding agent.
+Vim-modal multi-tab TUI for coding agents.
 
-Built with Rust (`ratatui` + `crossterm` + `tokio`). Talks MSP over stdio when
-`provider = "muse"`, or runs a quota-free mock backend for UI work.
+One tab = one agent session. Built with Rust (`ratatui` + `crossterm` +
+`tokio`). Fronts five stdio backends:
 
-> Prototype (M2). Interaction model and Muse wire are the focus — not a
+| backend | wire |
+| ------- | ---- |
+| `muse` | Muse Spark via `muse serve` (MSP JSON-RPC) |
+| `codex` | OpenAI Codex via `codex app-server` |
+| `agy` | Antigravity via `agy` stream-json |
+| `grok` | Grok via `grok agent stdio` (ACP) |
+| `mock` | Offline fake for UI work (no quota) |
+
+> Prototype. Interaction model and agent wiring are the focus — not a
 > production client.
+
+Full operator guide: [`docs/USER-MANUAL.md`](docs/USER-MANUAL.md).
 
 ## Run
 
@@ -21,13 +31,18 @@ Needs a real tty (alternate screen + mouse). Inside tmux: wheel and
 
 | mode | keys |
 | ---- | ---- |
-| NORMAL | `j/k`/arrows line · `Ctrl-u/d` half-page · `g` top · `G` bottom · `/` search · `n/N` next/prev · `i/a` insert · `1/2/3`/`Tab` tabs · `m` mouse toggle · `q` or `Ctrl-c` quit |
-| INSERT | type · `←/→` move · `Enter` send · `Esc`/`Ctrl-[` normal |
+| NORMAL (default keys) | arrows line · `PgUp/PgDn` half-page · `Home/End` top/bottom · `/` search · `n/N` next/prev · `Space`/`Enter` insert · digits/`Tab` tabs · `P` provider · `R` fresh session · `m` mouse toggle · `q` quit |
+| NORMAL·vim (`/vim`) | `j/k` line · `Ctrl-u/d` half-page · `g`/`G` top/bottom · `Space`/`i`/`a` insert (rest as above; `Enter` does nothing) |
+| INSERT | type · `←/→` move · `Enter` send · `Esc`/`Ctrl-[` normal · `/sessions` `/new` `/tab new` `/tab close` `/vim` `/help` commands |
 | SEARCH | `Enter` find · `Esc` cancel |
+| PICKER | `j/k` move · `Enter` switch · `1-5` quick · `Esc` cancel |
+| SESSIONS | `j/k` move · `Enter` view + continue · `d` delete · `1-9` quick · `Esc` cancel |
 | DIFF modal | `y` approve · `n` reject · `a` approve-all · `q`/`Esc` later |
 
-Mouse: wheel = 3 lines, `Shift+wheel` = page. `●` tab = busy (streams in
-background), bell rings on done.
+Mouse: wheel = 3 lines, `Shift+wheel` = page. Drag across the transcript
+to highlight; releasing copies via native clipboard + tmux buffer + OSC 52
+(grok-CLI parity, always backed up to `last-copy.txt`). `●` tab = busy
+(streams in background), bell rings on done.
 
 ## Config
 
@@ -35,8 +50,9 @@ background), bell rings on done.
 
 ```toml
 [polyforge]
-provider = "muse"   # default backend for all tabs: muse | codex | mock
+provider = "muse"   # default backend: muse | codex | agy | grok | mock
 # workspace = "/path"  # default: cwd
+# vim = false  # vim keymap (j/k/g/G/i/a); toggled live with /vim (saves here)
 
 [muse]
 # bin = "muse"
@@ -51,60 +67,59 @@ provider = "muse"   # default backend for all tabs: muse | codex | mock
 # bin = "agy"
 # model = "..."  # omitted = server default
 # agent = "..."  # omitted = server default
+
+[grok]
+# bin = "grok"
+# model = "grok-4.1"  # omitted = server default (session/set_config_option)
 ```
 
-Press `P` on any tab for the provider picker (`j/k` + `Enter`, `1-4`
+Press `P` on any tab for the provider picker (`j/k` + `Enter`, `1-5`
 quick-pick, `Esc` cancels): the tab respawns under the chosen backend with
 a FRESH session — history never carries over. Tab bar shows each tab's
 backend (`s1:muse`).
 
+## What each backend does
+
 | provider | behavior |
 | -------- | -------- |
-| `mock` | M1 streaming fake + local diff card |
-| `muse` | spawns `muse serve`, one MSP session per tab (`approvalMode: onRequest`) |
+| `mock` | Streaming fake + local diff card. Offline UI practice. |
+| `muse` | `muse serve`, one MSP session per tab (`approvalMode: onRequest`). Streams deltas; `approval/requested` → y/n/a/q modal; `turn/completed` rings the bell. |
+| `codex` | `codex app-server`, one thread per tab. Approvals answer `approved` / `approved_for_session` / `denied` (`accept*` when offered). Mid-turn writes and guardian reviews render as one-liners. |
+| `agy` | One `agy` child per tab (stream-json). Visible but ungated: no interactive approval modal — workspace writes auto-allow, Ask-actions soft-deny (stderr notices in the transcript). |
+| `grok` | One shared `grok agent stdio` host (ACP), one session per tab. Chunks / thoughts / tools / plans stream; `session/request_permission` → y/n/a/q mapped to ACP option kinds; `q` and unsupported requests answer `cancelled`. |
 
-Muse path: streams `item/delta` to the transcript, raises
-`approval/requested` as the y/n/a/q modal (`q` denies with "re-ask later"),
-rings on `turn/completed`. Muse owns `session.jsonl` persistence.
+No login: tabs stay navigable and show the fix (`muse login`, `codex login`,
+or sign in via `grok`). A failed host greys out only that backend.
 
-No login: tabs show `muse: not logged in — run \`muse login\`` (or the
-`codex login` equivalent) and stay navigable.
+## Sessions and tabs
 
-Sessions resume across restarts (Q10): each tab's transcript appends to
-`$XDG_DATA_HOME/polyforge/sessions/tab{N}.jsonl` (JSON-escaped, capped at
-50k lines with boot-time compaction) plus a `tab{N}.meta.json` with the
-backend and remote id. On boot the transcript replays, then muse re-attaches
-via `session/resume`, codex via `thread/resume`, agy via `--conversation`
-— a failed resume starts fresh and says so. `R` / picker respawn forgets
-the tab's stored transcript and starts clean.
+Boot opens ONE tab with a FRESH session. Transcripts append to
+`$XDG_DATA_HOME/polyforge/sessions/sess-{id}.jsonl` (capped at 50k lines)
+plus `sess-{id}.meta.json` (backend, remote id, timestamps, title).
 
-Codex approvals answer `approved` / `approved_for_session` / `denied`
-(`accept*` family for file edits when offered). Codex `q`/Later maps to
-wire `denied` (not a true defer) when those choices exist. Permissions and
-free-text prompts can only be closed locally for now — the turn stays
-parked server-side. Mid-turn file writes render as `codex: ~ path`
-(`+` add, `-` delete) per-file lines, and guardian auto-reviews show as
-`codex: reviewing …` / `codex: guardian approved — …` (matched by
-segment-tail, since the exact wire prefix is unconfirmed live).
+Session management follows the grok CLI shape:
 
-Antigravity runs one `agy` child per tab (`--input-format stream-json`,
-documented headless protocol): deltas stream, tool steps render with
-outcome, `result` ends the turn with a bell. Per your decision, agy tabs
-are visible-but-ungated — headless agy has no interactive approval, so
-workspace writes auto-allow and Ask-actions soft-deny (their notices
-appear in the transcript from stderr); nothing is ever auto-approved by
-us. `provider = "agy"` (or `antigravity`) makes it the default.
+- `/sessions [query]` — list most-active-first; query filters like search
+- `Enter` — replay transcript + re-attach remote (`session/resume` /
+  `thread/resume` / `--conversation`; failed resume starts fresh and says so)
+- `d` — delete stored session (refused while open in a live tab)
+- `/new` or `R` — fresh session in the active tab (same backend)
+- `/tab new` — new tab (max 3, same backend as current)
+- `/tab close` — kill the tab's session (agy child killed; grok best-effort
+  `session/close`; muse/codex remotes abandoned, transcript kept)
+
+The last tab cannot be closed — `R` starts it fresh instead.
 
 ## Live smoke
 
-Needs Muse login + quota:
+Needs Muse login + quota (or switch provider):
 
 ```sh
 cargo run            # provider defaults to muse/meta
 # i → "reply with exactly: forge-ok" → Enter
 ```
 
-Expect streamed reply, `muse: done ✓`, and a bell. Then try an edit and
+Expect a streamed reply, `muse: done ✓`, and a bell. Then try an edit and
 approve/deny from the modal. Zero-quota UI work: `provider = "mock"`.
 
 ## Known prototype deviations

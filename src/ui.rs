@@ -34,6 +34,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if app.mode == Mode::Picker {
         render_picker_modal(f, app);
     }
+    if app.mode == Mode::Sessions {
+        render_sessions_modal(f, app);
+    }
 }
 
 fn render_tabs(f: &mut Frame, app: &App, area: Rect) {
@@ -62,7 +65,19 @@ fn render_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     let width = area.width.max(1) as usize;
     app.viewport_height = area.height.max(1) as usize;
     app.viewport_width = width;
+    // Inner origin for mouse cell → text mapping (recorded every frame).
+    app.text_area = if area.width > 2 && area.height > 2 {
+        Some((
+            area.x + 1,
+            area.y + 1,
+            area.width - 2,
+            area.height - 2,
+        ))
+    } else {
+        None
+    };
     let vh = app.viewport_height;
+    let sel = app.sel;
     let s = app.active_mut();
     s.ensure_cache(width);
     // Walk the height cache to the first visible row (grok-build-style
@@ -86,14 +101,20 @@ fn render_transcript(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             Style::default()
         };
-        for chunk in crate::app::Session::wrap_line(line, width).iter().skip(sub) {
-            items.push(ListItem::new(Line::from(Span::styled(
-                chunk.clone(),
-                style,
-            ))));
+        let line_len = line.chars().count();
+        let span = sel.and_then(|sel| sel.span_on_line(li, line_len));
+        let chunks = crate::app::Session::wrap_line(line, width);
+        let mut coff = chunks.iter().take(sub).map(|c| c.chars().count()).sum::<usize>();
+        for chunk in chunks.iter().skip(sub) {
+            let spans = match span {
+                Some((ss, se)) => hl_spans(chunk, coff, ss, se, style),
+                None => vec![Span::styled(chunk.clone(), style)],
+            };
+            items.push(ListItem::new(Line::from(spans)));
             if items.len() >= vh {
                 break;
             }
+            coff += chunk.chars().count();
         }
         li += 1;
         sub = 0;
@@ -102,6 +123,36 @@ fn render_transcript(f: &mut Frame, app: &mut App, area: Rect) {
         .borders(Borders::ALL)
         .title(format!(" {} transcript ", s.name));
     f.render_widget(List::new(items).block(block), area);
+}
+
+/// Split one wrapped chunk into plain/highlighted spans for the selected
+/// char range [ss, se). `coff` is the chunk's first-char index in the line.
+fn hl_spans(
+    chunk: &str,
+    coff: usize,
+    ss: usize,
+    se: usize,
+    style: Style,
+) -> Vec<Span<'static>> {
+    let chars: Vec<char> = chunk.chars().collect();
+    let len = chars.len();
+    let s = ss.saturating_sub(coff).min(len);
+    let e = se.saturating_sub(coff).min(len);
+    if s >= e {
+        return vec![Span::styled(chunk.to_string(), style)];
+    }
+    let mut out = Vec::new();
+    if s > 0 {
+        out.push(Span::styled(chars[..s].iter().collect::<String>(), style));
+    }
+    out.push(Span::styled(
+        chars[s..e].iter().collect::<String>(),
+        style.add_modifier(Modifier::REVERSED),
+    ));
+    if e < len {
+        out.push(Span::styled(chars[e..].iter().collect::<String>(), style));
+    }
+    out
 }
 
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
@@ -113,6 +164,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         Mode::Insert => Color::Yellow,
         Mode::Search => Color::Magenta,
         Mode::Picker => Color::Cyan,
+        Mode::Sessions => Color::Blue,
     };
     let line = Line::from(vec![
         Span::styled(
@@ -138,11 +190,17 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_input(f: &mut Frame, app: &mut App, area: Rect) {
+    let normal_title = if app.vim {
+        " input — NORMAL·vim (j/k move, Space/i/a type, / search, P provider, R fresh) "
+    } else {
+        " input — NORMAL (arrows move, Space/Enter type, / search, P provider, R fresh) "
+    };
     let (title, content) = match app.mode {
-        Mode::Normal => (" input — NORMAL (i/a type, / search, P provider, 1-3 tabs) ", app.active().input.clone()),
-        Mode::Insert => (" input — INSERT (Esc done, Enter send) ", app.active().input.clone()),
+        Mode::Normal => (normal_title, app.active().input.clone()),
+        Mode::Insert => (" input — INSERT (Esc done, Enter send · /sessions /new /tab new /tab close /vim /help) ", app.active().input.clone()),
         Mode::Search => (" search — (Enter find, Esc cancel) ", format!("/{}", app.search_input)),
-        Mode::Picker => (" provider — (j/k move, Enter switch, 1-3 quick, Esc cancel) ", String::new()),
+        Mode::Picker => (" provider — (j/k move, Enter switch, 1-5 quick, Esc cancel) ", String::new()),
+        Mode::Sessions => (" sessions — (j/k move, Enter view + continue, d delete, 1-9 quick, Esc cancel) ", String::new()),
     };
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
@@ -200,6 +258,51 @@ fn render_picker_modal(f: &mut Frame, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" PROVIDER — switch starts a fresh session ");
+    f.render_widget(
+        Paragraph::new(lines).block(block).wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_sessions_modal(f: &mut Frame, app: &App) {
+    use crate::app::short_id;
+    use crate::store::fmt_short;
+    let area = centered(f.area(), 78, 60);
+    f.render_widget(Clear, area);
+    // Columns mirror `grok sessions list`: id + created + updated + summary.
+    let lines: Vec<Line> = app
+        .sess_list
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let cursor = if i == app.sess_sel { "> " } else { "  " };
+            let summary = if s.title.is_empty() {
+                s.preview.clone()
+            } else {
+                s.title.clone()
+            };
+            let style = if i == app.sess_sel {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(
+                format!(
+                    "{cursor}{}: [{}] {} {}→{} {}",
+                    i + 1,
+                    s.backend,
+                    short_id(&s.id),
+                    fmt_short(s.created_at),
+                    fmt_short(s.updated_at),
+                    summary,
+                ),
+                style,
+            ))
+        })
+        .collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" SESSIONS — Enter views + continues · d deletes · Esc cancels ");
     f.render_widget(
         Paragraph::new(lines).block(block).wrap(Wrap { trim: false }),
         area,

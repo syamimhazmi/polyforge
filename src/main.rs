@@ -6,8 +6,10 @@
 
 mod agy;
 mod app;
+mod clipboard;
 mod codex;
 mod config;
+mod grok;
 mod mock;
 mod msp;
 mod provider;
@@ -33,6 +35,10 @@ use msp::ServerMsg;
 use codex::{
     apply_codex_approval, apply_codex_notif, codex_bringup, codex_respond,
     codex_resume_thread, codex_start_thread, map_codex_decision,
+};
+use grok::{
+    apply_grok_notif, apply_grok_permission, grok_bringup, grok_close_session,
+    grok_new_session, grok_respond, grok_resume_session, grok_submit, map_grok_decision,
 };
 use provider::{
     map_decision, muse_bringup, muse_decide, muse_resume_session, muse_start_session,
@@ -62,7 +68,10 @@ async fn main() -> io::Result<()> {
 }
 
 struct LiveBackend {
-    host: msp::Host,
+    // Shared: grok's blocking session/prompt runs spawned per submit and
+    // holds a clone until the turn ends (deref coercion keeps &Host call
+    // sites unchanged).
+    host: std::sync::Arc<msp::Host>,
     rx: mpsc::Receiver<ServerMsg>,
 }
 
@@ -70,6 +79,10 @@ struct LiveBackend {
 struct Backends {
     muse: Option<LiveBackend>,
     codex: Option<LiveBackend>,
+    grok: Option<LiveBackend>,
+    /// Completion sender for spawned grok prompts (session/prompt answers
+    /// only at turn end, so submits can't await it in the drain loop).
+    grok_tx: Option<mpsc::Sender<ServerMsg>>,
     /// One agy child per tab (each holds its own conversation).
     agy: Vec<Option<AgyHandle>>,
 }
@@ -79,6 +92,7 @@ impl Backends {
         match kind {
             BackendKind::Muse => self.muse.as_ref(),
             BackendKind::Codex => self.codex.as_ref(),
+            BackendKind::Grok => self.grok.as_ref(),
             BackendKind::Mock | BackendKind::Agy => None,
         }
     }
@@ -101,6 +115,7 @@ async fn ensure_host(backends: &mut Backends, kind: BackendKind, cfg: &Config) -
     let present = match kind {
         BackendKind::Muse => backends.muse.is_some(),
         BackendKind::Codex => backends.codex.is_some(),
+        BackendKind::Grok => backends.grok.is_some(),
         // Agy children are per-tab (see open_tab_session); nothing shared.
         BackendKind::Agy | BackendKind::Mock => true,
     };
@@ -121,7 +136,10 @@ async fn ensure_host(backends: &mut Backends, kind: BackendKind, cfg: &Config) -
             )
             .await?;
             let _ = (ids, degraded);
-            backends.muse = Some(LiveBackend { host, rx });
+            backends.muse = Some(LiveBackend {
+                host: std::sync::Arc::new(host),
+                rx,
+            });
             Ok(())
         }
         BackendKind::Codex => {
@@ -135,7 +153,22 @@ async fn ensure_host(backends: &mut Backends, kind: BackendKind, cfg: &Config) -
             )
             .await?;
             let _ = (ids, degraded);
-            backends.codex = Some(LiveBackend { host, rx });
+            backends.codex = Some(LiveBackend {
+                host: std::sync::Arc::new(host),
+                rx,
+            });
+            Ok(())
+        }
+        BackendKind::Grok => {
+            let (host, prompt_tx, degraded) =
+                grok_bringup(&cfg.grok_bin(), env!("CARGO_PKG_VERSION"), vec![], tx).await?;
+            let _ = degraded;
+            backends.grok = Some(LiveBackend {
+                host: std::sync::Arc::new(host),
+                rx,
+            });
+            // Retained for spawned session/prompt completions (see drain).
+            backends.grok_tx = Some(prompt_tx);
             Ok(())
         }
         // Agy is unreachable here (the respawn drain routes it to
@@ -280,6 +313,54 @@ async fn open_tab_session(
                 },
             }
         }
+        BackendKind::Grok => {
+            let Some(ctx) = backends.get(backend) else {
+                fail(app, "host not running — press P to respawn");
+                return;
+            };
+            // A model-override note rides alongside a fresh id (non-fatal).
+            let fresh_note = |app: &mut App, note: Option<String>| {
+                if let Some(n) = note {
+                    app.sessions[tab].push_line(n);
+                }
+            };
+            match resume {
+                Some(old) => {
+                    match grok_resume_session(&ctx.host, &old, workspace.clone()).await {
+                        Ok(id) => opened(app, id, true),
+                        Err(rerr) => {
+                            match grok_new_session(
+                                &ctx.host,
+                                cfg.grok_model(),
+                                workspace.clone(),
+                            )
+                            .await
+                            {
+                                Ok((id, note)) => {
+                                    let s = &mut app.sessions[tab];
+                                    s.push_line(format!(
+                                        "{tag}: resume failed ({rerr}) — started fresh"
+                                    ));
+                                    fresh_note(app, note);
+                                    opened(app, id, false);
+                                }
+                                Err(e) => fail(app, &e),
+                            }
+                        }
+                    }
+                }
+                None => {
+                    match grok_new_session(&ctx.host, cfg.grok_model(), workspace.clone()).await
+                    {
+                        Ok((id, note)) => {
+                            fresh_note(app, note);
+                            opened(app, id, false);
+                        }
+                        Err(e) => fail(app, &e),
+                    }
+                }
+            }
+        }
         BackendKind::Agy => {
             // A fresh child per switch: kill the old conversation first.
             // A stored conversation id is passed through for continuation.
@@ -320,14 +401,14 @@ async fn run(
     cfg: &Config,
 ) -> io::Result<()> {
     let def = cfg.default_backend();
-    // Q10 resume: restore each tab's backend + transcript from the store
-    // before any bringup, so open_tab_session can re-attach the remote
-    // session it records. Storageless falls back to the configured default.
+    // Keymap is remembered in the config file (`/vim` toggles + saves).
+    app.vim = cfg.polyforge.vim;
+    // Fresh boot: exactly one tab with a NEW session id (previous sessions
+    // stay on disk for `/sessions`). Storageless falls back to no store.
     if let Some(store) = store::Store::open() {
         app.store = Some(store);
-        for tab in 0..app.sessions.len() {
-            app.restore_tab(tab, def);
-        }
+        app.sessions[0].backend = def;
+        app.attach_fresh_store(0);
     } else {
         for s in &mut app.sessions {
             s.backend = def;
@@ -337,10 +418,13 @@ async fn run(
     let mut backends = Backends::default();
     // One shared channel for all agy tab children.
     let (agy_tx, mut agy_rx) = mpsc::channel::<ServerMsg>(256);
-    // Bring up every Muse/Codex host actually needed after restore (not just
-    // the configured default). Grey-out only the backends whose ensure fails.
+    // Bring up every shared host actually needed (not just the configured
+    // default). Grey-out only the backends whose ensure fails.
     for kind in App::backends_needed(&app.sessions) {
-        if matches!(kind, BackendKind::Muse | BackendKind::Codex) {
+        if matches!(
+            kind,
+            BackendKind::Muse | BackendKind::Codex | BackendKind::Grok
+        ) {
             if let Err(e) = ensure_host(&mut backends, kind, cfg).await {
                 grey_out(app, kind, &e);
             }
@@ -349,8 +433,10 @@ async fn run(
     for tab in 0..app.sessions.len() {
         let kind = app.sessions[tab].backend;
         // Host already greyed out: skip so we don't clobber the ensure error.
-        if matches!(kind, BackendKind::Muse | BackendKind::Codex)
-            && backends.get(kind).is_none()
+        if matches!(
+            kind,
+            BackendKind::Muse | BackendKind::Codex | BackendKind::Grok
+        ) && backends.get(kind).is_none()
         {
             continue;
         }
@@ -402,6 +488,29 @@ async fn run(
                             app.scroll_lines(step);
                             dirty = true;
                         }
+                        // Drag-to-select in the transcript; release copies.
+                        MouseEventKind::Down(_) => {
+                            if app.mouse && app.sel_begin(m.column, m.row) {
+                                dirty = true;
+                            }
+                        }
+                        MouseEventKind::Drag(_) => {
+                            if app.mouse && app.sel.is_some() {
+                                app.sel_extend(m.column, m.row);
+                                dirty = true;
+                            }
+                        }
+                        MouseEventKind::Up(_) => {
+                            if app.mouse && app.sel.is_some() {
+                                match app.selected_text() {
+                                    Some(text) => {
+                                        app.flash = copy_to_clipboard(&text);
+                                    }
+                                    None => app.sel = None, // click: clear silently
+                                }
+                                dirty = true;
+                            }
+                        }
                         _ => {}
                     },
                     _ => {}
@@ -420,6 +529,15 @@ async fn run(
             codex_msg = backend_msg(&mut backends.codex) => {
                 let had = codex_msg.is_some();
                 if backend_frame(app, BackendKind::Codex, &mut backends.codex, codex_msg) {
+                    ring_bell();
+                }
+                if had {
+                    dirty = true;
+                }
+            }
+            grok_msg = backend_msg(&mut backends.grok) => {
+                let had = grok_msg.is_some();
+                if backend_frame(app, BackendKind::Grok, &mut backends.grok, grok_msg) {
                     ring_bell();
                 }
                 if had {
@@ -454,6 +572,40 @@ async fn run(
         if drain_outbox(app, &mut backends, cfg, &agy_tx).await {
             dirty = true;
         }
+        // Kill agy children of `/tab close`d tabs (queued indices refer to
+        // the layout at close time: compensate for earlier removals with a
+        // strictly-less shift so surviving tabs keep their handles).
+        if !app.pending_agy_kill.is_empty() {
+            let mut removed: Vec<usize> = Vec::new();
+            for tab in app.pending_agy_kill.drain(..) {
+                let idx = tab.saturating_sub(removed.iter().filter(|r| **r < tab).count());
+                if backends.agy.len() > idx {
+                    // Removing the slot keeps handles aligned with tabs;
+                    // shutdown kills the child (drop alone would leak it).
+                    if let Some(h) = backends.agy.remove(idx) {
+                        h.shutdown().await;
+                    }
+                    removed.push(idx);
+                    dirty = true;
+                }
+            }
+        }
+        // Server-side close for `/tab close`d grok tabs (best-effort,
+        // spawned: a hung server must never stall the event loop).
+        if !app.pending_grok_close.is_empty() {
+            if let Some(ctx) = backends.get(BackendKind::Grok) {
+                let host = ctx.host.clone();
+                let sids: Vec<String> = app.pending_grok_close.drain(..).collect();
+                tokio::spawn(async move {
+                    for sid in sids {
+                        grok_close_session(&host, &sid).await;
+                    }
+                });
+                dirty = true;
+            } else {
+                app.pending_grok_close.clear();
+            }
+        }
         // Persist transcript lines toward disk (free when buffers are empty).
         app.flush_store();
         let due = last_draw.map(|t| t.elapsed() >= MIN_DRAW).unwrap_or(true);
@@ -466,11 +618,23 @@ async fn run(
             break;
         }
     }
+    // In-flight spawned grok prompts hold the last Arcs: try_unwrap then
+    // misses, and the final drop kills the child (kill_on_drop) after
+    // stdin EOF already asked it to exit. No headless leak either way.
     if let Some(ctx) = backends.muse {
-        ctx.host.shutdown().await;
+        if let Ok(host) = std::sync::Arc::try_unwrap(ctx.host) {
+            host.shutdown().await;
+        }
     }
     if let Some(ctx) = backends.codex {
-        ctx.host.shutdown().await;
+        if let Ok(host) = std::sync::Arc::try_unwrap(ctx.host) {
+            host.shutdown().await;
+        }
+    }
+    if let Some(ctx) = backends.grok {
+        if let Ok(host) = std::sync::Arc::try_unwrap(ctx.host) {
+            host.shutdown().await;
+        }
     }
     for slot in backends.agy.iter_mut() {
         if let Some(h) = slot.take() {
@@ -545,11 +709,16 @@ fn handle_server_msg(app: &mut App, kind: BackendKind, msg: ServerMsg) -> bool {
                         (waiting.len() == 1).then_some(waiting[0])
                     })
                     .unwrap_or(app.active),
+                (BackendKind::Grok, _) => match tab_for_session(app, kind, &params) {
+                    Some(tab) => tab,
+                    None => return false,
+                },
                 _ => tab_for_session(app, kind, &params).unwrap_or(app.active),
             };
             match kind {
                 BackendKind::Muse => provider::apply_notif(app, tab, &method, &params),
                 BackendKind::Codex => apply_codex_notif(app, tab, &method, &params),
+                BackendKind::Grok => apply_grok_notif(app, tab, &method, &params),
                 BackendKind::Agy => apply_agy_notif(app, tab, &method, &params),
                 BackendKind::Mock => false,
             }
@@ -558,6 +727,17 @@ fn handle_server_msg(app: &mut App, kind: BackendKind, msg: ServerMsg) -> bool {
             BackendKind::Codex => {
                 let tab = tab_for_session(app, kind, &params).unwrap_or(app.active);
                 apply_codex_approval(app, tab, &method, id, &params)
+            }
+            BackendKind::Grok => {
+                match tab_for_session(app, kind, &params) {
+                    Some(tab) => apply_grok_permission(app, tab, &method, id, &params),
+                    None => {
+                        grok::queue_grok_cancelled(app, app.active, id);
+                        app.active_mut().push_line(format!("grok: cancelled orphan request {method}"));
+                        app.flash = format!("grok: cancelled orphan request {method}");
+                        false
+                    }
+                }
             }
             _ => {
                 app.flash = format!("{tag}: unexpected server request {method}");
@@ -579,7 +759,7 @@ fn tab_for_session(
     params: &serde_json::Value,
 ) -> Option<usize> {
     let keys: &[&str] = match kind {
-        BackendKind::Muse => &["sessionId"],
+        BackendKind::Muse | BackendKind::Grok => &["sessionId"],
         BackendKind::Codex => &["threadId", "conversationId"],
         BackendKind::Agy => &["conversation_id"],
         BackendKind::Mock => return None,
@@ -625,6 +805,22 @@ async fn drain_outbox(
     while let Some(sub) = app.outbox.submits.pop() {
         did = true;
         let tag = sub.backend.label();
+        // Grok prompts answer only at turn end: spawn, completion
+        // re-enters as grok/prompt_completed (never await in the drain).
+        if sub.backend == BackendKind::Grok {
+            let sid = app.sessions[sub.tab].remote_id.clone();
+            match (backends.get(sub.backend), backends.grok_tx.clone(), sid) {
+                (Some(ctx), Some(tx), Some(id)) => {
+                    grok_submit(ctx.host.clone(), tx, id, sub.prompt);
+                }
+                _ => {
+                    let s = &mut app.sessions[sub.tab];
+                    s.busy = false;
+                    s.push_line(format!("{tag}: no session for this tab — press P to respawn"));
+                }
+            }
+            continue;
+        }
         if sub.backend == BackendKind::Agy {
             let handle = backends.agy.get(sub.tab).and_then(|o| o.as_ref());
             match handle {
@@ -656,7 +852,8 @@ async fn drain_outbox(
                             .await
                             .map_err(|e| e.to_string())
                     }
-                    BackendKind::Mock | BackendKind::Agy => Ok(()),
+                    // Grok exits via the spawned early-continue above.
+                    BackendKind::Mock | BackendKind::Agy | BackendKind::Grok => Ok(()),
                 };
                 if let Err(e) = res {
                     let s = &mut app.sessions[sub.tab];
@@ -674,6 +871,21 @@ async fn drain_outbox(
     while let Some(d) = app.outbox.decides.pop() {
         did = true;
         let tag = d.backend.label();
+        // Grok replies are host-level JSON-RPC responses, including orphan
+        // requests. They must not depend on a surviving tab/session.
+        if d.backend == BackendKind::Grok {
+            if let Some(host) = backends.get(d.backend).map(|c| &c.host) {
+                let payload = serde_json::from_str(&d.choice_id).unwrap_or(
+                    serde_json::json!({"outcome": {"outcome": "cancelled"}}),
+                );
+                if let Err(e) = grok_respond(host, d.requirement_id, payload).await {
+                    app.flash = format!("grok: decide failed: {e}");
+                }
+            } else {
+                app.flash = "grok: no host for response".into();
+            }
+            continue;
+        }
         let sid = app.sessions[d.tab].remote_id.clone();
         let host = backends.get(d.backend).map(|c| &c.host);
         match (host, sid) {
@@ -689,6 +901,7 @@ async fn drain_outbox(
                     )
                     .await
                     .map_err(|e| e.to_string()),
+                    BackendKind::Grok => unreachable!("handled above"),
                     BackendKind::Mock | BackendKind::Agy => Ok(()),
                 };
                 if let Err(e) = res {
@@ -717,6 +930,13 @@ fn apply_mouse_capture(app: &App) -> io::Result<()> {
 fn ring_bell() {
     print!("\x07");
     let _ = io::stdout().flush();
+}
+
+/// Copy entry point: grok-parity legs (native + tmux + OSC 52) with an
+/// always-written backup file. Returns the status flash naming where the
+/// text landed.
+fn copy_to_clipboard(text: &str) -> String {
+    clipboard::copy_text_or_file(text).toast_message()
 }
 
 fn clear_pending_g(app: &mut App) {
@@ -801,6 +1021,39 @@ fn decide_ui(app: &mut App, kind: DecisionKind, label: &str) {
                 }
             }
         }
+        BackendKind::Grok => {
+            let approval = app.active().pending_approval.clone();
+            match approval {
+                Some(a) => match map_grok_decision(&a, kind) {
+                    Some((req_id, payload)) => {
+                        app.outbox.decides.push(OutboxDecide {
+                            tab,
+                            backend,
+                            approval_id: a.approval_id,
+                            requirement_id: req_id,
+                            choice_id: payload.to_string(),
+                            feedback: None,
+                        });
+                        if app.approved("grok", label) {
+                            ring_bell();
+                        }
+                    }
+                    None => {
+                        grok::queue_grok_cancelled(app, tab, a.requirement_id);
+                        app.approved("grok", "cancelled");
+                        app.flash = format!(
+                            "grok: cancelled — server offered no matching option for `{label}`"
+                        );
+                        ring_bell();
+                    }
+                },
+                None => {
+                    if app.approved("grok", label) {
+                        ring_bell();
+                    }
+                }
+            }
+        }
         BackendKind::Agy => {
             // Agy has no interactive approvals (vendor policy decides); the
             // modal can never appear, so any key here just ensures closure.
@@ -852,11 +1105,11 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         Mode::Normal => match code {
             KeyCode::Char('c') if ctrl => app.should_quit = true,
             KeyCode::Char('q') if no_mods => app.should_quit = true,
-            KeyCode::Char('j') if no_mods => {
+            KeyCode::Char('j') if no_mods && app.vim => {
                 clear_pending_g(app);
                 app.scroll_lines(1);
             }
-            KeyCode::Char('k') if no_mods => {
+            KeyCode::Char('k') if no_mods && app.vim => {
                 clear_pending_g(app);
                 app.scroll_lines(-1);
             }
@@ -879,13 +1132,32 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 app.scroll_lines(h);
             }
             // Prototype deviation (documented): single `g` = top, `G` = bottom.
-            KeyCode::Char('g') if no_mods => {
+            KeyCode::Char('g') if no_mods && app.vim => {
                 app.scroll_top();
                 clear_pending_g(app);
             }
-            KeyCode::Char('G') if no_mods => {
+            KeyCode::Char('G') if no_mods && app.vim => {
                 app.scroll_bottom();
                 clear_pending_g(app);
+            }
+            // Universal (both keymaps): full-size keys for the same moves.
+            KeyCode::PageDown if no_mods => {
+                clear_pending_g(app);
+                let h = app.half_page();
+                app.scroll_lines(h);
+            }
+            KeyCode::PageUp if no_mods => {
+                clear_pending_g(app);
+                let h = app.half_page();
+                app.scroll_lines(-h);
+            }
+            KeyCode::Home if no_mods => {
+                clear_pending_g(app);
+                app.scroll_top();
+            }
+            KeyCode::End if no_mods => {
+                clear_pending_g(app);
+                app.scroll_bottom();
             }
             KeyCode::Char('/') if no_mods => {
                 clear_pending_g(app);
@@ -901,7 +1173,17 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 clear_pending_g(app);
                 app.search_step(-1);
             }
-            KeyCode::Char('i') | KeyCode::Char('a') if no_mods => {
+            KeyCode::Char('i') | KeyCode::Char('a') if no_mods && app.vim => {
+                clear_pending_g(app);
+                app.mode = Mode::Insert;
+            }
+            // Normal keymap: Enter types (vim users keep i/a).
+            KeyCode::Enter if !app.vim => {
+                clear_pending_g(app);
+                app.mode = Mode::Insert;
+            }
+            // Space types in BOTH keymaps (dx shortcut: no Enter needed).
+            KeyCode::Char(' ') => {
                 clear_pending_g(app);
                 app.mode = Mode::Insert;
             }
@@ -920,9 +1202,17 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                     .unwrap_or(0);
                 app.mode = Mode::Picker;
             }
-            KeyCode::Char(c) if no_mods && ['1', '2', '3'].contains(&c) => {
+            KeyCode::Char('R') if no_mods => {
                 clear_pending_g(app);
-                app.active = (c as usize - '1' as usize).min(app.sessions.len() - 1);
+                // Same-backend fresh respawn (the restore banner's promise).
+                let cur = app.sessions[app.active].backend;
+                app.respawn_active(cur);
+            }
+            KeyCode::Char(c)
+                if no_mods && c >= '1' && (c as usize - '1' as usize) < app.sessions.len() =>
+            {
+                clear_pending_g(app);
+                app.active = c as usize - '1' as usize;
                 app.stick_to_bottom();
             }
             KeyCode::Tab if no_mods => {
@@ -1003,9 +1293,33 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 let (backend, _) = BackendKind::ALL[app.picker_sel];
                 app.respawn_active(backend);
             }
-            KeyCode::Char(c) if no_mods && ['1', '2', '3', '4'].contains(&c) => {
+            KeyCode::Char(c) if no_mods && ['1', '2', '3', '4', '5'].contains(&c) => {
                 let i = (c as usize - '1' as usize).min(BackendKind::ALL.len() - 1);
                 app.respawn_active(BackendKind::ALL[i].0);
+            }
+            _ => {}
+        },
+        Mode::Sessions => match code {
+            KeyCode::Esc => app.mode = Mode::Normal,
+            KeyCode::Char('[') if ctrl => app.mode = Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down if no_mods => {
+                if !app.sess_list.is_empty() {
+                    app.sess_sel = (app.sess_sel + 1) % app.sess_list.len();
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up if no_mods => {
+                if !app.sess_list.is_empty() {
+                    app.sess_sel =
+                        (app.sess_sel + app.sess_list.len() - 1) % app.sess_list.len();
+                }
+            }
+            KeyCode::Enter => app.choose_session(app.sess_sel),
+            KeyCode::Char('d') if no_mods => app.delete_selected_session(),
+            KeyCode::Char(c) if no_mods && c >= '1' && c <= '9' => {
+                let i = c as usize - '1' as usize;
+                if i < app.sess_list.len() {
+                    app.choose_session(i);
+                }
             }
             _ => {}
         },
@@ -1024,6 +1338,88 @@ mod tests {
     use super::*;
     use crate::app::{ApprovalChoice, PendingApproval, PendingDiff};
     use crossterm::event::{KeyCode, KeyModifiers};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grok_cancelled_requests_reach_host_without_remote_session() {
+        let (tx, rx) = mpsc::channel(4);
+        let host = msp::Host::spawn("/bin/sh", &["-c", r#"
+            while read -r response; do
+                printf '{"method":"observed","params":%s}\n' "$response"
+            done
+        "#], &[], tx).await.unwrap();
+        let mut backends = Backends {
+            grok: Some(LiveBackend { host: std::sync::Arc::new(host), rx }),
+            ..Default::default()
+        };
+        let mut app = App::new();
+        app.active_mut().backend = BackendKind::Grok;
+        app.active_mut().remote_id = Some("known".into());
+        let (agy_tx, _agy_rx) = mpsc::channel(1);
+        for (id, method, sid) in [(1, "x.ai/ask_user_question", "known"),
+            (2, "session/request_permission", "orphan")] {
+            handle_server_msg(&mut app, BackendKind::Grok, ServerMsg::Request {
+                id: serde_json::json!(id), method: method.into(),
+                params: serde_json::json!({"sessionId":sid}),
+            });
+        }
+        assert!(app.active().lines.iter().any(|l| l.contains("question, not an approval")));
+        // A tab can disappear before drain; host-level responses still apply.
+        app.sessions.clear();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            assert!(drain_outbox(&mut app, &mut backends, &Config::default(), &agy_tx).await);
+            for expected_id in [2, 1] {
+                match backends.grok.as_mut().unwrap().rx.recv().await.unwrap() {
+                    ServerMsg::Notif { params, .. } => {
+                        assert_eq!(params["id"], expected_id);
+                        assert_eq!(params["result"]["outcome"]["outcome"], "cancelled");
+                    }
+                    other => panic!("unexpected: {other:?}"),
+                }
+            }
+        }).await.expect("cancelled response did not reach host");
+    }
+
+    #[test]
+    fn grok_unmatched_frames_cannot_change_active_approval_or_busy_state() {
+        let mut app = muse_modal_app();
+        app.active_mut().busy = true;
+        for sid in [serde_json::json!("orphan"), serde_json::Value::Null] {
+            for method in ["session/request_permission", "x.ai/ask_user_question"] {
+                handle_server_msg(&mut app, BackendKind::Grok, ServerMsg::Request {
+                    id: serde_json::json!(17), method: method.into(),
+                    params: serde_json::json!({"sessionId": sid}),
+                });
+                let reply = app.outbox.decides.pop().unwrap();
+                assert_eq!(reply.backend, BackendKind::Grok);
+                assert_eq!(reply.requirement_id, 17);
+                assert_eq!(serde_json::from_str::<serde_json::Value>(&reply.choice_id).unwrap()["outcome"]["outcome"], "cancelled");
+                assert!(app.flash.contains("orphan"));
+            }
+            for method in ["grok/prompt_completed", "session/update"] {
+                assert!(!handle_server_msg(&mut app, BackendKind::Grok, ServerMsg::Notif {
+                    method: method.into(), params: serde_json::json!({"sessionId": sid, "stopReason":"end_turn"}),
+                }));
+            }
+            assert!(app.active().busy);
+            assert_eq!(app.active().pending_approval.as_ref().unwrap().approval_id, "a1");
+            assert!(app.active().pending_diff.is_some());
+        }
+    }
+
+    #[test]
+    fn grok_unmappable_decision_queues_cancelled_and_closes_card() {
+        let mut app = muse_modal_app();
+        app.active_mut().backend = BackendKind::Grok;
+        app.active_mut().pending_approval.as_mut().unwrap().requirement_id = serde_json::json!(42);
+        decide_ui(&mut app, DecisionKind::ApproveAll, "approved-all");
+        assert!(app.active().pending_approval.is_none());
+        assert!(app.active().pending_diff.is_none());
+        assert!(app.flash.contains("no matching option"));
+        assert_eq!(app.outbox.decides.len(), 1);
+        assert_eq!(app.outbox.decides[0].requirement_id, 42);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&app.outbox.decides[0].choice_id).unwrap()["outcome"]["outcome"], "cancelled");
+    }
 
     const NONE: KeyModifiers = KeyModifiers::empty();
     const SHIFT: KeyModifiers = KeyModifiers::SHIFT;
@@ -1146,6 +1542,24 @@ mod tests {
         assert_eq!(app.outbox.respawns[0].backend, BackendKind::Codex);
     }
 
+    /// R respawns the active tab fresh under its current backend.
+    #[test]
+    fn r_respawns_active_tab_same_backend() {
+        let mut app = App::new();
+        app.active_mut().backend = BackendKind::Codex;
+        app.active_mut().remote_id = Some("thread-1".into());
+        app.active_mut().push_line("old history".to_string());
+        handle_key(&mut app, KeyCode::Char('R'), SHIFT);
+        assert_eq!(app.mode, Mode::Normal);
+        let s = app.active();
+        assert_eq!(s.backend, BackendKind::Codex);
+        assert!(s.remote_id.is_none());
+        assert_eq!(s.lines.len(), 1); // marker only: history never carries over
+        assert!(s.lines[0].contains("fresh"));
+        assert_eq!(app.outbox.respawns.len(), 1);
+        assert_eq!(app.outbox.respawns[0].backend, BackendKind::Codex);
+    }
+
     /// Picker Esc cancels without touching the tab.
     #[test]
     fn picker_esc_cancels() {
@@ -1170,14 +1584,86 @@ mod tests {
         assert!(app.active().busy);
     }
 
-    /// Picker reaches all four backends.
+    /// Sessions chooser: j/k move, out-of-range digits are a no-op,
+    /// Esc cancels without touching the tab.
     #[test]
-    fn picker_lists_four_backends() {
+    fn sessions_keys_navigate_and_cancel() {
+        fn stored(id: &str) -> crate::store::StoredSession {
+            crate::store::StoredSession {
+                id: id.to_string(),
+                backend: "mock".to_string(),
+                remote_id: None,
+                created_at: 1000,
+                updated_at: 1000,
+                title: String::new(),
+                preview: "preview".to_string(),
+            }
+        }
+        let mut app = App::new();
+        app.sess_list = vec![stored("a"), stored("b")];
+        app.mode = Mode::Sessions;
+        handle_key(&mut app, KeyCode::Char('j'), NONE);
+        assert_eq!(app.sess_sel, 1);
+        handle_key(&mut app, KeyCode::Char('k'), NONE);
+        assert_eq!(app.sess_sel, 0);
+        handle_key(&mut app, KeyCode::Char('9'), NONE);
+        assert_eq!(app.mode, Mode::Sessions, "out-of-range digit is a no-op");
+        assert!(app.outbox.respawns.is_empty());
+        handle_key(&mut app, KeyCode::Esc, NONE);
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.outbox.respawns.is_empty());
+    }
+
+    /// Digit tabs follow the live tab count (boot = 1 tab).
+    #[test]
+    fn digit_tabs_are_dynamic() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('2'), NONE);
+        assert_eq!(app.active, 0, "no second tab yet: digit ignored");
+        app.open_tab();
+        handle_key(&mut app, KeyCode::Char('2'), NONE);
+        assert_eq!(app.active, 1);
+        handle_key(&mut app, KeyCode::Char('1'), NONE);
+        assert_eq!(app.active, 0);
+    }
+
+    /// Picker reaches all five backends.
+    #[test]
+    fn picker_lists_five_backends() {
         let mut app = App::new();
         handle_key(&mut app, KeyCode::Char('P'), SHIFT);
         handle_key(&mut app, KeyCode::Char('4'), NONE);
         assert_eq!(app.active().backend, BackendKind::Agy);
         assert_eq!(app.outbox.respawns.len(), 1);
+        handle_key(&mut app, KeyCode::Char('P'), SHIFT);
+        handle_key(&mut app, KeyCode::Char('5'), NONE);
+        assert_eq!(app.active().backend, BackendKind::Grok);
+        // Same tab re-picked: the stale Agy respawn is dropped, one Grok
+        // respawn queued.
+        assert_eq!(app.outbox.respawns.len(), 1);
+        assert_eq!(app.outbox.respawns[0].backend, BackendKind::Grok);
+    }
+
+    /// Submit on a grok tab queues a backend-tagged submit (the drain
+    /// spawns session/prompt); submit on a dead tab reports, never hangs.
+    #[test]
+    fn submit_routes_grok_tab() {
+        let mut app = App::new();
+        app.active_mut().backend = BackendKind::Grok;
+        app.active_mut().remote_id = Some("acp-sess-1".into());
+        app.active_mut().input = "hi".to_string();
+        app.submit();
+        assert_eq!(app.outbox.submits.len(), 1);
+        assert_eq!(app.outbox.submits[0].backend, BackendKind::Grok);
+        assert!(app.active().busy);
+
+        let mut dead = App::new();
+        dead.active_mut().backend = BackendKind::Grok;
+        dead.active_mut().input = "hi".to_string();
+        dead.submit();
+        assert!(dead.outbox.submits.is_empty());
+        assert!(!dead.active().busy);
+        assert!(dead.active().lines.iter().any(|l| l.contains("grok")));
     }
 
     /// Submit on a codex tab queues a backend-tagged submit (async drain
@@ -1202,12 +1688,20 @@ mod tests {
         assert!(dead.active().lines.iter().any(|l| l.contains("codex")));
     }
 
+    /// Scrollable app: production tabs open empty, so tests seed filler.
+    fn scroll_app(vim: bool) -> App {
+        let mut app = App::new();
+        crate::mock::seed(&mut app.sessions[0]);
+        app.vim = vim;
+        app.viewport_height = 20;
+        app.stick_to_bottom();
+        app
+    }
+
     /// Crossterm delivers `G` as Char('G')+SHIFT; it must jump to bottom.
     #[test]
     fn shift_g_goes_to_bottom() {
-        let mut app = App::new();
-        app.viewport_height = 20;
-        app.stick_to_bottom();
+        let mut app = scroll_app(true);
         let max = app.active().lines.len().saturating_sub(20);
         handle_key(&mut app, KeyCode::Char('g'), NONE);
         assert_eq!(app.active().scroll, 0);
@@ -1224,9 +1718,7 @@ mod tests {
     /// Plain keys keep working alongside the Shift tolerance.
     #[test]
     fn plain_keys_unaffected() {
-        let mut app = App::new();
-        app.viewport_height = 20;
-        app.stick_to_bottom();
+        let mut app = scroll_app(true);
         let max = app.active().lines.len().saturating_sub(20);
         handle_key(&mut app, KeyCode::Char('k'), NONE);
         assert_eq!(app.active().scroll, max - 1);
@@ -1234,5 +1726,78 @@ mod tests {
         assert!(!app.flash.is_empty());
         handle_key(&mut app, KeyCode::Char('q'), NONE);
         assert!(app.should_quit);
+    }
+
+    /// Default keymap is NOT vim: j/k/g/G/i/a do nothing, Enter types.
+    #[test]
+    fn normal_keymap_ignores_vim_keys() {
+        let mut app = App::new();
+        assert!(!app.vim);
+        app.viewport_height = 20;
+        app.stick_to_bottom();
+        let scroll = app.active().scroll;
+        for c in ['j', 'k', 'g', 'G', 'i', 'a'] {
+            handle_key(&mut app, KeyCode::Char(c), NONE);
+        }
+        assert_eq!(app.active().scroll, scroll);
+        assert_eq!(app.mode, Mode::Normal);
+        handle_key(&mut app, KeyCode::Enter, NONE);
+        assert_eq!(app.mode, Mode::Insert, "Enter types in the normal keymap");
+    }
+
+    /// Space enters insert in BOTH keymaps (dx shortcut).
+    #[test]
+    fn space_types_in_both_keymaps() {
+        for vim in [false, true] {
+            let mut app = App::new();
+            app.vim = vim;
+            handle_key(&mut app, KeyCode::Char(' '), NONE);
+            assert_eq!(app.mode, Mode::Insert, "vim={vim}: Space must type");
+        }
+    }
+
+    /// Vim keymap: i/a type, Enter does NOT enter insert.
+    #[test]
+    fn vim_keymap_types_with_i_a_only() {
+        let mut app = App::new();
+        app.vim = true;
+        handle_key(&mut app, KeyCode::Enter, NONE);
+        assert_eq!(app.mode, Mode::Normal, "Enter must not type in vim mode");
+        handle_key(&mut app, KeyCode::Char('i'), NONE);
+        assert_eq!(app.mode, Mode::Insert);
+    }
+
+    /// A command typed in Normal mode lands in Search; a miss that looks
+    /// like a command must redirect to Insert mode instead of silence.
+    #[test]
+    fn failed_search_matching_a_command_redirects_to_insert() {
+        let mut app = App::new();
+        app.mode = Mode::Search;
+        app.search_input = "tab close".to_string();
+        app.run_search();
+        assert!(app.flash.contains("INSERT mode"), "flash: {}", app.flash);
+        assert!(app.flash.contains("/tab close"), "flash: {}", app.flash);
+        // Ordinary misses keep the plain message (no false redirect).
+        app.search_input = "zzz-no-such-line".to_string();
+        app.run_search();
+        assert_eq!(app.flash, "no match: zzz-no-such-line");
+    }
+
+    /// Home/End/PageUp/PageDown scroll in BOTH keymaps.
+    #[test]
+    fn fullsize_nav_keys_are_universal() {
+        for vim in [false, true] {
+            let mut app = scroll_app(vim);
+            let max = app.active().lines.len().saturating_sub(20);
+            assert!(max > 0, "precondition: scrollable seed");
+            handle_key(&mut app, KeyCode::Home, NONE);
+            assert_eq!(app.active().scroll, 0);
+            handle_key(&mut app, KeyCode::End, NONE);
+            assert_eq!(app.active().scroll, max);
+            handle_key(&mut app, KeyCode::PageUp, NONE);
+            assert!(app.active().scroll < max);
+            handle_key(&mut app, KeyCode::PageDown, NONE);
+            assert_eq!(app.active().scroll, max);
+        }
     }
 }

@@ -2,9 +2,7 @@
 name = "polyforge"
 version = "0.1.0"
 edition = "2024"
-
-# M1 PROTOTYPE (throwaway): ratatui + crossterm only.
-# tokio / serde / persistence arrive in M2 alongside the first real provider.
+description = "Vim-modal multi-tab TUI for coding agents (muse, codex, agy, grok, mock)"
 
 [dependencies]
 ratatui = "0.29"

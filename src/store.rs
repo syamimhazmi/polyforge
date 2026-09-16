@@ -1,9 +1,10 @@
-//! Q10 session store: per-tab JSONL transcripts plus a meta file under
+//! Session store: one JSONL transcript plus a meta file per session id under
 //! `$XDG_DATA_HOME/polyforge/sessions` (fallback `~/.local/share/...`).
-//! Every pushed line appends through a buffered sink, so a crash loses at
-//! most one frame's lines; boot truncates runaway files back to MAX_LINES
-//! and re-attaches the remote session recorded in the meta file.
-//! Storage failures degrade to storageless (None), never crash the TUI.
+//! Every boot opens a FRESH session id; previous sessions stay on disk and
+//! are listed by `/sessions` (view + continue). Every pushed line appends
+//! through a buffered sink, so a crash loses at most one frame's lines;
+//! oversize files are compacted back to MAX_LINES on load. Storage failures
+//! degrade to storageless (None), never crash the TUI.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -13,17 +14,82 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::{BackendKind, MAX_LINES};
 
-/// Files longer than MAX_LINES + SLOP are rewritten with the tail on boot.
+/// Files longer than MAX_LINES + SLOP are rewritten with the tail on load.
 const COMPACT_SLOP: usize = 4096;
+/// Most sessions `/sessions` lists (newest first).
+pub const LIST_CAP: usize = 50;
+/// Preview width for the `/sessions` list.
+pub const PREVIEW_LEN: usize = 60;
 
 pub struct Store {
     dir: PathBuf,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionMeta {
     pub backend: String,
     pub remote_id: Option<String>,
+    /// Creation time, millis since the Unix epoch.
+    pub created_at: u64,
+    /// Last activity (bumped on every meta save): the UPDATED column.
+    /// Defaults to 0 so metas written before this field sort last.
+    #[serde(default)]
+    pub updated_at: u64,
+    /// First user prompt, truncated (display only).
+    pub title: String,
+}
+
+/// One stored session for the `/sessions` chooser, newest activity first
+/// (mirrors `grok sessions list`: id + created + updated + summary).
+#[derive(Debug, Clone)]
+pub struct StoredSession {
+    pub id: String,
+    pub backend: String,
+    pub remote_id: Option<String>,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub title: String,
+    pub preview: String,
+}
+
+/// Millis since the Unix epoch (session ids, ordering, display).
+pub fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Compact `MM-DD HH:MM` (UTC) for the `/sessions` columns.
+pub fn fmt_short(millis: u64) -> String {
+    let full = fmt_time(millis);
+    full.get(5..).unwrap_or(&full).to_string()
+}
+
+/// `YYYY-MM-DD HH:MM` (UTC) for the `/sessions` list. No chrono dependency:
+/// days-to-civil from the epoch, done by hand.
+pub fn fmt_time(millis: u64) -> String {
+    let secs = millis / 1000;
+    let days = (secs / 86_400) as i64;
+    let sod = (secs % 86_400) as i64;
+    // Howard Hinnant's civil-from-days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        y + i64::from(m <= 2),
+        m,
+        d,
+        sod / 3600,
+        (sod % 3600) / 60
+    )
 }
 
 impl Store {
@@ -42,19 +108,28 @@ impl Store {
         Some(Self { dir })
     }
 
-    fn transcript_path(&self, tab: usize) -> PathBuf {
-        self.dir.join(format!("tab{tab}.jsonl"))
+    /// A fresh id per session (boot, respawn, new tab). Millis + pid
+    /// order it; the process-wide sequence makes back-to-back mints
+    /// (same millis) unique. Old sessions are never deleted.
+    pub fn new_session_id() -> String {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("{}-{}-{seq}", now_millis(), std::process::id())
     }
 
-    fn meta_path(&self, tab: usize) -> PathBuf {
-        self.dir.join(format!("tab{tab}.meta.json"))
+    fn transcript_path(&self, id: &str) -> PathBuf {
+        self.dir.join(format!("sess-{id}.jsonl"))
+    }
+
+    fn meta_path(&self, id: &str) -> PathBuf {
+        self.dir.join(format!("sess-{id}.meta.json"))
     }
 
     /// Load the transcript tail (at most MAX_LINES, oldest first). Garbage
     /// lines load as-is so one corrupt write never eats the history.
     /// Oversize files are compacted to the tail as a side effect.
-    pub fn load_transcript(&self, tab: usize) -> Vec<String> {
-        let path = self.transcript_path(tab);
+    pub fn load_transcript(&self, id: &str) -> Vec<String> {
+        let path = self.transcript_path(id);
         let file = match File::open(&path) {
             Ok(f) => f,
             Err(_) => return Vec::new(),
@@ -67,52 +142,119 @@ impl Store {
         if lines.len() > MAX_LINES {
             let tail = &lines[lines.len() - MAX_LINES..];
             if lines.len() > MAX_LINES + COMPACT_SLOP {
-                let _ = self.rewrite(tab, tail);
+                let _ = self.rewrite(id, tail);
             }
             lines = tail.to_vec();
         }
         lines
     }
 
-    fn rewrite(&self, tab: usize, tail: &[String]) -> std::io::Result<()> {
+    fn rewrite(&self, id: &str, tail: &[String]) -> std::io::Result<()> {
         let mut out = String::new();
         for l in tail {
             out.push_str(&serde_json::to_string(l).unwrap_or_default());
             out.push('\n');
         }
-        fs::write(self.transcript_path(tab), out)
+        fs::write(self.transcript_path(id), out)
     }
 
-    /// Append sink for a tab (created on demand). Attached AFTER replay so
-    /// the restore never duplicates history.
-    pub fn open_sink(&self, tab: usize) -> Option<BufWriter<File>> {
+    /// Append sink for a session (created on demand). Attached AFTER replay
+    /// so viewing a previous session never duplicates history.
+    pub fn open_sink(&self, id: &str) -> Option<BufWriter<File>> {
         OpenOptions::new()
             .create(true)
             .append(true)
-            .open(self.transcript_path(tab))
+            .open(self.transcript_path(id))
             .ok()
             .map(BufWriter::new)
     }
 
     /// Load the meta file. Unknown backends are rejected (fresh default).
-    pub fn load_meta(&self, tab: usize) -> Option<SessionMeta> {
-        let raw = fs::read_to_string(self.meta_path(tab)).ok()?;
+    pub fn load_meta(&self, id: &str) -> Option<SessionMeta> {
+        let raw = fs::read_to_string(self.meta_path(id)).ok()?;
         let meta: SessionMeta = serde_json::from_str(&raw).ok()?;
         BackendKind::parse(&meta.backend)?;
         Some(meta)
     }
 
-    pub fn save_meta(&self, tab: usize, meta: &SessionMeta) {
+    pub fn save_meta(&self, id: &str, meta: &SessionMeta) {
         if let Ok(raw) = serde_json::to_string(meta) {
-            let _ = fs::write(self.meta_path(tab), raw);
+            let _ = fs::write(self.meta_path(id), raw);
         }
     }
 
-    /// Forget a tab (respawn-fresh). The caller drops the sink first.
-    pub fn reset(&self, tab: usize) {
-        let _ = fs::remove_file(self.transcript_path(tab));
-        let _ = fs::remove_file(self.meta_path(tab));
+    /// Previous sessions, newest first (at most LIST_CAP). Sessions whose
+    /// meta is missing or unparsable are skipped; a missing transcript
+    /// previews as empty rather than dropping the entry.
+    pub fn list_sessions(&self) -> Vec<StoredSession> {
+        let entries = fs::read_dir(&self.dir)
+            .map(|rd| rd.filter_map(|e| e.ok()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut out = Vec::new();
+        for e in entries {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(id) = name
+                .strip_prefix("sess-")
+                .and_then(|s| s.strip_suffix(".meta.json"))
+            else {
+                continue;
+            };
+            let raw = match fs::read_to_string(e.path()) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let Ok(meta): Result<SessionMeta, _> = serde_json::from_str(&raw) else {
+                continue;
+            };
+            if BackendKind::parse(&meta.backend).is_none() {
+                continue;
+            }
+            let preview = self
+                .load_transcript(id)
+                .into_iter()
+                .next()
+                .map(|l| truncate(&l, PREVIEW_LEN))
+                .unwrap_or_else(|| "(no lines yet)".to_string());
+            out.push(StoredSession {
+                id: id.to_string(),
+                backend: meta.backend,
+                remote_id: meta.remote_id,
+                created_at: meta.created_at,
+                updated_at: meta.updated_at,
+                title: meta.title,
+                preview,
+            });
+        }
+        // Most recently active first (grok's UPDATED-first ordering), with
+        // zero-timestamp (legacy) entries sunk to the bottom.
+        out.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        out.truncate(LIST_CAP);
+        out
     }
+
+    /// Permanently delete a session's files (`grok sessions delete`).
+    /// Returns true when something was removed.
+    pub fn delete_session(&self, id: &str) -> bool {
+        if id.contains('/') || id.contains('\0') || id.is_empty() {
+            return false;
+        }
+        let t = fs::remove_file(self.transcript_path(id)).is_ok();
+        let m = fs::remove_file(self.meta_path(id)).is_ok();
+        t || m
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    let mut out: String = s.chars().take(max).collect();
+    if s.chars().count() > max {
+        out.push('…');
+    }
+    out
 }
 
 fn decode_line(raw: &str) -> String {
@@ -150,6 +292,16 @@ mod tests {
         }
     }
 
+    fn test_meta() -> SessionMeta {
+        SessionMeta {
+            backend: "muse".to_string(),
+            remote_id: Some("sess-1".to_string()),
+            created_at: 1_700_000_000_000,
+            updated_at: 1_700_000_000_000,
+            title: "hello".to_string(),
+        }
+    }
+
     #[test]
     fn round_trip_with_tricky_chars() {
         let (store, _g) = tmp_store();
@@ -159,21 +311,21 @@ mod tests {
             "emoji ✓ tab\there".to_string(),
             "".to_string(),
         ];
-        let mut sink = store.open_sink(0).expect("sink");
+        let mut sink = store.open_sink("a").expect("sink");
         for l in &lines {
             append_line(&mut sink, l);
         }
         sink.flush().expect("flush");
         drop(sink);
-        assert_eq!(store.load_transcript(0), lines);
+        assert_eq!(store.load_transcript("a"), lines);
     }
 
     #[test]
     fn corrupt_lines_load_raw() {
         let (store, _g) = tmp_store();
-        fs::write(store.transcript_path(1), "{not json\n\"ok\"\n").expect("write");
+        fs::write(store.transcript_path("b"), "{not json\n\"ok\"\n").expect("write");
         assert_eq!(
-            store.load_transcript(1),
+            store.load_transcript("b"),
             vec!["{not json".to_string(), "ok".to_string()]
         );
     }
@@ -181,41 +333,100 @@ mod tests {
     #[test]
     fn oversize_file_compacts_to_tail() {
         let (store, _g) = tmp_store();
-        let mut sink = store.open_sink(2).expect("sink");
+        let mut sink = store.open_sink("c").expect("sink");
         for i in 0..(MAX_LINES + COMPACT_SLOP + 100) {
             append_line(&mut sink, &format!("line {i:06}"));
         }
         sink.flush().expect("flush");
         drop(sink);
-        let loaded = store.load_transcript(2);
+        let loaded = store.load_transcript("c");
         assert_eq!(loaded.len(), MAX_LINES);
         assert_eq!(loaded[0], format!("line {:06}", COMPACT_SLOP + 100));
         // Rewrite happened: the file itself shrank to MAX_LINES.
-        let raw = fs::read_to_string(store.transcript_path(2)).expect("read");
+        let raw = fs::read_to_string(store.transcript_path("c")).expect("read");
         assert_eq!(raw.lines().count(), MAX_LINES);
     }
 
     #[test]
-    fn meta_round_trip_and_reset() {
+    fn meta_round_trip_rejects_unknown_backend() {
         let (store, _g) = tmp_store();
-        assert!(store.load_meta(0).is_none());
-        let meta = SessionMeta {
-            backend: "muse".to_string(),
-            remote_id: Some("sess-1".to_string()),
-        };
-        store.save_meta(0, &meta);
-        assert_eq!(store.load_meta(0), Some(meta));
+        assert!(store.load_meta("m").is_none());
+        let meta = test_meta();
+        store.save_meta("m", &meta);
+        assert_eq!(store.load_meta("m"), Some(meta));
         // Unknown backends are rejected.
         store.save_meta(
-            0,
+            "m",
             &SessionMeta {
                 backend: "wat".to_string(),
                 remote_id: None,
+                created_at: 0,
+                updated_at: 0,
+                title: String::new(),
             },
         );
-        assert!(store.load_meta(0).is_none());
-        store.reset(0);
-        assert!(store.load_transcript(0).is_empty());
-        assert!(!store.transcript_path(0).exists());
+        assert!(store.load_meta("m").is_none());
+    }
+
+    #[test]
+    fn list_sessions_most_active_first_with_preview() {
+        let (store, _g) = tmp_store();
+        // "old" was created later but "new" was active more recently:
+        // UPDATED-first ordering (grok's `sessions list` contract).
+        for (id, created, updated) in [
+            ("old", 2000u64, 2000u64),
+            ("new", 1000u64, 3000u64),
+        ] {
+            let mut meta = test_meta();
+            meta.created_at = created;
+            meta.updated_at = updated;
+            meta.title = format!("title {id}");
+            store.save_meta(id, &meta);
+            let mut sink = store.open_sink(id).expect("sink");
+            append_line(&mut sink, &format!("> first line of {id}"));
+            append_line(&mut sink, "second");
+            use std::io::Write;
+            sink.flush().expect("flush");
+        }
+        // Unparsable meta never surfaces; legacy tab files are ignored.
+        fs::write(store.dir.join("sess-broken.meta.json"), "{nope").expect("write");
+        fs::write(store.dir.join("tab0.meta.json"), "{}").expect("write");
+        let listed = store.list_sessions();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].id, "new");
+        assert_eq!(listed[1].id, "old");
+        assert_eq!(listed[0].title, "title new");
+        assert_eq!(listed[0].preview, "> first line of new");
+        assert_eq!(listed[0].remote_id.as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    fn delete_session_removes_files_and_rejects_paths() {
+        let (store, _g) = tmp_store();
+        store.save_meta("gone", &test_meta());
+        let mut sink = store.open_sink("gone").expect("sink");
+        append_line(&mut sink, "x");
+        use std::io::Write;
+        sink.flush().expect("flush");
+        assert!(store.delete_session("gone"));
+        assert!(!store.transcript_path("gone").exists());
+        assert!(!store.meta_path("gone").exists());
+        assert!(!store.delete_session("gone"), "second delete is a no-op");
+        assert!(!store.delete_session("../evil"));
+        assert!(!store.delete_session(""));
+        assert!(!store.list_sessions().iter().any(|s| s.id == "gone"));
+    }
+
+    #[test]
+    fn fmt_short_truncates_to_day_time() {
+        assert_eq!(fmt_short(1_789_516_800_000), "09-16 00:00");
+        assert_eq!(fmt_short(0), "01-01 00:00");
+    }
+
+    #[test]
+    fn fmt_time_known_dates() {
+        // 2026-09-16 00:00:00 UTC.
+        assert_eq!(fmt_time(1_789_516_800_000), "2026-09-16 00:00");
+        assert_eq!(fmt_time(0), "1970-01-01 00:00");
     }
 }

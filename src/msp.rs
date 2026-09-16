@@ -62,6 +62,10 @@ impl Host {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            // No Host may outlive its owner with a live child: the final
+            // drop (after in-flight spawned calls release their Arcs)
+            // kills the server instead of leaking it headless.
+            .kill_on_drop(true)
             .spawn()?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
@@ -100,14 +104,16 @@ impl Host {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
         let frame = serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        let mut w = self.writer.lock().await;
-        if let Err(e) = w.write_all(format!("{frame}\n").as_bytes()).await {
-            self.pending.lock().unwrap().remove(&id);
-            return Err(RpcError {
-                code: -32000,
-                message: format!("serve write: {e}"),
-            });
-        }
+        {
+            let mut w = self.writer.lock().await;
+            if let Err(e) = w.write_all(format!("{frame}\n").as_bytes()).await {
+                self.pending.lock().unwrap().remove(&id);
+                return Err(RpcError {
+                    code: -32000,
+                    message: format!("serve write: {e}"),
+                });
+            }
+        } // Release the writer before waiting: server requests need respond().
         rx.await.unwrap_or(Err(RpcError {
             code: -32000,
             message: "serve call dropped".into(),
@@ -260,6 +266,37 @@ pub fn extract_text(params: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pending_call_allows_permission_response() {
+        let (tx, mut events) = mpsc::channel(4);
+        // A local peer waits for our permission response before ending the call.
+        let host = Host::spawn("/bin/sh", &["-c", r#"
+            read -r prompt
+            printf '%s\n' '{"id":"permission","method":"session/request_permission"}'
+            read -r response
+            printf '{"method":"observed","params":%s}\n' "$response"
+            printf '%s\n' '{"id":1,"result":{"stopReason":"end_turn"}}'
+        "#], &[], tx).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let call = host.call("session/prompt", Value::Null);
+            let respond = async {
+                assert!(matches!(events.recv().await, Some(ServerMsg::Request { .. })));
+                host.respond(serde_json::json!("permission"), serde_json::json!({"outcome":{"outcome":"cancelled"}})).await.unwrap();
+                match events.recv().await.unwrap() {
+                    ServerMsg::Notif { params, .. } => {
+                        assert_eq!(params["id"], "permission");
+                        assert_eq!(params["result"]["outcome"]["outcome"], "cancelled");
+                    }
+                    other => panic!("unexpected: {other:?}"),
+                }
+            };
+            let (result, ()) = tokio::join!(call, respond);
+            assert_eq!(result.unwrap()["stopReason"], "end_turn");
+        }).await.expect("call held writer while awaiting response");
+        host.shutdown().await;
+    }
 
     #[test]
     fn uuid7_parses_and_sorts() {

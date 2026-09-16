@@ -5,12 +5,12 @@
 use crate::app::PendingDiff;
 use crate::app::Session;
 
+/// Scrollable filler for tests only: production tabs open empty.
+#[cfg(test)]
 pub fn seed(s: &mut Session) {
     for i in 1..=60 {
         s.push_line(format!("{} seed line {i:02}: scroll me with j/k, C-u/d, g/G", s.name));
     }
-    s.push_line(format!("{} try: i<type><Enter> for a mock streaming reply", s.name));
-    s.push_line(format!("{} try: /seed<Enter> then n/N to walk matches", s.name));
 }
 
 pub fn start_job(s: &mut Session, prompt: &str) {
@@ -32,4 +32,17 @@ pub fn start_job(s: &mut Session, prompt: &str) {
         file: "src/draft.rs".to_string(),
         body: "--- a/src/draft.rs\n+++ b/src/draft.rs\n@@\n+pub fn draft() {\n+    todo!(\"from mock job\")\n+}\n".to_string(),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// No hint placeholders in fresh tabs (both try-lines removed).
+    #[test]
+    fn seed_has_no_hint_lines() {
+        let mut s = Session::new("s1");
+        seed(&mut s);
+        assert!(s.lines.iter().all(|l| !l.contains("try:")));
+    }
 }
