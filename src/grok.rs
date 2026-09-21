@@ -247,7 +247,7 @@ pub fn apply_grok_notif(app: &mut App, tab: usize, method: &str, params: &Value)
                 if let Some(a) = s.pending_approval.as_ref() {
                     if a.approval_id.ends_with(resolved) && !resolved.is_empty() {
                         s.pending_approval.take();
-                        s.pending_diff.take();
+                        let _ = s.clear_diff();
                     }
                 }
                 if tab == app.active {
@@ -454,7 +454,7 @@ pub fn apply_grok_permission(
         })
         .unwrap_or_default();
     let s = &mut app.sessions[tab];
-    s.pending_diff = Some(PendingDiff {
+    s.stage_diff(PendingDiff {
         file: title.to_string(),
         body,
     });

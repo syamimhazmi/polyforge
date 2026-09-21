@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot};
 
@@ -39,6 +39,94 @@ pub enum ServerMsg {
 }
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, RpcError>>>>>;
+
+/// S1-F1: cap one NDJSON line from an agent child (1 MiB). A hostile child
+/// sending an unbounded line must not grow our buffer without limit.
+/// Oversize lines are dropped with a transport error.
+pub const MAX_NDJSON_LINE_BYTES: usize = 1_048_576;
+
+/// Bounded line-read outcome. Oversize tails are discarded so the next
+/// read resynchronises on the following line.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CappedLine {
+    Line(String),
+    /// Line exceeded the cap; `bytes` is cap + 1 (what we buffered).
+    Oversize { bytes: usize },
+    /// Line was not valid UTF-8.
+    InvalidUtf8 { bytes: usize },
+    Eof,
+}
+
+/// Read one `\n`-terminated line while never buffering more than
+/// [`MAX_NDJSON_LINE_BYTES`] + 1 bytes, even before the first newline.
+pub async fn read_capped_line<R>(reader: &mut R, scratch: &mut Vec<u8>) -> std::io::Result<CappedLine>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    scratch.clear();
+    let mut total = 0usize;
+    loop {
+        let remaining = MAX_NDJSON_LINE_BYTES + 1 - total;
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            if total == 0 {
+                return Ok(CappedLine::Eof);
+            }
+            return to_line(scratch);
+        }
+        // Copy at most up to and including the first newline, and never
+        // more than the remaining budget.
+        let mut take = remaining;
+        if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+            take = take.min(pos + 1);
+        }
+        take = take.min(chunk.len());
+        scratch.extend_from_slice(&chunk[..take]);
+        reader.consume(take);
+        total += take;
+        if total > MAX_NDJSON_LINE_BYTES {
+            // S1-GAP-B: if the cap+1 scratch already ends on `\n`, the
+            // oversize line is fully consumed — do not discard further
+            // (that would eat the next line).
+            if !scratch.ends_with(b"\n") {
+                discard_until_newline(reader).await?;
+            }
+            return Ok(CappedLine::Oversize { bytes: total });
+        }
+        if scratch.ends_with(b"\n") {
+            return to_line(scratch);
+        }
+    }
+}
+
+fn to_line(scratch: &[u8]) -> std::io::Result<CappedLine> {
+    match String::from_utf8(scratch.to_vec()) {
+        Ok(s) => Ok(CappedLine::Line(s)),
+        Err(_) => Ok(CappedLine::InvalidUtf8 { bytes: scratch.len() }),
+    }
+}
+
+/// Swallow the rest of an oversize line without allocating. Uses only
+/// `fill_buf` + `consume` so a multi-MiB tail cannot grow a Vec.
+async fn discard_until_newline<R>(reader: &mut R) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+            reader.consume(pos + 1);
+            return Ok(());
+        }
+        let n = chunk.len();
+        reader.consume(n);
+    }
+}
 
 pub struct Host {
     next_id: AtomicU64,
@@ -72,11 +160,29 @@ impl Host {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let pump_pending = pending.clone();
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
+            let mut reader = BufReader::new(stdout);
+            let mut scratch = Vec::new();
             loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => route_line(&line, &pump_pending, &events_tx).await,
-                    Ok(None) => {
+                match read_capped_line(&mut reader, &mut scratch).await {
+                    Ok(CappedLine::Line(line)) => {
+                        route_line(&line, &pump_pending, &events_tx).await
+                    }
+                    Ok(CappedLine::Oversize { bytes }) => {
+                        let _ = events_tx
+                            .send(ServerMsg::Transport(format!(
+                                "serve stdout: line of {bytes} bytes exceeds \
+                                 {MAX_NDJSON_LINE_BYTES}-byte cap, dropped"
+                            )))
+                            .await;
+                    }
+                    Ok(CappedLine::InvalidUtf8 { bytes }) => {
+                        let _ = events_tx
+                            .send(ServerMsg::Transport(format!(
+                                "serve stdout: line of {bytes} bytes is not UTF-8, dropped"
+                            )))
+                            .await;
+                    }
+                    Ok(CappedLine::Eof) => {
                         let _ = events_tx
                             .send(ServerMsg::Transport("serve stdout closed".into()))
                             .await;
@@ -311,6 +417,141 @@ mod tests {
         // timestamp prefix is non-decreasing.
         let ts = |id: &str| u64::from_str_radix(&id.replace('-', "")[..12], 16).unwrap();
         assert!(ts(&a) <= ts(&b), "v7 timestamp went backwards");
+    }
+
+    #[tokio::test]
+    async fn capped_line_passes_normal_framing() {
+        let data = b"{\"a\":1}\n\n{\"b\":2}\n";
+        let mut reader = BufReader::new(&data[..]);
+        let mut scratch = Vec::new();
+        assert_eq!(
+            read_capped_line(&mut reader, &mut scratch).await.unwrap(),
+            CappedLine::Line("{\"a\":1}\n".to_string())
+        );
+        assert_eq!(
+            read_capped_line(&mut reader, &mut scratch).await.unwrap(),
+            CappedLine::Line("\n".to_string())
+        );
+        assert_eq!(
+            read_capped_line(&mut reader, &mut scratch).await.unwrap(),
+            CappedLine::Line("{\"b\":2}\n".to_string())
+        );
+        assert_eq!(
+            read_capped_line(&mut reader, &mut scratch).await.unwrap(),
+            CappedLine::Eof
+        );
+    }
+
+    #[tokio::test]
+    async fn capped_line_drops_oversize_and_resyncs() {
+        let mut data = vec![b'x'; MAX_NDJSON_LINE_BYTES + 100];
+        data.push(b'\n');
+        data.extend_from_slice(b"{\"ok\":true}\n");
+        let mut reader = BufReader::new(&data[..]);
+        let mut scratch = Vec::new();
+        // S1-F1: the hostile line is dropped, never buffered past cap + 1.
+        assert_eq!(
+            read_capped_line(&mut reader, &mut scratch).await.unwrap(),
+            CappedLine::Oversize {
+                bytes: MAX_NDJSON_LINE_BYTES + 1
+            }
+        );
+        assert!(scratch.len() <= MAX_NDJSON_LINE_BYTES + 1);
+        // Framing resynchronises: the next line still parses.
+        assert_eq!(
+            read_capped_line(&mut reader, &mut scratch).await.unwrap(),
+            CappedLine::Line("{\"ok\":true}\n".to_string())
+        );
+        assert_eq!(
+            read_capped_line(&mut reader, &mut scratch).await.unwrap(),
+            CappedLine::Eof
+        );
+    }
+
+    #[tokio::test]
+    async fn capped_line_accepts_eof_terminated_tail() {
+        let data = b"{\"tail\":true}";
+        let mut reader = BufReader::new(&data[..]);
+        let mut scratch = Vec::new();
+        assert_eq!(
+            read_capped_line(&mut reader, &mut scratch).await.unwrap(),
+            CappedLine::Line("{\"tail\":true}".to_string())
+        );
+        assert_eq!(
+            read_capped_line(&mut reader, &mut scratch).await.unwrap(),
+            CappedLine::Eof
+        );
+    }
+
+    #[tokio::test]
+    async fn capped_line_flags_non_utf8_without_killing_stream() {
+        let mut data = vec![0xff, 0xfe, b'\n'];
+        data.extend_from_slice(b"{\"ok\":true}\n");
+        let mut reader = BufReader::new(&data[..]);
+        let mut scratch = Vec::new();
+        assert!(matches!(
+            read_capped_line(&mut reader, &mut scratch).await.unwrap(),
+            CappedLine::InvalidUtf8 { .. }
+        ));
+        assert_eq!(
+            read_capped_line(&mut reader, &mut scratch).await.unwrap(),
+            CappedLine::Line("{\"ok\":true}\n".to_string())
+        );
+    }
+
+    /// S1-GAP-B: exact cap+1 bytes ending in `\n` must Oversize without
+    /// discarding the following line.
+    #[tokio::test]
+    async fn capped_line_exact_cap_plus_one_newline_preserves_next() {
+        let mut data = vec![b'x'; MAX_NDJSON_LINE_BYTES];
+        data.push(b'\n');
+        data.extend_from_slice(b"{\"ok\":true}\n");
+        let mut reader = BufReader::new(&data[..]);
+        let mut scratch = Vec::new();
+        assert_eq!(
+            read_capped_line(&mut reader, &mut scratch).await.unwrap(),
+            CappedLine::Oversize {
+                bytes: MAX_NDJSON_LINE_BYTES + 1
+            }
+        );
+        assert!(scratch.len() <= MAX_NDJSON_LINE_BYTES + 1);
+        assert!(scratch.ends_with(b"\n"));
+        assert_eq!(
+            read_capped_line(&mut reader, &mut scratch).await.unwrap(),
+            CappedLine::Line("{\"ok\":true}\n".to_string())
+        );
+        assert_eq!(
+            read_capped_line(&mut reader, &mut scratch).await.unwrap(),
+            CappedLine::Eof
+        );
+    }
+
+    /// S1-GAP-A: multi-MiB oversize tail with a late `\n` still resyncs;
+    /// scratch never exceeds cap+1 (discard allocates no growing Vec).
+    #[tokio::test]
+    async fn capped_line_multi_mib_tail_resyncs_without_growing_scratch() {
+        let mut data = vec![b'y'; MAX_NDJSON_LINE_BYTES + 1];
+        // ~4 MiB more without newline, then newline + next frame.
+        data.extend(std::iter::repeat(b'z').take(4 * 1024 * 1024));
+        data.push(b'\n');
+        data.extend_from_slice(b"{\"ok\":true}\n");
+        let mut reader = BufReader::new(&data[..]);
+        let mut scratch = Vec::new();
+        assert_eq!(
+            read_capped_line(&mut reader, &mut scratch).await.unwrap(),
+            CappedLine::Oversize {
+                bytes: MAX_NDJSON_LINE_BYTES + 1
+            }
+        );
+        assert!(scratch.len() <= MAX_NDJSON_LINE_BYTES + 1);
+        assert_eq!(
+            read_capped_line(&mut reader, &mut scratch).await.unwrap(),
+            CappedLine::Line("{\"ok\":true}\n".to_string())
+        );
+        assert_eq!(
+            read_capped_line(&mut reader, &mut scratch).await.unwrap(),
+            CappedLine::Eof
+        );
     }
 
     #[test]

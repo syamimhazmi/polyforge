@@ -6,6 +6,7 @@
 //! oversize files are compacted back to MAX_LINES on load. Storage failures
 //! degrade to storageless (None), never crash the TUI.
 
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
@@ -128,34 +129,49 @@ impl Store {
     /// Load the transcript tail (at most MAX_LINES, oldest first). Garbage
     /// lines load as-is so one corrupt write never eats the history.
     /// Oversize files are compacted to the tail as a side effect.
+    ///
+    /// Single streaming pass: decoded lines are held in a capped deque,
+    /// so peak memory stays at one copy of the tail (never the whole
+    /// file twice over plus a tail clone).
     pub fn load_transcript(&self, id: &str) -> Vec<String> {
         let path = self.transcript_path(id);
         let file = match File::open(&path) {
             Ok(f) => f,
             Err(_) => return Vec::new(),
         };
-        let raw: Vec<String> = BufReader::new(file)
-            .lines()
-            .filter_map(|l| l.ok())
-            .collect();
-        let mut lines: Vec<String> = raw.iter().map(|l| decode_line(l)).collect();
-        if lines.len() > MAX_LINES {
-            let tail = &lines[lines.len() - MAX_LINES..];
-            if lines.len() > MAX_LINES + COMPACT_SLOP {
-                let _ = self.rewrite(id, tail);
+        let mut tail: VecDeque<String> = VecDeque::new();
+        let mut total = 0usize;
+        for line in BufReader::new(file).lines().filter_map(|l| l.ok()) {
+            total += 1;
+            if tail.len() == MAX_LINES {
+                tail.pop_front();
             }
-            lines = tail.to_vec();
+            tail.push_back(decode_line(&line));
+        }
+        let lines = Vec::from(tail);
+        if total > MAX_LINES + COMPACT_SLOP {
+            let _ = self.rewrite(id, &lines);
         }
         lines
     }
 
+    /// First transcript line, decoded (the `/sessions` preview). Reads one
+    /// line only: listing must stay fast no matter how large transcripts
+    /// grow. None when the transcript is missing or empty.
+    pub fn first_line(&self, id: &str) -> Option<String> {
+        let file = File::open(self.transcript_path(id)).ok()?;
+        let line = BufReader::new(file).lines().next()?.ok()?;
+        Some(decode_line(&line))
+    }
+
     fn rewrite(&self, id: &str, tail: &[String]) -> std::io::Result<()> {
-        let mut out = String::new();
+        let file = File::create(self.transcript_path(id))?;
+        let mut out = BufWriter::new(file);
         for l in tail {
-            out.push_str(&serde_json::to_string(l).unwrap_or_default());
-            out.push('\n');
+            let encoded = serde_json::to_string(l).unwrap_or_default();
+            writeln!(out, "{encoded}")?;
         }
-        fs::write(self.transcript_path(id), out)
+        out.flush()
     }
 
     /// Append sink for a session (created on demand). Attached AFTER replay
@@ -210,9 +226,7 @@ impl Store {
                 continue;
             }
             let preview = self
-                .load_transcript(id)
-                .into_iter()
-                .next()
+                .first_line(id)
                 .map(|l| truncate(&l, PREVIEW_LEN))
                 .unwrap_or_else(|| "(no lines yet)".to_string());
             out.push(StoredSession {
@@ -345,6 +359,42 @@ mod tests {
         // Rewrite happened: the file itself shrank to MAX_LINES.
         let raw = fs::read_to_string(store.transcript_path("c")).expect("read");
         assert_eq!(raw.lines().count(), MAX_LINES);
+    }
+
+    #[test]
+    fn load_transcript_keeps_tail_window_without_rewrite() {
+        let (store, _g) = tmp_store();
+        let mut sink = store.open_sink("w").expect("sink");
+        for i in 0..(MAX_LINES + 100) {
+            append_line(&mut sink, &format!("line {i:06}"));
+        }
+        use std::io::Write;
+        sink.flush().expect("flush");
+        drop(sink);
+        let loaded = store.load_transcript("w");
+        assert_eq!(loaded.len(), MAX_LINES);
+        assert_eq!(loaded[0], "line 000100");
+        assert_eq!(
+            loaded[MAX_LINES - 1],
+            format!("line {:06}", MAX_LINES + 99)
+        );
+        // Under the rewrite slop: the file itself is untouched.
+        let raw = fs::read_to_string(store.transcript_path("w")).expect("read");
+        assert_eq!(raw.lines().count(), MAX_LINES + 100);
+    }
+
+    #[test]
+    fn first_line_reads_head_only() {
+        let (store, _g) = tmp_store();
+        assert_eq!(store.first_line("missing"), None);
+        let mut sink = store.open_sink("h").expect("sink");
+        append_line(&mut sink, "> first \"quoted\"");
+        append_line(&mut sink, "second");
+        use std::io::Write;
+        sink.flush().expect("flush");
+        drop(sink);
+        assert_eq!(store.first_line("h").as_deref(), Some("> first \"quoted\""));
+        assert_eq!(store.first_line("missing"), None);
     }
 
     #[test]

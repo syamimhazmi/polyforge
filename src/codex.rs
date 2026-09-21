@@ -355,7 +355,10 @@ pub fn apply_codex_approval(
         _ => (method.to_string(), truncate(&params.to_string(), 2000)),
     };
     let s = &mut app.sessions[tab];
-    s.pending_diff = Some(PendingDiff { file: tool.clone(), body });
+    s.stage_diff(PendingDiff {
+        file: tool.clone(),
+        body,
+    });
     // Codex approvals answer with {"decision": <word>} under the request id.
     // Choices below carry the response decision in `choice_id`; the request
     // id rides in `requirement_id` (repurposed string slot).

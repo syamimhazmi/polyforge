@@ -8,8 +8,15 @@ pub const MAX_LINES: usize = 50_000;
 pub const DEFAULT_WIDTH: usize = 100;
 
 /// Number of display rows `line` occupies at `width` (always ≥ 1).
+/// ASCII lines (the common case) skip the per-char width walk: every
+/// byte is one column, so the count is plain division over the byte
+/// length. Must agree with `wrap_chunks` (greedy packs `width` bytes).
 pub fn wrap_rows(line: &str, width: usize) -> usize {
-    wrap_chunks(line, width.max(1)).len().max(1)
+    let w = width.max(1);
+    if line.is_ascii() {
+        return ((line.len() + w - 1) / w).max(1);
+    }
+    wrap_chunks(line, w).len().max(1)
 }
 
 fn wrap_chunks(line: &str, width: usize) -> Vec<String> {
@@ -103,6 +110,18 @@ pub fn col_to_char(s: &str, col: usize) -> usize {
 }
 /// First user prompt kept as the `/sessions` title (chars).
 pub const TITLE_LEN: usize = 48;
+
+/// Slash commands available in Insert mode. The first element is the
+/// display template; `accept_slash_completion` inserts `insert` instead
+/// (e.g. `/sessions` completes to `/sessions ` so a query can follow).
+pub const SLASH_COMMANDS: [(&str, &str, &str); 6] = [
+    ("/sessions [query]", "/sessions ", "browse previous sessions"),
+    ("/new", "/new", "fresh session in this tab"),
+    ("/tab new", "/tab new", "open a tab (max 3)"),
+    ("/tab close", "/tab close", "close this tab"),
+    ("/vim", "/vim", "toggle vim keymap"),
+    ("/help", "/help", "command + key summary"),
+];
 
 /// Short display id for the `/sessions` list (store ids are ASCII
 /// `millis-pid-seq`, so byte slicing is safe).
@@ -267,6 +286,12 @@ pub struct Session {
     pub pending_diff: Option<PendingDiff>,
     /// Live approval behind the card (muse/codex backends).
     pub pending_approval: Option<PendingApproval>,
+    /// TypeSafe judgment for the open DIFF card (None = none yet / no key).
+    pub approval_risk: Option<crate::typesafe::ApprovalJudgment>,
+    /// Generation token: bumped on every stage/clear so late answers drop.
+    pub risk_gen: u64,
+    /// Last `risk_gen` a TypeSafe request was spawned for (dedupe).
+    pub risk_spawned_gen: Option<u64>,
     /// This tab's provider (per-tab picker, M3).
     pub backend: BackendKind,
     /// Remote session/thread id for the backend above (None = unavailable).
@@ -307,6 +332,9 @@ impl Session {
             diff_after: None,
             pending_diff: None,
             pending_approval: None,
+            approval_risk: None,
+            risk_gen: 0,
+            risk_spawned_gen: None,
             backend: BackendKind::Mock,
             remote_id: None,
             tab_degraded: None,
@@ -345,6 +373,31 @@ impl Session {
         }
     }
 
+    /// Replace the whole transcript at once (session switch): the wrap
+    /// cache is built in the same pass at `width`, so replay never pays
+    /// a per-line push plus a second full rebuild. Old allocations are
+    /// dropped instead of retained, keeping a large viewed session from
+    /// pinning memory after switching away. Over-cap heads are dropped,
+    /// mirroring `push_line`.
+    pub fn replace_lines(&mut self, mut lines: Vec<String>, width: usize) {
+        let w = width.max(1);
+        if lines.len() > MAX_LINES {
+            lines.drain(..lines.len() - MAX_LINES);
+        }
+        let mut row_cache = Vec::with_capacity(lines.len());
+        let mut total_rows = 0usize;
+        for l in &lines {
+            let rows = wrap_rows(l, w);
+            row_cache.push(rows);
+            total_rows += rows;
+        }
+        self.lines = lines;
+        self.row_cache = row_cache;
+        self.total_rows = total_rows;
+        self.cache_width = Some(w);
+        self.scroll = 0;
+    }
+
     /// Rebuild the height cache when the viewport width changed.
     pub fn ensure_cache(&mut self, width: usize) {
         if self.cache_width == Some(width) {
@@ -366,6 +419,22 @@ impl Session {
     pub fn wrap_line(line: &str, width: usize) -> Vec<String> {
         wrap_chunks(line, width.max(1))
     }
+
+    /// Open the DIFF card and invalidate any in-flight risk judgment.
+    pub fn stage_diff(&mut self, diff: PendingDiff) {
+        self.pending_diff = Some(diff);
+        self.approval_risk = None;
+        self.risk_gen = self.risk_gen.wrapping_add(1);
+        self.risk_spawned_gen = None;
+    }
+
+    /// Close the DIFF card; bump gen so late TypeSafe answers are ignored.
+    pub fn clear_diff(&mut self) -> Option<PendingDiff> {
+        self.approval_risk = None;
+        self.risk_gen = self.risk_gen.wrapping_add(1);
+        self.risk_spawned_gen = None;
+        self.pending_diff.take()
+    }
 }
 
 pub struct App {
@@ -374,6 +443,10 @@ pub struct App {
     pub outbox: Outbox,
     pub picker_sel: usize,
     pub mode: Mode,
+    /// Selected index into the current slash-command suggestions
+    /// (Insert mode, input starts with `/`). Always clamped by the
+    /// completion helpers; reset to 0 on every input edit.
+    pub cmd_sel: usize,
     pub search_input: String,
     pub search_cursor: usize,
     pub last_query: String,
@@ -417,6 +490,7 @@ impl App {
             outbox: Outbox::default(),
             picker_sel: 0,
             mode: Mode::Normal,
+            cmd_sel: 0,
             search_input: String::new(),
             search_cursor: 0,
             last_query: String::new(),
@@ -495,6 +569,7 @@ impl App {
     pub fn submit(&mut self) {
         let prompt = std::mem::take(&mut self.active_mut().input);
         self.active_mut().cursor = 0;
+        self.cmd_sel = 0;
         if prompt.trim().is_empty() {
             return;
         }
@@ -545,6 +620,48 @@ impl App {
         }
         self.mode = Mode::Normal;
         self.stick_to_bottom();
+    }
+
+    /// Indices into `SLASH_COMMANDS` matching the active tab's input as
+    /// a prefix. Empty unless the input starts with `/`; typing args
+    /// past a complete command (e.g. `/sessions foo`) hides the list.
+    pub fn slash_matches(&self) -> Vec<usize> {
+        let input = self.active().input.as_str();
+        if !input.starts_with('/') {
+            return Vec::new();
+        }
+        SLASH_COMMANDS
+            .iter()
+            .enumerate()
+            .filter(|(_, (template, _, _))| template.starts_with(input))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Move the suggestion highlight, wrapping around the current list.
+    /// `delta` is +1 (next) or -1 (previous). No-op when the list is empty.
+    pub fn cycle_cmd_sel(&mut self, delta: i32) {
+        let n = self.slash_matches().len();
+        if n == 0 {
+            self.cmd_sel = 0;
+            return;
+        }
+        self.cmd_sel = (self.cmd_sel as i32 + delta).rem_euclid(n as i32) as usize;
+    }
+
+    /// Replace the input with the highlighted suggestion, cursor to the
+    /// end. Returns false when no suggestion is showing.
+    pub fn accept_slash_completion(&mut self) -> bool {
+        let matches = self.slash_matches();
+        let Some(&i) = matches.get(self.cmd_sel.min(matches.len().saturating_sub(1))) else {
+            return false;
+        };
+        let (_, insert, _) = SLASH_COMMANDS[i];
+        let s = self.active_mut();
+        s.input = insert.to_string();
+        s.cursor = s.input.chars().count();
+        self.cmd_sel = 0;
+        true
     }
 
     /// Slash commands (typed in Insert mode, never sent to a backend):
@@ -707,12 +824,8 @@ impl App {
             s.pending_agy_init = false;
             s.queue.clear();
             s.diff_after = None;
-            s.pending_diff = None;
+            let _ = s.clear_diff();
             s.pending_approval = None;
-            s.lines.clear();
-            s.row_cache.clear();
-            s.total_rows = 0;
-            s.scroll = 0;
             s.store_id = Some(pick.id.clone());
             s.created_at = pick.created_at;
             s.updated_at = updated_at;
@@ -722,9 +835,10 @@ impl App {
         let store = self.store.as_ref().expect("chooser needs a store");
         let lines = store.load_transcript(&pick.id);
         let n = lines.len();
-        for line in lines {
-            self.sessions[tab].push_line(line);
-        }
+        // Bulk replay at the live viewport width: one wrap pass, and the
+        // previous transcript's allocations are freed (not retained).
+        let width = self.viewport_width.max(1);
+        self.sessions[tab].replace_lines(lines, width);
         self.sessions[tab].sink = store.open_sink(&pick.id);
         // Banner is UI-only: detach sink so it never grows JSONL.
         let sink = self.sessions[tab].sink.take();
@@ -937,7 +1051,7 @@ impl App {
             s.pending_agy_init = false;
             s.queue.clear();
             s.diff_after = None;
-            s.pending_diff = None;
+            let _ = s.clear_diff();
             s.pending_approval = None;
             s.lines.clear();
             s.row_cache.clear();
@@ -955,7 +1069,7 @@ impl App {
     /// Returns true when a card was actually closed.
     pub fn approved(&mut self, tag: &str, decision: &str) -> bool {
         let s = self.active_mut();
-        let Some(diff) = s.pending_diff.take() else {
+        let Some(diff) = s.clear_diff() else {
             return false;
         };
         s.pending_approval.take();
@@ -997,7 +1111,7 @@ impl App {
             }
             if s.queue.is_empty() {
                 if let Some(diff) = s.diff_after.take() {
-                    s.pending_diff = Some(diff);
+                    s.stage_diff(diff);
                 } else {
                     s.busy = false;
                     s.push_line("mock: done ✓".to_string());
@@ -1016,7 +1130,7 @@ impl App {
     /// Returns true when a job fully finished (bell).
     pub fn decide_diff(&mut self, decision: &str) -> bool {
         let s = self.active_mut();
-        let Some(diff) = s.pending_diff.take() else {
+        let Some(diff) = s.clear_diff() else {
             return false;
         };
         s.push_line(format!("{} {} [{}]", diff_mark(decision), diff.file, decision));
@@ -1611,6 +1725,99 @@ mod tests {
         let _ = std::fs::remove_dir_all(_dir);
     }
 
+    #[test]
+    fn stage_and_clear_diff_bump_risk_gen() {
+        let mut s = Session::new("t");
+        assert_eq!(s.risk_gen, 0);
+        s.stage_diff(PendingDiff {
+            file: "f".into(),
+            body: "b".into(),
+        });
+        assert_eq!(s.risk_gen, 1);
+        assert!(s.pending_diff.is_some());
+        s.approval_risk = Some(crate::typesafe::ApprovalJudgment::compose(0.0, 1.0, 0.0, 0.0));
+        s.risk_spawned_gen = Some(1);
+        let taken = s.clear_diff();
+        assert_eq!(taken.unwrap().file, "f");
+        assert_eq!(s.risk_gen, 2);
+        assert!(s.approval_risk.is_none());
+        assert!(s.risk_spawned_gen.is_none());
+    }
+
+    #[test]
+    fn slash_bare_prefix_lists_every_command() {
+        let mut app = App::new();
+        app.active_mut().input = "/".to_string();
+        let got = app.slash_matches();
+        assert_eq!(got.len(), SLASH_COMMANDS.len());
+        assert_eq!(got, (0..SLASH_COMMANDS.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn slash_prefix_filters_and_tab_pair_matches() {
+        let mut app = App::new();
+        app.active_mut().input = "/s".to_string();
+        let names: Vec<&str> = app
+            .slash_matches()
+            .iter()
+            .map(|&i| SLASH_COMMANDS[i].0)
+            .collect();
+        assert_eq!(names, vec!["/sessions [query]"]);
+        // "/t" narrows to the two /tab spellings.
+        app.active_mut().input = "/t".to_string();
+        let names: Vec<&str> = app
+            .slash_matches()
+            .iter()
+            .map(|&i| SLASH_COMMANDS[i].0)
+            .collect();
+        assert_eq!(names, vec!["/tab new", "/tab close"]);
+        app.active_mut().input = "/tab ".to_string();
+        assert_eq!(app.slash_matches().len(), 2);
+        app.active_mut().input = "/tab c".to_string();
+        let names: Vec<&str> = app
+            .slash_matches()
+            .iter()
+            .map(|&i| SLASH_COMMANDS[i].0)
+            .collect();
+        assert_eq!(names, vec!["/tab close"]);
+    }
+
+    #[test]
+    fn slash_matches_hide_without_prefix_or_past_args() {
+        let mut app = App::new();
+        assert!(app.slash_matches().is_empty(), "empty input shows nothing");
+        app.active_mut().input = "hello".to_string();
+        assert!(app.slash_matches().is_empty());
+        // Args past a complete command hide the list (user is typing a query).
+        app.active_mut().input = "/sessions foo".to_string();
+        assert!(app.slash_matches().is_empty());
+        app.active_mut().input = "/nope".to_string();
+        assert!(app.slash_matches().is_empty());
+    }
+
+    #[test]
+    fn slash_cycle_wraps_and_accept_inserts() {
+        let mut app = App::new();
+        app.active_mut().input = "/t".to_string();
+        app.cycle_cmd_sel(1);
+        assert_eq!(app.cmd_sel, 1);
+        app.cycle_cmd_sel(1);
+        assert_eq!(app.cmd_sel, 0, "wraps past the end");
+        app.cycle_cmd_sel(-1);
+        assert_eq!(app.cmd_sel, 1, "wraps past the start");
+        assert!(app.accept_slash_completion());
+        assert_eq!(app.active().input, "/tab close");
+        assert_eq!(app.active().cursor, "/tab close".chars().count());
+        // Sessions completes with a trailing space for the query.
+        app.active_mut().input = "/s".to_string();
+        assert!(app.accept_slash_completion());
+        assert_eq!(app.active().input, "/sessions ");
+        // Nothing showing: accept is a no-op.
+        app.active_mut().input = "hi".to_string();
+        assert!(!app.accept_slash_completion());
+        assert_eq!(app.active().input, "hi");
+    }
+
     /// Drag across lines with scroll + wrapping resolves exact text.
     #[test]
     fn drag_selection_extracts_text() {
@@ -1661,6 +1868,67 @@ mod tests {
         assert!(app.sel_begin(0, 5));
         app.sel_extend(8, 5);
         assert_eq!(app.selected_text().as_deref(), Some("line-two"));
+    }
+
+    #[test]
+    fn replace_lines_builds_cache_at_width_and_caps() {
+        let mut s = Session::new("t");
+        // 14 ASCII cols at width 7 = 2 rows; wide chars take the slow path.
+        s.replace_lines(
+            vec!["0123456789ABCD".to_string(), "あいう".to_string()],
+            7,
+        );
+        assert_eq!(s.cache_width, Some(7));
+        assert_eq!(s.row_cache, vec![2, Session::wrap_line("あいう", 7).len()]);
+        assert_eq!(s.total_rows, s.row_cache.iter().sum::<usize>());
+        // Over-cap input drops the head, mirroring push_line.
+        let big: Vec<String> = (0..(MAX_LINES + 10)).map(|i| format!("l{i}")).collect();
+        s.replace_lines(big, 100);
+        assert_eq!(s.lines.len(), MAX_LINES);
+        assert_eq!(s.lines[0], "l10");
+        assert_eq!(s.row_cache.len(), MAX_LINES);
+        assert_eq!(s.total_rows, s.row_cache.iter().sum::<usize>());
+    }
+
+    #[test]
+    fn choose_session_replays_at_viewport_width() {
+        let (store, _dir) = test_store("choose-width");
+        let id = crate::store::Store::new_session_id();
+        let mut sink = store.open_sink(&id).expect("sink");
+        for i in 0..500 {
+            crate::store::append_line(&mut sink, &format!("line {i:04} with padding"));
+        }
+        use std::io::Write;
+        sink.flush().expect("flush");
+        drop(sink);
+        store.save_meta(
+            &id,
+            &crate::store::SessionMeta {
+                backend: "mock".to_string(),
+                remote_id: None,
+                created_at: 1000,
+                updated_at: 2000,
+                title: "wide".to_string(),
+            },
+        );
+        let mut app = App::new();
+        app.store = Some(store);
+        app.viewport_width = 7;
+        app.viewport_height = 20;
+        app.open_session_chooser(String::new());
+        app.choose_session(0);
+        let s = app.active();
+        assert_eq!(s.lines.len(), 501, "500 replayed + the viewing banner");
+        assert_eq!(s.cache_width, Some(7), "replay wraps at the live width");
+        assert_eq!(s.total_rows, s.row_cache.iter().sum::<usize>());
+        assert!(
+            s.total_rows > 500,
+            "7-wide wraps must exceed one row per line"
+        );
+        assert_eq!(s.scroll + 20, s.total_rows, "pinned to the bottom");
+        assert!(s.lines.last().unwrap().starts_with("(viewing 500 lines"));
+        assert_eq!(app.mode, Mode::Normal);
+        let _ = std::fs::remove_dir_all(_dir);
     }
 
     /// Wide chars occupy two columns in both directions.

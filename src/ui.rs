@@ -27,6 +27,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_transcript(f, app, chunks[1]);
     render_status(f, app, chunks[2]);
     render_input(f, app, chunks[3]);
+    render_cmd_popup(f, app, chunks[3]);
 
     if app.active().pending_diff.is_some() {
         render_diff_modal(f, app);
@@ -197,7 +198,7 @@ fn render_input(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let (title, content) = match app.mode {
         Mode::Normal => (normal_title, app.active().input.clone()),
-        Mode::Insert => (" input — INSERT (Esc done, Enter send · /sessions /new /tab new /tab close /vim /help) ", app.active().input.clone()),
+        Mode::Insert => (" input — INSERT (Esc done, Enter send · ↑/↓ pick · Tab completes) ", app.active().input.clone()),
         Mode::Search => (" search — (Enter find, Esc cancel) ", format!("/{}", app.search_input)),
         Mode::Picker => (" provider — (j/k move, Enter switch, 1-5 quick, Esc cancel) ", String::new()),
         Mode::Sessions => (" sessions — (j/k move, Enter view + continue, d delete, 1-9 quick, Esc cancel) ", String::new()),
@@ -215,6 +216,54 @@ fn render_input(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// Slash-command suggestions above the input (Insert mode, input starts
+/// with `/`). Plain bordered list reusing the picker highlight; the
+/// highlight follows `cmd_sel` (Tab accepts, Up/Down moves).
+fn render_cmd_popup(f: &mut Frame, app: &App, input_area: Rect) {
+    if app.mode != Mode::Insert {
+        return;
+    }
+    let matches = app.slash_matches();
+    if matches.is_empty() {
+        return;
+    }
+    let show = matches.len().min(6);
+    let height = (show as u16 + 2).min(input_area.y);
+    if height < 3 {
+        return; // no room above the input on a tiny terminal
+    }
+    let area = Rect {
+        x: input_area.x,
+        y: input_area.y - height,
+        width: input_area.width,
+        height,
+    };
+    f.render_widget(Clear, area);
+    let sel = app.cmd_sel.min(matches.len() - 1);
+    let lines: Vec<Line> = matches
+        .iter()
+        .take(show)
+        .enumerate()
+        .map(|(row, &i)| {
+            let (template, _, desc) = crate::app::SLASH_COMMANDS[i];
+            let cursor = if row == sel { "> " } else { "  " };
+            let style = if row == sel {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(
+                format!("{cursor}{template} — {desc}"),
+                style,
+            ))
+        })
+        .collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" commands — Tab completes · ↑/↓ picks ");
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn render_diff_modal(f: &mut Frame, app: &App) {
     let area = centered(f.area(), 76, 60);
     f.render_widget(Clear, area);
@@ -222,10 +271,29 @@ fn render_diff_modal(f: &mut Frame, app: &App) {
     let Some(diff) = s.pending_diff.as_ref() else {
         return;
     };
-    let text = format!("{}\n\n{}", diff.body, "y approve · n reject · a approve-all · q later");
+    let risk = match s.approval_risk.as_ref() {
+        Some(j) => j.summary_line(),
+        None if s.risk_spawned_gen.is_some() => "risk … scoring".to_string(),
+        None => String::new(),
+    };
+    let text = if risk.is_empty() {
+        format!("{}\n\n{}", diff.body, "y approve · n reject · a approve-all · q later")
+    } else {
+        format!(
+            "{}\n\n{}\n\n{}",
+            diff.body, risk, "y approve · n reject · a approve-all · q later"
+        )
+    };
+    let title = if risk.is_empty() {
+        format!(" DIFF — {} ", diff.file)
+    } else if let Some(j) = s.approval_risk.as_ref() {
+        format!(" DIFF — {} — {} ", diff.file, j.band.label())
+    } else {
+        format!(" DIFF — {} ", diff.file)
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" DIFF — {} ", diff.file))
+        .title(title)
         .style(Style::default().bg(Color::Black));
     f.render_widget(
         Paragraph::new(text).block(block).wrap(Wrap { trim: false }),

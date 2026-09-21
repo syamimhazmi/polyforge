@@ -14,6 +14,7 @@ mod mock;
 mod msp;
 mod provider;
 mod store;
+mod typesafe;
 mod ui;
 
 use std::io::{self, Write};
@@ -94,6 +95,94 @@ impl Backends {
             BackendKind::Codex => self.codex.as_ref(),
             BackendKind::Grok => self.grok.as_ref(),
             BackendKind::Mock | BackendKind::Agy => None,
+        }
+    }
+}
+
+/// TypeSafe approval-risk result (tab + generation for staleness).
+enum RiskMsg {
+    Ready {
+        tab: usize,
+        token: u64,
+        judgment: typesafe::ApprovalJudgment,
+    },
+    Failed {
+        tab: usize,
+        token: u64,
+        err: String,
+    },
+}
+
+/// Spawn one System One call per open DIFF that lacks a judgment yet.
+fn spawn_pending_risk_scores(
+    app: &mut App,
+    client: &Option<typesafe::Client>,
+    tx: &mpsc::Sender<RiskMsg>,
+) {
+    let Some(client) = client else {
+        return;
+    };
+    for (tab, s) in app.sessions.iter_mut().enumerate() {
+        let Some(diff) = s.pending_diff.as_ref() else {
+            continue;
+        };
+        if s.approval_risk.is_some() {
+            continue;
+        }
+        if s.risk_spawned_gen == Some(s.risk_gen) {
+            continue;
+        }
+        let token = s.risk_gen;
+        s.risk_spawned_gen = Some(token);
+        let tool = diff.file.clone();
+        let body = diff.body.clone();
+        let client = client.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let msg = match client.judge_approval(&tool, &body).await {
+                Ok(judgment) => RiskMsg::Ready {
+                    tab,
+                    token,
+                    judgment,
+                },
+                Err(err) => RiskMsg::Failed { tab, token, err },
+            };
+            let _ = tx.send(msg).await;
+        });
+    }
+}
+
+fn apply_risk_msg(app: &mut App, msg: RiskMsg) {
+    match msg {
+        RiskMsg::Ready {
+            tab,
+            token,
+            judgment,
+        } => {
+            let Some(s) = app.sessions.get_mut(tab) else {
+                return;
+            };
+            if s.pending_diff.is_none() || s.risk_gen != token {
+                return;
+            }
+            let line = judgment.summary_line();
+            s.approval_risk = Some(judgment);
+            if tab == app.active {
+                app.flash = line;
+            }
+        }
+        RiskMsg::Failed { tab, token, err } => {
+            let Some(s) = app.sessions.get_mut(tab) else {
+                return;
+            };
+            if s.pending_diff.is_none() || s.risk_gen != token {
+                return;
+            }
+            // Leave approval_risk None; allow a later retry if token bumps.
+            s.risk_spawned_gen = None;
+            if tab == app.active {
+                app.flash = format!("risk score failed: {err}");
+            }
         }
     }
 }
@@ -416,6 +505,9 @@ async fn run(
     }
 
     let mut backends = Backends::default();
+    // TypeSafe: optional. Missing key leaves approvals unscored.
+    let typesafe = typesafe::Client::from_env();
+    let (risk_tx, mut risk_rx) = mpsc::channel::<RiskMsg>(32);
     // One shared channel for all agy tab children.
     let (agy_tx, mut agy_rx) = mpsc::channel::<ServerMsg>(256);
     // Bring up every shared host actually needed (not just the configured
@@ -557,6 +649,15 @@ async fn run(
                     dirty = true;
                 }
             }
+            risk_msg = risk_rx.recv() => {
+                if let Some(msg) = risk_msg {
+                    apply_risk_msg(app, msg);
+                    while let Ok(m) = risk_rx.try_recv() {
+                        apply_risk_msg(app, m);
+                    }
+                    dirty = true;
+                }
+            }
             _ = ticker.tick() => {
                 // Mock streaming only; an idle TUI paints nothing.
                 if app.sessions.iter().any(|s| s.backend == BackendKind::Mock && s.busy)
@@ -572,6 +673,7 @@ async fn run(
         if drain_outbox(app, &mut backends, cfg, &agy_tx).await {
             dirty = true;
         }
+        spawn_pending_risk_scores(app, &typesafe, &risk_tx);
         // Kill agy children of `/tab close`d tabs (queued indices refer to
         // the layout at close time: compensate for earlier removals with a
         // strictly-less shift so surviving tabs keep their handles).
@@ -1223,10 +1325,27 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             _ => clear_pending_g(app),
         },
         Mode::Insert => match code {
-            KeyCode::Esc => app.mode = Mode::Normal,
+            KeyCode::Esc => {
+                app.mode = Mode::Normal;
+                app.cmd_sel = 0;
+            }
             // Ctrl-[ sends the same bytes as Esc on most terminals; belt & braces.
-            KeyCode::Char('[') if ctrl => app.mode = Mode::Normal,
+            KeyCode::Char('[') if ctrl => {
+                app.mode = Mode::Normal;
+                app.cmd_sel = 0;
+            }
             KeyCode::Enter => app.submit(),
+            // Slash-command suggestions (input starts with `/`):
+            // Up/Down moves the highlight, Tab accepts it.
+            KeyCode::Tab if no_mods => {
+                app.accept_slash_completion();
+            }
+            KeyCode::Up if !app.slash_matches().is_empty() => {
+                app.cycle_cmd_sel(-1);
+            }
+            KeyCode::Down if !app.slash_matches().is_empty() => {
+                app.cycle_cmd_sel(1);
+            }
             KeyCode::Backspace => {
                 let s = app.active_mut();
                 if s.cursor > 0 {
@@ -1234,6 +1353,7 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                     let bi = byte_index(&s.input, s.cursor);
                     s.input.remove(bi);
                 }
+                app.cmd_sel = 0;
             }
             KeyCode::Left => {
                 let s = app.active_mut();
@@ -1249,6 +1369,7 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 let bi = byte_index(&s.input, s.cursor);
                 s.input.insert(bi, c);
                 s.cursor += 1;
+                app.cmd_sel = 0;
             }
             _ => {}
         },
@@ -1427,7 +1548,7 @@ mod tests {
     fn muse_modal_app() -> App {
         let mut app = App::new();
         app.active_mut().backend = BackendKind::Muse;
-        app.active_mut().pending_diff = Some(PendingDiff {
+        app.active_mut().stage_diff(PendingDiff {
             file: "tool".into(),
             body: "body".into(),
         });
@@ -1485,7 +1606,7 @@ mod tests {
     fn codex_later_queues_denied() {
         let mut app = App::new();
         app.active_mut().backend = BackendKind::Codex;
-        app.active_mut().pending_diff = Some(PendingDiff {
+        app.active_mut().stage_diff(PendingDiff {
             file: "applyPatch".into(),
             body: "body".into(),
         });
@@ -1783,6 +1904,32 @@ mod tests {
         assert_eq!(app.flash, "no match: zzz-no-such-line");
     }
 
+    /// Insert mode: typing `/` narrows suggestions, Up/Down moves the
+    /// highlight, Tab accepts it, Enter still sends.
+    #[test]
+    fn slash_suggestions_complete_via_tab() {
+        let mut app = App::new();
+        app.mode = Mode::Insert;
+        handle_key(&mut app, KeyCode::Char('/'), NONE);
+        handle_key(&mut app, KeyCode::Char('t'), NONE);
+        assert_eq!(app.active().input, "/t");
+        assert_eq!(app.slash_matches().len(), 2);
+        handle_key(&mut app, KeyCode::Down, NONE);
+        assert_eq!(app.cmd_sel, 1);
+        handle_key(&mut app, KeyCode::Up, NONE);
+        assert_eq!(app.cmd_sel, 0);
+        handle_key(&mut app, KeyCode::Tab, NONE);
+        assert_eq!(app.active().input, "/tab new");
+        assert_eq!(app.mode, Mode::Insert, "Tab completes, it does not send");
+        // Plain text: Up/Down/Tab leave the input alone.
+        app.active_mut().input = "hi".to_string();
+        app.active_mut().cursor = 2;
+        handle_key(&mut app, KeyCode::Up, NONE);
+        handle_key(&mut app, KeyCode::Down, NONE);
+        handle_key(&mut app, KeyCode::Tab, NONE);
+        assert_eq!(app.active().input, "hi");
+    }
+
     /// Home/End/PageUp/PageDown scroll in BOTH keymaps.
     #[test]
     fn fullsize_nav_keys_are_universal() {
@@ -1799,5 +1946,52 @@ mod tests {
             handle_key(&mut app, KeyCode::PageDown, NONE);
             assert_eq!(app.active().scroll, max);
         }
+    }
+
+    #[test]
+    fn risk_ready_applies_only_for_matching_token() {
+        let mut app = muse_modal_app();
+        let token = app.active().risk_gen;
+        let j = typesafe::ApprovalJudgment::compose(2.0, 1.0, 0.97, 0.96);
+        apply_risk_msg(
+            &mut app,
+            RiskMsg::Ready {
+                tab: 0,
+                token,
+                judgment: j.clone(),
+            },
+        );
+        assert_eq!(app.active().approval_risk.as_ref(), Some(&j));
+        assert!(app.flash.contains("HIGH"));
+
+        // Stale token after clear: ignored.
+        let _ = app.active_mut().clear_diff();
+        apply_risk_msg(
+            &mut app,
+            RiskMsg::Ready {
+                tab: 0,
+                token,
+                judgment: j,
+            },
+        );
+        assert!(app.active().approval_risk.is_none());
+    }
+
+    #[test]
+    fn risk_failed_clears_spawned_marker() {
+        let mut app = muse_modal_app();
+        let token = app.active().risk_gen;
+        app.active_mut().risk_spawned_gen = Some(token);
+        apply_risk_msg(
+            &mut app,
+            RiskMsg::Failed {
+                tab: 0,
+                token,
+                err: "boom".into(),
+            },
+        );
+        assert!(app.active().approval_risk.is_none());
+        assert!(app.active().risk_spawned_gen.is_none());
+        assert!(app.flash.contains("boom"));
     }
 }

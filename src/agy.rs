@@ -14,12 +14,12 @@
 use std::process::Stdio;
 
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use crate::app::App;
-use crate::msp::ServerMsg;
+use crate::msp::{CappedLine, MAX_NDJSON_LINE_BYTES, ServerMsg, read_capped_line};
 
 /// Prompt channel + owned child for one agy tab.
 pub struct AgyHandle {
@@ -67,13 +67,14 @@ pub async fn spawn_agy(
             }
         }
     });
-    // Stdout pump: NDJSON run events.
+    // Stdout pump: NDJSON run events (S1-F1: line size capped).
     let stdout_tx = events_tx.clone();
     tokio::spawn(async move {
-        let mut lines = BufReader::new(stdout).lines();
+        let mut reader = BufReader::new(stdout);
+        let mut scratch = Vec::new();
         loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
+            match read_capped_line(&mut reader, &mut scratch).await {
+                Ok(CappedLine::Line(line)) => {
                     let line = line.trim().to_string();
                     if line.is_empty() {
                         continue;
@@ -94,16 +95,34 @@ pub async fn spawn_agy(
                         Err(_) => continue, // banners; diagnostics use stderr
                     }
                 }
-                _ => break,
+                Ok(CappedLine::Oversize { bytes }) => {
+                    let _ = stdout_tx
+                        .send(ServerMsg::Transport(format!(
+                            "agy stdout: line of {bytes} bytes exceeds \
+                             {MAX_NDJSON_LINE_BYTES}-byte cap, dropped"
+                        )))
+                        .await;
+                }
+                Ok(CappedLine::InvalidUtf8 { bytes }) => {
+                    let _ = stdout_tx
+                        .send(ServerMsg::Transport(format!(
+                            "agy stdout: line of {bytes} bytes is not UTF-8, dropped"
+                        )))
+                        .await;
+                }
+                Ok(CappedLine::Eof) => break,
+                Err(_) => break,
             }
         }
     });
     // Stderr pump: permission soft-denials and diagnostics live here.
+    // Same S1-F1 cap: stderr is equally child-controlled.
     tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
+        let mut reader = BufReader::new(stderr);
+        let mut scratch = Vec::new();
         loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
+            match read_capped_line(&mut reader, &mut scratch).await {
+                Ok(CappedLine::Line(line)) => {
                     let line = line.trim().to_string();
                     if line.is_empty() {
                         continue;
@@ -115,7 +134,23 @@ pub async fn spawn_agy(
                         })
                         .await;
                 }
-                _ => break,
+                Ok(CappedLine::Oversize { bytes }) => {
+                    let _ = events_tx
+                        .send(ServerMsg::Transport(format!(
+                            "agy stderr: line of {bytes} bytes exceeds \
+                             {MAX_NDJSON_LINE_BYTES}-byte cap, dropped"
+                        )))
+                        .await;
+                }
+                Ok(CappedLine::InvalidUtf8 { bytes }) => {
+                    let _ = events_tx
+                        .send(ServerMsg::Transport(format!(
+                            "agy stderr: line of {bytes} bytes is not UTF-8, dropped"
+                        )))
+                        .await;
+                }
+                Ok(CappedLine::Eof) => break,
+                Err(_) => break,
             }
         }
     });

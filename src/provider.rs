@@ -219,7 +219,7 @@ pub fn apply_notif(app: &mut App, tab: usize, method: &str, params: &Value) -> b
                 body.push_str(&format!("\nchoices: {}", labels.join(" · ")));
             }
             let s = &mut app.sessions[tab];
-            s.pending_diff = Some(PendingDiff {
+            s.stage_diff(PendingDiff {
                 file: tool.to_string(),
                 body,
             });

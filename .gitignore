@@ -1,2 +1,5 @@
 /target
 docs/*.json
+# cargo-mutants working output (regenerated locally)
+/mutants.out/
+/mutants.out.old/
