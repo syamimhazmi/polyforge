@@ -202,6 +202,7 @@ pub fn apply_grok_notif(app: &mut App, tab: usize, method: &str, params: &Value)
             apply_session_update(app, tab, update)
         }
         "grok/prompt_completed" => {
+            flush_grok_drafts(app, tab);
             if let Some(e) = params.get("error").and_then(|v| v.as_str()) {
                 let s = &mut app.sessions[tab];
                 s.busy = false;
@@ -240,14 +241,43 @@ pub fn apply_grok_notif(app: &mut App, tab: usize, method: &str, params: &Value)
                     .get("tool_call_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let s = &mut app.sessions[tab];
-                s.push_line("grok: permission resolved".to_string());
-                // Our modal answered it already (or the agent moved on):
-                // never leave a card parked on a resolved request.
-                if let Some(a) = s.pending_approval.as_ref() {
-                    if a.approval_id.ends_with(resolved) && !resolved.is_empty() {
-                        s.pending_approval.take();
-                        let _ = s.clear_diff();
+                // S2-F3: only retire a card the user already answered
+                // (its decision sits queued in the outbox). An
+                // unanswered card must not silently vanish: queue an
+                // explicit cancel so the wire carries a decision, then
+                // close with a transcript note.
+                let unanswered: Option<Value> = {
+                    let s = &mut app.sessions[tab];
+                    s.push_line("grok: permission resolved".to_string());
+                    match s.pending_approval.as_ref() {
+                        Some(a)
+                            if a.approval_id.ends_with(resolved) && !resolved.is_empty() =>
+                        {
+                            let decided = app
+                                .outbox
+                                .decides
+                                .iter()
+                                .any(|d| d.requirement_id == a.requirement_id);
+                            (!decided).then(|| a.requirement_id.clone())
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(req_id) = unanswered {
+                    queue_grok_cancelled(app, tab, req_id);
+                    let s = &mut app.sessions[tab];
+                    s.pending_approval.take();
+                    let _ = s.clear_diff();
+                    s.push_line(
+                        "grok: permission resolved without a decision — sent cancel".to_string(),
+                    );
+                } else if !resolved.is_empty() {
+                    let s = &mut app.sessions[tab];
+                    if let Some(a) = s.pending_approval.as_ref() {
+                        if a.approval_id.ends_with(resolved) {
+                            s.pending_approval.take();
+                            let _ = s.clear_diff();
+                        }
                     }
                 }
                 if tab == app.active {
@@ -276,12 +306,15 @@ fn apply_session_update(app: &mut App, tab: usize, update: &Value) -> bool {
                     .unwrap_or_else(|| msp::extract_text(update).unwrap_or_default()),
                 None => msp::extract_text(update).unwrap_or_default(),
             };
+            // Commit any live thought above the answer before tokens land.
+            flush_thought_draft(app, tab);
             push_text(app, tab, &text);
             false
         }
         "agent_thought_chunk" => {
-            // One truncated line: reasoning stays visible without
-            // flooding the transcript mid-stream.
+            // One live coalesced line (Session.draft_thought). Per-token
+            // push_line flooded the transcript when the model streamed
+            // word-by-word.
             let text = update
                 .get("content")
                 .and_then(|c| c.get("text"))
@@ -289,8 +322,7 @@ fn apply_session_update(app: &mut App, tab: usize, update: &Value) -> bool {
                 .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
                 .unwrap_or_default();
             if !text.is_empty() {
-                let s = &mut app.sessions[tab];
-                s.push_line(format!("grok: ∴ {}", truncate(&text, 160)));
+                append_thought_draft(app, tab, &text);
                 if tab == app.active {
                     app.stick_to_bottom();
                 }
@@ -298,6 +330,7 @@ fn apply_session_update(app: &mut App, tab: usize, update: &Value) -> bool {
             false
         }
         "tool_call" => {
+            flush_grok_drafts(app, tab);
             let title = update
                 .get("title")
                 .and_then(|v| v.as_str())
@@ -319,6 +352,7 @@ fn apply_session_update(app: &mut App, tab: usize, update: &Value) -> bool {
             false
         }
         "tool_call_update" => {
+            flush_grok_drafts(app, tab);
             let status = update
                 .get("status")
                 .and_then(|v| v.as_str())
@@ -369,16 +403,73 @@ fn apply_session_update(app: &mut App, tab: usize, update: &Value) -> bool {
     }
 }
 
+/// Cap on the open answer draft (force-commit if a turn never sends `\n`).
+const ANSWER_DRAFT_CAP: usize = 64 * 1024;
+/// Display + commit cap for the live thought line (matches prior truncate).
+const THOUGHT_DRAFT_CAP: usize = 160;
+
+/// Append answer deltas into `draft_answer`; peel complete lines on `\n`.
 fn push_text(app: &mut App, tab: usize, t: &str) {
+    if t.is_empty() {
+        return;
+    }
     let s = &mut app.sessions[tab];
-    for line in t.split('\n') {
+    s.draft_answer.push_str(t);
+    while let Some(idx) = s.draft_answer.find('\n') {
+        let line: String = s.draft_answer.drain(..=idx).collect();
+        let line = line.trim_end_matches('\n');
         if !line.is_empty() {
             s.push_line(line.to_string());
         }
     }
+    if s.draft_answer.len() > ANSWER_DRAFT_CAP {
+        let overflow = std::mem::take(&mut s.draft_answer);
+        s.push_line(overflow);
+    }
     if tab == app.active {
         app.stick_to_bottom();
     }
+}
+
+fn append_thought_draft(app: &mut App, tab: usize, piece: &str) {
+    let s = &mut app.sessions[tab];
+    match s.draft_thought.as_mut() {
+        Some(body) => {
+            if !body.is_empty() {
+                body.push(' ');
+            }
+            body.push_str(piece);
+            if body.len() > THOUGHT_DRAFT_CAP {
+                *body = truncate(body, THOUGHT_DRAFT_CAP);
+            }
+        }
+        None => {
+            s.draft_thought = Some(truncate(piece, THOUGHT_DRAFT_CAP));
+        }
+    }
+}
+
+fn flush_thought_draft(app: &mut App, tab: usize) {
+    let s = &mut app.sessions[tab];
+    if let Some(body) = s.draft_thought.take() {
+        if !body.is_empty() {
+            s.push_line(format!("grok: ∴ {}", truncate(&body, THOUGHT_DRAFT_CAP)));
+        }
+    }
+}
+
+fn flush_answer_draft(app: &mut App, tab: usize) {
+    let s = &mut app.sessions[tab];
+    let rest = std::mem::take(&mut s.draft_answer);
+    if !rest.is_empty() {
+        s.push_line(rest);
+    }
+}
+
+/// Commit live thought + open answer before chrome / turn-end lines.
+fn flush_grok_drafts(app: &mut App, tab: usize) {
+    flush_thought_draft(app, tab);
+    flush_answer_draft(app, tab);
 }
 
 /// Render a grok permission request as a diff card + live approval handle.
@@ -541,9 +632,10 @@ mod tests {
     fn chunk_lines_land_in_transcript() {
         let mut app = grok_tab();
         assert!(!apply_grok_notif(&mut app, 0, "session/update", &chunk("hello\nworld")));
-        let lines = &app.active().lines;
-        assert!(lines.iter().any(|l| l == "hello"));
-        assert!(lines.iter().any(|l| l == "world"));
+        assert!(app.active().lines.iter().any(|l| l == "hello"));
+        // Trailing segment without `\n` stays in the open answer draft.
+        assert_eq!(app.active().draft_answer, "world");
+        assert!(!app.active().lines.iter().any(|l| l == "world"));
         // Flat variant (update fields at params top level) also routes.
         let flat = serde_json::json!({
             "sessionId": "sess-1",
@@ -551,7 +643,16 @@ mod tests {
             "content": {"type": "text", "text": "flat"},
         });
         assert!(!apply_grok_notif(&mut app, 0, "session/update", &flat));
-        assert!(app.active().lines.iter().any(|l| l == "flat"));
+        assert_eq!(app.active().draft_answer, "worldflat");
+        // Turn end commits the open draft.
+        assert!(apply_grok_notif(
+            &mut app,
+            0,
+            "grok/prompt_completed",
+            &serde_json::json!({"sessionId": "sess-1", "stopReason": "end_turn"}),
+        ));
+        assert!(app.active().lines.iter().any(|l| l == "worldflat"));
+        assert!(app.active().draft_answer.is_empty());
     }
 
     #[test]
@@ -564,7 +665,12 @@ mod tests {
             },
         });
         assert!(!apply_grok_notif(&mut app, 0, "session/update", &thought));
-        assert!(app.active().lines.iter().any(|l| l == "grok: ∴ hmm let me think"));
+        // Live draft only — not committed until flush (tool / turn end).
+        assert_eq!(
+            app.active().draft_thought.as_deref(),
+            Some("hmm let me think")
+        );
+        assert!(!app.active().lines.iter().any(|l| l.starts_with("grok: ∴")));
         let tool = serde_json::json!({
             "sessionId": "s", "update": {
                 "sessionUpdate": "tool_call",
@@ -572,6 +678,8 @@ mod tests {
             },
         });
         assert!(!apply_grok_notif(&mut app, 0, "session/update", &tool));
+        assert!(app.active().draft_thought.is_none());
+        assert!(app.active().lines.iter().any(|l| l == "grok: ∴ hmm let me think"));
         assert!(app.active().lines.iter().any(|l| l == "grok: ⚙ read foo.rs [read]"));
         assert!(app.active().busy);
         let upd = serde_json::json!({
@@ -590,6 +698,68 @@ mod tests {
             &serde_json::json!({"sessionId": "s", "update": {"sessionUpdate": "frobnicator"}}),
         ));
         assert_eq!(app.active().lines.len(), before);
+    }
+
+    #[test]
+    fn thought_chunks_coalesce_one_line() {
+        let mut app = grok_tab();
+        for word in ["The", "user", "said", "hello"] {
+            let thought = serde_json::json!({
+                "sessionId": "s", "update": {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": {"type": "text", "text": word},
+                },
+            });
+            assert!(!apply_grok_notif(&mut app, 0, "session/update", &thought));
+        }
+        assert_eq!(
+            app.active().draft_thought.as_deref(),
+            Some("The user said hello")
+        );
+        assert_eq!(
+            app.active().stream_draft_lines(),
+            vec!["grok: ∴ The user said hello".to_string()]
+        );
+        assert!(!app.active().lines.iter().any(|l| l.starts_with("grok: ∴")));
+        assert!(apply_grok_notif(
+            &mut app,
+            0,
+            "grok/prompt_completed",
+            &serde_json::json!({"sessionId": "s", "stopReason": "end_turn"}),
+        ));
+        let thought_lines: Vec<_> = app
+            .active()
+            .lines
+            .iter()
+            .filter(|l| l.starts_with("grok: ∴"))
+            .collect();
+        assert_eq!(thought_lines.len(), 1);
+        assert_eq!(thought_lines[0], "grok: ∴ The user said hello");
+        assert!(app.active().draft_thought.is_none());
+    }
+
+    #[test]
+    fn answer_chunks_coalesce_until_newline() {
+        let mut app = grok_tab();
+        for part in ["Hel", "lo ", "world\n", "Next"] {
+            assert!(!apply_grok_notif(&mut app, 0, "session/update", &chunk(part)));
+        }
+        assert!(app.active().lines.iter().any(|l| l == "Hello world"));
+        assert_eq!(app.active().draft_answer, "Next");
+        assert!(!app.active().lines.iter().any(|l| l == "Next"));
+        assert!(apply_grok_notif(
+            &mut app,
+            0,
+            "grok/prompt_completed",
+            &serde_json::json!({"sessionId": "sess-1", "stopReason": "end_turn"}),
+        ));
+        assert!(app.active().lines.iter().any(|l| l == "Next"));
+        assert!(app.active().draft_answer.is_empty());
+        // Done line lands after the flushed answer.
+        let lines = &app.active().lines;
+        let next_i = lines.iter().position(|l| l == "Next").unwrap();
+        let done_i = lines.iter().position(|l| l == "grok: done ✓").unwrap();
+        assert!(next_i < done_i);
     }
 
     #[test]
@@ -714,18 +884,44 @@ mod tests {
         assert!(app.active().lines.iter().any(|l| l.contains("question, not an approval")));
     }
 
+    /// S2-F3: an UNANSWERED card must not silently vanish on
+    /// interaction_resolved — an explicit cancel goes on the wire, then
+    /// the card retires with a transcript note.
     #[test]
-    fn interaction_resolved_retires_parked_card() {
+    fn interaction_resolved_without_decision_sends_cancel() {
         let mut app = grok_tab();
         assert!(apply_grok_permission(&mut app, 0, "session/request_permission", serde_json::json!(11), &permission_req()));
         assert!(app.active().pending_approval.is_some());
+        assert!(app.outbox.decides.is_empty());
         let resolved = serde_json::json!({
             "sessionId": "sess-1",
             "update": {"sessionUpdate": "interaction_resolved", "tool_call_id": "tc-9"},
         });
         assert!(!apply_grok_notif(&mut app, 0, "x.ai/session_notification", &resolved));
         assert!(app.active().pending_approval.is_none());
+        assert!(app.active().pending_diff.is_none());
+        assert_eq!(app.outbox.decides.len(), 1);
+        assert_eq!(app.outbox.decides[0].requirement_id, serde_json::json!(11));
+        assert!(app.outbox.decides[0].choice_id.contains("cancelled"));
         assert!(app.active().lines.iter().any(|l| l.contains("permission resolved")));
+        assert!(app.active().lines.iter().any(|l| l.contains("sent cancel")));
+    }
+
+    /// S2-F3 control: a card the user already answered (its decision is
+    /// queued) still retires quietly — no duplicate cancel.
+    #[test]
+    fn interaction_resolved_with_decision_retires_quietly() {
+        let mut app = grok_tab();
+        assert!(apply_grok_permission(&mut app, 0, "session/request_permission", serde_json::json!(11), &permission_req()));
+        queue_grok_cancelled(&mut app, 0, serde_json::json!(11));
+        let resolved = serde_json::json!({
+            "sessionId": "sess-1",
+            "update": {"sessionUpdate": "interaction_resolved", "tool_call_id": "tc-9"},
+        });
+        assert!(!apply_grok_notif(&mut app, 0, "x.ai/session_notification", &resolved));
+        assert!(app.active().pending_approval.is_none());
+        assert!(app.active().pending_diff.is_none());
+        assert_eq!(app.outbox.decides.len(), 1, "answered card must not queue a second cancel");
     }
 
     /// Live bringup against a real `grok agent stdio`: initialize needs no

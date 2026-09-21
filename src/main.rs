@@ -594,11 +594,10 @@ async fn run(
                         }
                         MouseEventKind::Up(_) => {
                             if app.mouse && app.sel.is_some() {
-                                match app.selected_text() {
-                                    Some(text) => {
-                                        app.flash = copy_to_clipboard(&text);
-                                    }
-                                    None => app.sel = None, // click: clear silently
+                                // take_selected_text always dehighlights
+                                // (copy path and empty click alike).
+                                if let Some(text) = app.take_selected_text() {
+                                    app.flash = copy_to_clipboard(&text);
                                 }
                                 dirty = true;
                             }
@@ -815,6 +814,16 @@ fn handle_server_msg(app: &mut App, kind: BackendKind, msg: ServerMsg) -> bool {
                     Some(tab) => tab,
                     None => return false,
                 },
+                // S2-F1: muse/codex frames naming an unknown (or no)
+                // session are dropped, never attributed to the active
+                // tab — a wrong-tab approval modal is worse than a
+                // dropped transcript line.
+                (BackendKind::Muse | BackendKind::Codex, _) => {
+                    match tab_for_session(app, kind, &params) {
+                        Some(tab) => tab,
+                        None => return false,
+                    }
+                }
                 _ => tab_for_session(app, kind, &params).unwrap_or(app.active),
             };
             match kind {
@@ -827,8 +836,30 @@ fn handle_server_msg(app: &mut App, kind: BackendKind, msg: ServerMsg) -> bool {
         }
         ServerMsg::Request { id, method, params } => match kind {
             BackendKind::Codex => {
-                let tab = tab_for_session(app, kind, &params).unwrap_or(app.active);
-                apply_codex_approval(app, tab, &method, id, &params)
+                match tab_for_session(app, kind, &params) {
+                    Some(tab) => apply_codex_approval(app, tab, &method, id, &params),
+                    // S2-F1: an orphan approval must never bind its
+                    // modal to the active tab. Fail closed: queue a
+                    // host-level deny (no session needed to send it)
+                    // and say so on the active tab, if any survives.
+                    None => {
+                        app.outbox.decides.push(OutboxDecide {
+                            tab: app.active,
+                            backend: kind,
+                            approval_id: method.clone(),
+                            requirement_id: id.clone(),
+                            choice_id: "denied".to_string(),
+                            feedback: None,
+                        });
+                        let line =
+                            format!("codex: denied orphan request {method} (unknown session)");
+                        if let Some(s) = app.sessions.get_mut(app.active) {
+                            s.push_line(line.clone());
+                        }
+                        app.flash = line;
+                        false
+                    }
+                }
             }
             BackendKind::Grok => {
                 match tab_for_session(app, kind, &params) {
@@ -988,6 +1019,26 @@ async fn drain_outbox(
             }
             continue;
         }
+        // S2-F1: codex answers are host-level JSON-RPC responses keyed
+        // by request id (the session id is unused). Like grok, they
+        // must send even when no tab/session survives — orphan
+        // approvals are denied fail-closed at route time.
+        if d.backend == BackendKind::Codex {
+            if let Some(host) = backends.get(d.backend).map(|c| &c.host) {
+                if let Err(e) = codex_respond(
+                    host,
+                    d.requirement_id.clone(),
+                    serde_json::json!({"decision": d.choice_id}),
+                )
+                .await
+                {
+                    app.flash = format!("codex: decide failed: {e}");
+                }
+            } else {
+                app.flash = "codex: no host for response".into();
+            }
+            continue;
+        }
         let sid = app.sessions[d.tab].remote_id.clone();
         let host = backends.get(d.backend).map(|c| &c.host);
         match (host, sid) {
@@ -996,14 +1047,7 @@ async fn drain_outbox(
                     BackendKind::Muse => {
                         muse_decide(host, &id, &d).await.map_err(|e| e.to_string())
                     }
-                    BackendKind::Codex => codex_respond(
-                        host,
-                        d.requirement_id.clone(),
-                        serde_json::json!({"decision": d.choice_id}),
-                    )
-                    .await
-                    .map_err(|e| e.to_string()),
-                    BackendKind::Grok => unreachable!("handled above"),
+                    BackendKind::Codex | BackendKind::Grok => unreachable!("handled above"),
                     BackendKind::Mock | BackendKind::Agy => Ok(()),
                 };
                 if let Err(e) = res {
@@ -1074,14 +1118,25 @@ fn decide_ui(app: &mut App, kind: DecisionKind, label: &str) {
                         }
                     }
                     None => {
-                        // Never trap the user: close the card locally and say
-                        // so. The approval stays pending server-side (it may
-                        // be re-issued); nothing is auto-approved or denied.
-                        app.muse_approved(label);
-                        app.flash = format!(
-                            "muse: closed locally — server offered no way to send `{label}`"
-                        );
-                        ring_bell();
+                        // S2-F2: a negative decision must always deny on
+                        // the wire. With no deny choice, closing the card
+                        // would fake a denial the server never received
+                        // (it may treat silence as consent), so keep the
+                        // card open and say so loudly. Positive decisions
+                        // still close locally: nothing is approved
+                        // server-side, so closing is fail-closed.
+                        if matches!(kind, DecisionKind::Reject | DecisionKind::Later) {
+                            app.flash = format!(
+                                "muse: cannot send `{label}` — server offered no deny path (card kept open; nothing denied)"
+                            );
+                            ring_bell();
+                        } else {
+                            app.muse_approved(label);
+                            app.flash = format!(
+                                "muse: closed locally — server offered no way to send `{label}`"
+                            );
+                            ring_bell();
+                        }
                     }
                 },
                 None => {
@@ -1566,18 +1621,27 @@ mod tests {
         app
     }
 
-    /// The reported bug: with no deny choice offered, q/Esc must still
-    /// close the card (locally, sending nothing) — never trap the user.
+    /// S2-F2: with no deny choice offered, q/Esc must NOT close the
+    /// card — a silent close fakes a denial the server never received.
+    /// The card stays open with a loud flash; y still escapes via the
+    /// offered approve choice, so the user is never trapped.
     #[test]
-    fn q_closes_modal_without_deny_choice() {
+    fn q_keeps_modal_open_without_deny_choice() {
         let mut app = muse_modal_app();
         handle_key(&mut app, KeyCode::Char('q'), NONE);
-        assert!(app.active().pending_diff.is_none(), "modal stuck open on q");
+        assert!(app.active().pending_diff.is_some(), "q silently closed a deny-less card");
         assert!(app.outbox.decides.is_empty(), "q must not send a decision");
-        assert!(!app.flash.is_empty());
+        assert!(app.flash.contains("no deny path"), "flash must name the missing deny path");
         let mut app = muse_modal_app();
         handle_key(&mut app, KeyCode::Esc, NONE);
-        assert!(app.active().pending_diff.is_none(), "modal stuck open on Esc");
+        assert!(app.active().pending_diff.is_some(), "Esc silently closed a deny-less card");
+        assert!(app.outbox.decides.is_empty(), "Esc must not send a decision");
+        // The offered approve path still closes (fail-closed: y queues
+        // the allow choice; n/q never fabricate a denial).
+        let mut app = muse_modal_app();
+        handle_key(&mut app, KeyCode::Char('n'), NONE);
+        assert!(app.active().pending_diff.is_some(), "n silently closed a deny-less card");
+        assert!(app.outbox.decides.is_empty(), "n must not send a decision");
     }
 
     /// The happy path in muse mode: y maps to the allow choice and queues
@@ -1641,6 +1705,166 @@ mod tests {
         assert!(app.active().pending_diff.is_none());
         assert_eq!(app.outbox.decides.len(), 1);
         assert_eq!(app.outbox.decides[0].choice_id, "denied");
+    }
+
+    /// S2-F1: muse/codex notifs naming an unknown (or no) session are
+    /// dropped, never attributed to the active tab. The active tab's
+    /// modal, transcript, and busy state stay untouched; a frame naming
+    /// the live session still routes.
+    #[test]
+    fn orphan_notifs_cannot_touch_active_tab() {
+        for backend in [BackendKind::Muse, BackendKind::Codex] {
+            let mut app = App::new();
+            app.active_mut().backend = backend;
+            app.active_mut().remote_id = Some("sess-1".into());
+            app.active_mut().busy = true;
+            app.active_mut().stage_diff(PendingDiff {
+                file: "tool".into(),
+                body: "body".into(),
+            });
+            app.active_mut().pending_approval = Some(PendingApproval {
+                approval_id: "a1".into(),
+                requirement_id: serde_json::Value::Null,
+                choices: vec![],
+            });
+            let before = app.active().lines.len();
+            for params in [
+                serde_json::json!({"sessionId": "orphan", "threadId": "orphan"}),
+                serde_json::json!({}),
+            ] {
+                assert!(!handle_server_msg(
+                    &mut app,
+                    backend,
+                    ServerMsg::Notif {
+                        method: "item/delta".into(),
+                        params: params.clone(),
+                    }
+                ));
+                assert!(!handle_server_msg(
+                    &mut app,
+                    backend,
+                    ServerMsg::Notif {
+                        method: "approval/requested".into(),
+                        params: params.clone(),
+                    }
+                ));
+            }
+            assert!(app.active().busy);
+            assert_eq!(app.active().pending_approval.as_ref().unwrap().approval_id, "a1");
+            assert!(app.active().pending_diff.is_some());
+            assert_eq!(app.active().lines.len(), before);
+            assert!(app.outbox.decides.is_empty());
+        }
+        // Control: a frame naming the live session still routes (muse).
+        let mut app = App::new();
+        app.active_mut().backend = BackendKind::Muse;
+        app.active_mut().remote_id = Some("sess-1".into());
+        assert!(handle_server_msg(
+            &mut app,
+            BackendKind::Muse,
+            ServerMsg::Notif {
+                method: "approval/requested".into(),
+                params: serde_json::json!({
+                    "sessionId": "sess-1",
+                    "toolName": "write",
+                    "availableChoices": [
+                        {"choiceId": "c-deny", "decision": "denied", "scope": "once",
+                         "label": "Deny", "acceptsFeedback": false},
+                    ],
+                }),
+            }
+        ));
+        assert!(app.active().pending_diff.is_some());
+    }
+
+    /// S2-F1: an orphan codex approval request is denied fail-closed on
+    /// the wire, never staged as a modal on the active tab. A request
+    /// naming the live session still stages its modal.
+    #[test]
+    fn orphan_codex_request_denied_never_staged() {
+        let mut app = App::new();
+        app.active_mut().backend = BackendKind::Codex;
+        app.active_mut().remote_id = Some("thread-1".into());
+        for params in [
+            serde_json::json!({"threadId": "nope"}),
+            serde_json::json!({}),
+        ] {
+            assert!(!handle_server_msg(
+                &mut app,
+                BackendKind::Codex,
+                ServerMsg::Request {
+                    id: serde_json::json!(8),
+                    method: "applyPatchApproval".into(),
+                    params: params.clone(),
+                }
+            ));
+        }
+        assert!(app.active().pending_diff.is_none());
+        assert!(app.active().pending_approval.is_none());
+        assert_eq!(app.outbox.decides.len(), 2);
+        for d in &app.outbox.decides {
+            assert_eq!(d.backend, BackendKind::Codex);
+            assert_eq!(d.requirement_id, 8);
+            assert_eq!(d.choice_id, "denied");
+        }
+        assert!(app.flash.contains("orphan"));
+        // Control: the live session's own request still stages a modal.
+        assert!(handle_server_msg(
+            &mut app,
+            BackendKind::Codex,
+            ServerMsg::Request {
+                id: serde_json::json!(9),
+                method: "applyPatchApproval".into(),
+                params: serde_json::json!({"threadId": "thread-1"}),
+            }
+        ));
+        assert!(app.active().pending_diff.is_some());
+        assert!(app.active().pending_approval.is_some());
+    }
+
+    /// S2-F1: the queued orphan deny is a host-level response — it must
+    /// reach the host even when the tab/session is gone by drain time.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_orphan_deny_reaches_host_without_session() {
+        let (tx, rx) = mpsc::channel(4);
+        let host = msp::Host::spawn("/bin/sh", &["-c", r#"
+            while read -r response; do
+                printf '{"method":"observed","params":%s}\n' "$response"
+            done
+        "#], &[], tx).await.unwrap();
+        let mut backends = Backends {
+            codex: Some(LiveBackend { host: std::sync::Arc::new(host), rx }),
+            ..Default::default()
+        };
+        let mut app = App::new();
+        app.active_mut().backend = BackendKind::Codex;
+        app.active_mut().remote_id = Some("thread-1".into());
+        let (agy_tx, _agy_rx) = mpsc::channel(1);
+        assert!(!handle_server_msg(
+            &mut app,
+            BackendKind::Codex,
+            ServerMsg::Request {
+                id: serde_json::json!(8),
+                method: "applyPatchApproval".into(),
+                params: serde_json::json!({"threadId": "nope"}),
+            }
+        ));
+        assert!(app.active().pending_diff.is_none());
+        // The tab can disappear before the drain; the deny still applies.
+        app.sessions.clear();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            assert!(drain_outbox(&mut app, &mut backends, &Config::default(), &agy_tx).await);
+            match backends.codex.as_mut().unwrap().rx.recv().await.unwrap() {
+                ServerMsg::Notif { params, .. } => {
+                    assert_eq!(params["id"], 8);
+                    assert_eq!(params["result"]["decision"], "denied");
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        })
+        .await
+        .expect("denied response did not reach host");
     }
 
     /// P opens the picker; j/k move; Enter respawns the tab fresh.

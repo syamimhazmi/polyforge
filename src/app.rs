@@ -123,6 +123,65 @@ pub const SLASH_COMMANDS: [(&str, &str, &str); 6] = [
     ("/help", "/help", "command + key summary"),
 ];
 
+/// Strip terminal-injection bytes (S3-F1): ESC-led sequences (CSI, OSC,
+/// DCS/SOS/PM/APC, charset shifts, single `ESC X`), C1 singletons, C0
+/// controls, and DEL are removed. Sequence parameters go with their
+/// introducer, so no `[31m` remnant or hyperlink URL survives. Tab and
+/// newline are kept; everything else passes through. Idempotent.
+pub fn sanitize_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '\t' | '\n' => out.push(c),
+            '\x1b' => consume_esc(&mut it),
+            '\u{9b}' => consume_csi(&mut it),
+            '\u{9d}' | '\u{90}' | '\u{98}' | '\u{9e}' | '\u{9f}' => consume_until_st(&mut it),
+            _ if c.is_control() => {}
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Consume an ESC-led sequence: the introducer is already eaten.
+fn consume_esc(it: &mut std::iter::Peekable<std::str::Chars>) {
+    match it.next() {
+        None => {}
+        Some('[') => consume_csi(it),
+        Some(']' | 'P' | 'X' | '^' | '_') => consume_until_st(it),
+        Some('(' | ')' | '#' | '%' | '$') => {
+            it.next();
+        }
+        Some(_) => {}
+    }
+}
+
+/// Consume a CSI body through its final byte (`@`–`~`); unterminated
+/// input fails closed by eating to the end.
+fn consume_csi(it: &mut std::iter::Peekable<std::str::Chars>) {
+    for c in it.by_ref() {
+        if ('\x40'..='\x7e').contains(&c) {
+            break;
+        }
+    }
+}
+
+/// Consume an OSC/DCS-style body through ST (BEL, `ESC \`, or U+009C).
+fn consume_until_st(it: &mut std::iter::Peekable<std::str::Chars>) {
+    while let Some(c) = it.next() {
+        match c {
+            '\x07' | '\u{9c}' => break,
+            '\x1b' => {
+                if it.next() == Some('\\') {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Short display id for the `/sessions` list (store ids are ASCII
 /// `millis-pid-seq`, so byte slicing is safe).
 pub fn short_id(id: &str) -> String {
@@ -319,6 +378,12 @@ pub struct Session {
     pub store_dirty: bool,
     /// Set when an agy child is spawned; cleared when `agy/init` lands.
     pub pending_agy_init: bool,
+    /// Live Grok thought body (no `grok: ∴` prefix). Mid-stream only;
+    /// committed via flush. Bounded; never written token-by-token to JSONL.
+    pub draft_thought: Option<String>,
+    /// Open Grok answer line. Chunks append here; `\n` peels committed
+    /// lines via `push_line`. Remainder flushes at turn/tool boundaries.
+    pub draft_answer: String,
 }
 
 impl Session {
@@ -350,10 +415,41 @@ impl Session {
             sink: None,
             store_dirty: false,
             pending_agy_init: false,
+            draft_thought: None,
+            draft_answer: String::new(),
         }
     }
 
+    /// Drop in-flight Grok stream drafts (tab reset / session replace).
+    pub fn clear_stream_drafts(&mut self) {
+        self.draft_thought = None;
+        self.draft_answer.clear();
+    }
+
+    /// Virtual trailing lines for the live thought + open answer (render).
+    pub fn stream_draft_lines(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(t) = self.draft_thought.as_ref() {
+            if !t.is_empty() {
+                out.push(format!("grok: ∴ {t}"));
+            }
+        }
+        if !self.draft_answer.is_empty() {
+            out.push(self.draft_answer.clone());
+        }
+        out
+    }
+
+    /// Wrapped-row count of [`stream_draft_lines`] at `width`.
+    pub fn draft_display_rows(&self, width: usize) -> usize {
+        self.stream_draft_lines()
+            .iter()
+            .map(|l| wrap_rows(l, width.max(1)))
+            .sum()
+    }
+
     pub fn push_line(&mut self, line: String) {
+        let line = sanitize_text(&line);
         if let Some(sink) = self.sink.as_mut() {
             crate::store::append_line(sink, &line);
             self.store_dirty = true;
@@ -380,6 +476,10 @@ impl Session {
     /// pinning memory after switching away. Over-cap heads are dropped,
     /// mirroring `push_line`.
     pub fn replace_lines(&mut self, mut lines: Vec<String>, width: usize) {
+        for l in lines.iter_mut() {
+            let clean = sanitize_text(l);
+            *l = clean;
+        }
         let w = width.max(1);
         if lines.len() > MAX_LINES {
             lines.drain(..lines.len() - MAX_LINES);
@@ -396,6 +496,7 @@ impl Session {
         self.total_rows = total_rows;
         self.cache_width = Some(w);
         self.scroll = 0;
+        self.clear_stream_drafts();
     }
 
     /// Rebuild the height cache when the viewport width changed.
@@ -422,7 +523,10 @@ impl Session {
 
     /// Open the DIFF card and invalidate any in-flight risk judgment.
     pub fn stage_diff(&mut self, diff: PendingDiff) {
-        self.pending_diff = Some(diff);
+        self.pending_diff = Some(PendingDiff {
+            file: sanitize_text(&diff.file),
+            body: sanitize_text(&diff.body),
+        });
         self.approval_risk = None;
         self.risk_gen = self.risk_gen.wrapping_add(1);
         self.risk_spawned_gen = None;
@@ -530,7 +634,9 @@ impl App {
 
     fn max_scroll(&self) -> usize {
         let s = self.active();
-        s.total_rows.saturating_sub(self.viewport_height.max(1))
+        let w = self.viewport_width.max(1);
+        let total = s.total_rows + s.draft_display_rows(w);
+        total.saturating_sub(self.viewport_height.max(1))
     }
 
     fn set_scroll(&mut self, v: usize) {
@@ -560,7 +666,8 @@ impl App {
         let w = self.viewport_width.max(1);
         let s = self.active_mut();
         s.ensure_cache(w);
-        let tail = s.total_rows.saturating_sub(vh);
+        let total = s.total_rows + s.draft_display_rows(w);
+        let tail = total.saturating_sub(vh);
         s.scroll = tail;
     }
 
@@ -1057,6 +1164,7 @@ impl App {
             s.row_cache.clear();
             s.total_rows = 0;
             s.scroll = 0;
+            s.clear_stream_drafts();
             s.push_line(format!("--- {} session (fresh) ---", backend.label()));
         }
         self.outbox.respawns.push(OutboxRespawn { tab, backend });
@@ -1224,7 +1332,14 @@ impl App {
         if out.is_empty() {
             return None;
         }
-        Some(out.join("\n"))
+        Some(sanitize_text(&out.join("\n")))
+    }
+
+    /// Selection text for auto-copy; always clears the highlight.
+    pub fn take_selected_text(&mut self) -> Option<String> {
+        let text = self.selected_text();
+        self.sel = None;
+        text
     }
 
     // -- search (/ + n/N) --
@@ -1850,6 +1965,28 @@ mod tests {
         assert!(!app.sel_begin(1, 99));
     }
 
+    /// Auto-copy path must clear the highlight (mouse-up dehighlight).
+    #[test]
+    fn take_selected_text_clears_selection() {
+        let mut app = App::new();
+        app.sessions[0].lines.clear();
+        app.sessions[0].row_cache.clear();
+        app.sessions[0].total_rows = 0;
+        app.sessions[0].push_line("copy-me-please".to_string());
+        app.viewport_width = 20;
+        app.viewport_height = 10;
+        app.active_mut().ensure_cache(20);
+        app.text_area = Some((0, 0, 20, 10));
+        app.active_mut().scroll = 0;
+        assert!(app.sel_begin(0, 0));
+        app.sel_extend(8, 0);
+        assert_eq!(app.selected_text().as_deref(), Some("copy-me-"));
+        assert!(app.sel.is_some());
+        assert_eq!(app.take_selected_text().as_deref(), Some("copy-me-"));
+        assert!(app.sel.is_none());
+        assert_eq!(app.take_selected_text(), None);
+    }
+
     /// Scrolled viewport maps cells to the right lines.
     #[test]
     fn drag_selection_honors_scroll() {
@@ -2054,5 +2191,90 @@ mod tests {
         assert!(app.decide_diff("approved"));
         assert!(!app.active().busy);
         assert!(app.active().pending_diff.is_none());
+    }
+
+    /// S3-F1: ESC/C0 fixture is inert — no ESC survives, CSI parameter
+    /// remnants (`[31m`) are gone with their sequence, the hyperlink URL
+    /// goes with its OSC, and visible text is kept.
+    #[test]
+    fn sanitize_strips_esc_c0_sequences() {
+        let dirty = "\x1b[31mred\x1b[0m\x00\x07bell\x1b]8;;http://evil\x07link";
+        assert_eq!(sanitize_text(dirty), "redbelllink");
+    }
+
+    /// S3-F1: tab, newline, and non-ASCII text are not display attacks.
+    #[test]
+    fn sanitize_keeps_tab_newline_unicode() {
+        assert_eq!(sanitize_text("a\tb\ncあ🎉"), "a\tb\ncあ🎉");
+    }
+
+    /// S3-F1: C1 singletons (never enumerated in the finding) fail closed
+    /// too: CSI `U+009B` consumes its parameters, DEL and lone C1 drop.
+    #[test]
+    fn sanitize_drops_c1_singletons_and_del() {
+        assert_eq!(sanitize_text("a\x7fb\u{80}c\u{9b}31md"), "abcd");
+        assert_eq!(sanitize_text("a\u{9d}52;c;xyz\x07b"), "ab");
+    }
+
+    /// S3-F1: truncated input fails closed — a bare ESC eats its follower,
+    /// an unterminated CSI never leaks its parameters.
+    #[test]
+    fn sanitize_truncated_sequences_fail_closed() {
+        assert_eq!(sanitize_text("a\x1bb"), "a");
+        assert_eq!(sanitize_text("a\x1b[31"), "a");
+        assert_eq!(sanitize_text("a\x1b"), "a");
+    }
+
+    /// S3-F1: `push_line` is the store choke point — the dirty line must
+    /// be absent from both memory and the JSONL transcript.
+    #[test]
+    fn push_line_stores_sanitized() {
+        let (store, dir) = test_store("s3-store");
+        let id = crate::store::Store::new_session_id();
+        let mut app = App::new();
+        app.sessions[0].sink = store.open_sink(&id);
+        app.sessions[0].push_line("\x1b[2Jwiped\x00".to_string());
+        app.flush_store();
+        assert_eq!(app.sessions[0].lines, vec!["wiped"]);
+        assert_eq!(store.load_transcript(&id), vec!["wiped"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// S3-F1: pre-fix transcripts loaded from disk are cleaned on replay.
+    #[test]
+    fn replace_lines_sanitizes_legacy_data() {
+        let mut s = Session::new("t");
+        s.replace_lines(vec!["\x1b[1mclean\x1b[0m".to_string()], 100);
+        assert_eq!(s.lines, vec!["clean"]);
+    }
+
+    /// S3-F1: the copy layer is defense in depth — even a raw line that
+    /// bypassed `push_line` must not survive `selected_text`.
+    #[test]
+    fn selected_text_is_sanitized() {
+        let mut app = App::new();
+        let dirty = "\x1b[31mcopy-me\x1b[0m";
+        app.sessions[0].lines.push(dirty.to_string());
+        let len = dirty.chars().count();
+        app.sel = Some(Selection {
+            anchor_line: 0,
+            anchor_char: 0,
+            focus_line: 0,
+            focus_char: len,
+        });
+        assert_eq!(app.selected_text().as_deref(), Some("copy-me"));
+    }
+
+    /// S3-F1: the approval card is agent-controlled render surface too.
+    #[test]
+    fn stage_diff_sanitizes_card() {
+        let mut s = Session::new("t");
+        s.stage_diff(PendingDiff {
+            file: "tool\x1b[2K".to_string(),
+            body: "do it\x1b]8;;http://evil\x07now".to_string(),
+        });
+        let diff = s.pending_diff.as_ref().expect("staged");
+        assert_eq!(diff.file, "tool");
+        assert_eq!(diff.body, "do itnow");
     }
 }

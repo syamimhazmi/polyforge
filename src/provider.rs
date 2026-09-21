@@ -218,6 +218,19 @@ pub fn apply_notif(app: &mut App, tab: usize, method: &str, params: &Value) -> b
                     choices.iter().map(|c| c.label.as_str()).collect();
                 body.push_str(&format!("\nchoices: {}", labels.join(" · ")));
             }
+            // S2-F2: refuse to show a y/n modal the user cannot deny.
+            // With no `denied` choice, n/q would close the card while
+            // sending nothing — the server may treat silence as
+            // consent. Fail closed: no modal, nothing approved or
+            // denied, loud note instead.
+            if !choices.iter().any(|c| c.decision == "denied") {
+                let s = &mut app.sessions[tab];
+                s.push_line(format!(
+                    "muse: approval for {tool} arrived with no deny option — modal refused (nothing approved or denied)"
+                ));
+                app.flash = format!("muse: {tool} offered no way to deny — modal refused");
+                return true; // bell: needs attention, the turn may be stalled
+            }
             let s = &mut app.sessions[tab];
             s.stage_diff(PendingDiff {
                 file: tool.to_string(),
@@ -233,7 +246,7 @@ pub fn apply_notif(app: &mut App, tab: usize, method: &str, params: &Value) -> b
                     .get("currentRequirementId")
                     .cloned()
                     .unwrap_or(Value::Null),
-                choices: parse_choices(p),
+                choices,
             });
             app.flash = format!("{tool} wants approval (y/n/a/q)");
             true // bell: a decision is waiting
@@ -412,6 +425,55 @@ mod tests {
         assert!(map_decision(&a, DecisionKind::ApproveAll).is_none());
         // once-approved must not be used as a stand-in.
         assert!(a.choices.iter().any(|c| c.decision == "approved"));
+    }
+
+    fn requested_params(choices: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "toolName": "write",
+            "approvalId": "a9",
+            "currentRequirementId": "r9",
+            "availableChoices": choices,
+        })
+    }
+
+    fn allow_only_choices() -> serde_json::Value {
+        serde_json::json!([
+            {"choiceId": "c-allow", "decision": "approved", "scope": "once",
+             "label": "Allow", "acceptsFeedback": false},
+        ])
+    }
+
+    /// S2-F2: an approval request offering no deny choice must not stage
+    /// a modal — n/q would otherwise close the card while sending
+    /// nothing. Loud note instead; nothing approved or denied.
+    #[test]
+    fn approval_without_deny_choice_refuses_modal() {
+        let mut app = App::new();
+        let params = requested_params(allow_only_choices());
+        assert!(apply_notif(&mut app, 0, "approval/requested", &params));
+        assert!(app.sessions[0].pending_diff.is_none());
+        assert!(app.sessions[0].pending_approval.is_none());
+        assert!(app.flash.contains("no way to deny"));
+        assert!(app.sessions[0]
+            .lines
+            .iter()
+            .any(|l| l.contains("modal refused")));
+    }
+
+    /// Control: a request offering deny still stages the modal.
+    #[test]
+    fn approval_with_deny_choice_stages_modal() {
+        let mut app = App::new();
+        let params = requested_params(serde_json::json!([
+            {"choiceId": "c-allow", "decision": "approved", "scope": "once",
+             "label": "Allow", "acceptsFeedback": false},
+            {"choiceId": "c-deny", "decision": "denied", "scope": "once",
+             "label": "Deny", "acceptsFeedback": true},
+        ]));
+        assert!(apply_notif(&mut app, 0, "approval/requested", &params));
+        assert!(app.sessions[0].pending_diff.is_some());
+        let approval = app.sessions[0].pending_approval.as_ref().unwrap();
+        assert!(approval.choices.iter().any(|c| c.decision == "denied"));
     }
 
     #[test]

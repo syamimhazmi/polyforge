@@ -81,30 +81,61 @@ fn render_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     let sel = app.sel;
     let s = app.active_mut();
     s.ensure_cache(width);
+    // Committed lines + live Grok stream drafts (thought / open answer).
+    let drafts = s.stream_draft_lines();
+    let draft_rows: Vec<usize> = drafts
+        .iter()
+        .map(|l| crate::app::wrap_rows(l, width))
+        .collect();
+    let n_committed = s.lines.len();
+    let n_view = n_committed + drafts.len();
     // Walk the height cache to the first visible row (grok-build-style
     // virtualized window: only visible rows are laid out, never the tail).
     let mut li = 0usize;
     let mut consumed = 0usize;
-    while li < s.lines.len() && consumed + s.row_cache[li] <= s.scroll {
-        consumed += s.row_cache[li];
+    while li < n_view {
+        let rows = if li < n_committed {
+            s.row_cache[li]
+        } else {
+            draft_rows[li - n_committed]
+        };
+        if consumed + rows > s.scroll {
+            break;
+        }
+        consumed += rows;
         li += 1;
     }
     let mut sub = s.scroll.saturating_sub(consumed);
     let mut items = Vec::new();
-    while items.len() < vh && li < s.lines.len() {
-        let line = &s.lines[li];
+    while items.len() < vh && li < n_view {
+        let raw = if li < n_committed {
+            s.lines[li].as_str()
+        } else {
+            drafts[li - n_committed].as_str()
+        };
+        // S3-F1 render defense: lines are clean at ingress, but never
+        // trust the buffer on the way to the terminal.
+        let line = crate::app::sanitize_text(raw);
         let style = if line.starts_with('>') {
             Style::default().fg(Color::Cyan)
         } else if line.starts_with("mock: approved") || line.starts_with("muse: approved") {
             Style::default().fg(Color::Green)
-        } else if line.starts_with("mock: ") || line.starts_with("muse: ") {
+        } else if line.starts_with("mock: ")
+            || line.starts_with("muse: ")
+            || line.starts_with("grok: ∴")
+        {
             Style::default().fg(Color::DarkGray)
         } else {
             Style::default()
         };
         let line_len = line.chars().count();
-        let span = sel.and_then(|sel| sel.span_on_line(li, line_len));
-        let chunks = crate::app::Session::wrap_line(line, width);
+        // Drafts are not mouse-selectable (no stable line index in `lines`).
+        let span = if li < n_committed {
+            sel.and_then(|sel| sel.span_on_line(li, line_len))
+        } else {
+            None
+        };
+        let chunks = crate::app::Session::wrap_line(&line, width);
         let mut coff = chunks.iter().take(sub).map(|c| c.chars().count()).sum::<usize>();
         for chunk in chunks.iter().skip(sub) {
             let spans = match span {
@@ -184,7 +215,8 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             s.scroll.min(total.saturating_sub(1).max(0)) + 1,
             total.max(1),
             if app.mouse { "on" } else { "off" },
-            app.flash,
+            // S3-F1: flash carries agent text (method names, errors).
+            crate::app::sanitize_text(&app.flash),
         )),
     ]);
     f.render_widget(Paragraph::new(line), area);
@@ -276,20 +308,23 @@ fn render_diff_modal(f: &mut Frame, app: &App) {
         None if s.risk_spawned_gen.is_some() => "risk … scoring".to_string(),
         None => String::new(),
     };
+    // S3-F1 render defense: the card body/file are agent-controlled.
+    let body = crate::app::sanitize_text(&diff.body);
+    let file = crate::app::sanitize_text(&diff.file);
     let text = if risk.is_empty() {
-        format!("{}\n\n{}", diff.body, "y approve · n reject · a approve-all · q later")
+        format!("{}\n\n{}", body, "y approve · n reject · a approve-all · q later")
     } else {
         format!(
             "{}\n\n{}\n\n{}",
-            diff.body, risk, "y approve · n reject · a approve-all · q later"
+            body, risk, "y approve · n reject · a approve-all · q later"
         )
     };
     let title = if risk.is_empty() {
-        format!(" DIFF — {} ", diff.file)
+        format!(" DIFF — {} ", file)
     } else if let Some(j) = s.approval_risk.as_ref() {
-        format!(" DIFF — {} — {} ", diff.file, j.band.label())
+        format!(" DIFF — {} — {} ", file, j.band.label())
     } else {
-        format!(" DIFF — {} ", diff.file)
+        format!(" DIFF — {} ", file)
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -344,10 +379,11 @@ fn render_sessions_modal(f: &mut Frame, app: &App) {
         .enumerate()
         .map(|(i, s)| {
             let cursor = if i == app.sess_sel { "> " } else { "  " };
+            // S3-F1: preview/title come from stored transcripts.
             let summary = if s.title.is_empty() {
-                s.preview.clone()
+                crate::app::sanitize_text(&s.preview)
             } else {
-                s.title.clone()
+                crate::app::sanitize_text(&s.title)
             };
             let style = if i == app.sess_sel {
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
@@ -405,4 +441,37 @@ fn char_byte_index(s: &str, char_idx: usize) -> usize {
         .map(|(b, _)| b)
         .nth(char_idx)
         .unwrap_or(s.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    /// S3-F1: even a raw line that bypassed `push_line` renders inert —
+    /// no control byte may reach the terminal buffer, while visible text
+    /// and hyperlink labels survive without their URL.
+    #[test]
+    fn render_neutralizes_injected_line() {
+        let mut app = App::new();
+        app.sessions[0].lines.push(
+            "\x1b[2J\x1b]8;;http://evil\x07pwned\x00".to_string(),
+        );
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| render(f, &mut app)).expect("draw");
+        let buf = terminal.backend().buffer();
+        for cell in buf.content() {
+            for ch in cell.symbol().chars() {
+                assert!(
+                    !ch.is_control(),
+                    "control char reached terminal buffer: {ch:?}"
+                );
+            }
+        }
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("pwned"));
+        assert!(!text.contains("evil"));
+    }
 }
