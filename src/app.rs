@@ -115,7 +115,11 @@ pub const TITLE_LEN: usize = 48;
 /// display template; `accept_slash_completion` inserts `insert` instead
 /// (e.g. `/sessions` completes to `/sessions ` so a query can follow).
 pub const SLASH_COMMANDS: [(&str, &str, &str); 6] = [
-    ("/sessions [query]", "/sessions ", "browse previous sessions"),
+    (
+        "/sessions [query]",
+        "/sessions ",
+        "browse previous sessions",
+    ),
     ("/new", "/new", "fresh session in this tab"),
     ("/tab new", "/tab new", "open a tab (max 3)"),
     ("/tab close", "/tab close", "close this tab"),
@@ -262,8 +266,14 @@ impl BackendKind {
         (BackendKind::Mock, "mock — offline fake (no quota)"),
         (BackendKind::Muse, "muse — Muse Spark via `muse serve`"),
         (BackendKind::Codex, "codex — Codex via `codex app-server`"),
-        (BackendKind::Agy, "agy — Antigravity via `agy` (visible, ungated)"),
-        (BackendKind::Grok, "grok — Grok via `grok agent stdio` (ACP)"),
+        (
+            BackendKind::Agy,
+            "agy — Antigravity via `agy` (visible, ungated)",
+        ),
+        (
+            BackendKind::Grok,
+            "grok — Grok via `grok agent stdio` (ACP)",
+        ),
     ];
 
     pub fn label(self) -> &'static str {
@@ -709,12 +719,15 @@ impl App {
             BackendKind::Muse | BackendKind::Codex | BackendKind::Grok => match sid {
                 Some(_) => {
                     s.busy = true;
-                    self.outbox.submits.push(OutboxSubmit { tab, backend, prompt });
+                    self.outbox.submits.push(OutboxSubmit {
+                        tab,
+                        backend,
+                        prompt,
+                    });
                 }
                 None => {
                     let tag = backend.label();
-                    let why = degraded
-                        .unwrap_or_else(|| format!("{tag} session unavailable"));
+                    let why = degraded.unwrap_or_else(|| format!("{tag} session unavailable"));
                     s.push_line(format!("{tag}: {why}"));
                 }
             },
@@ -722,7 +735,11 @@ impl App {
             // order; no session id is needed up front (init assigns it).
             BackendKind::Agy => {
                 s.busy = true;
-                self.outbox.submits.push(OutboxSubmit { tab, backend, prompt });
+                self.outbox.submits.push(OutboxSubmit {
+                    tab,
+                    backend,
+                    prompt,
+                });
             }
         }
         self.mode = Mode::Normal;
@@ -886,9 +903,7 @@ impl App {
         if store.delete_session(&pick.id) {
             self.flash = format!("deleted session {}", short_id(&pick.id));
             self.sess_list.remove(self.sess_sel);
-            self.sess_sel = self
-                .sess_sel
-                .min(self.sess_list.len().saturating_sub(1));
+            self.sess_sel = self.sess_sel.min(self.sess_list.len().saturating_sub(1));
             if self.sess_list.is_empty() {
                 self.mode = Mode::Normal;
             }
@@ -916,11 +931,7 @@ impl App {
         // run's writes (newer remote id / title / updated win).
         let (remote_id, title, updated_at) = match store.load_meta(&pick.id) {
             Some(meta) => (meta.remote_id, meta.title, meta.updated_at),
-            None => (
-                pick.remote_id.clone(),
-                pick.title.clone(),
-                pick.updated_at,
-            ),
+            None => (pick.remote_id.clone(), pick.title.clone(), pick.updated_at),
         };
         {
             let s = self.active_mut();
@@ -1057,7 +1068,8 @@ impl App {
         };
         for l in [
             "commands (Insert mode, Enter sends):".to_string(),
-            "  /sessions [query] — browse previous sessions, Enter views + continues, d deletes".to_string(),
+            "  /sessions [query] — browse previous sessions, Enter views + continues, d deletes"
+                .to_string(),
             "  /new — fresh session in this tab (same as R)".to_string(),
             "  /tab new — open a tab (max 3), same backend as current".to_string(),
             "  /tab close — close this tab, killing its session".to_string(),
@@ -1181,7 +1193,11 @@ impl App {
             return false;
         };
         s.pending_approval.take();
-        s.push_line(format!("{tag}: {} {} [{decision}]", muse_mark(decision), diff.file));
+        s.push_line(format!(
+            "{tag}: {} {} [{decision}]",
+            muse_mark(decision),
+            diff.file
+        ));
         self.stick_to_bottom();
         true
     }
@@ -1241,7 +1257,12 @@ impl App {
         let Some(diff) = s.clear_diff() else {
             return false;
         };
-        s.push_line(format!("{} {} [{}]", diff_mark(decision), diff.file, decision));
+        s.push_line(format!(
+            "{} {} [{}]",
+            diff_mark(decision),
+            diff.file,
+            decision
+        ));
         s.busy = false;
         s.push_line("mock: done ✓".to_string());
         self.stick_to_bottom();
@@ -1292,8 +1313,7 @@ impl App {
         // Walk the height cache to the visible row (same walk as render).
         let mut li = 0usize;
         let mut consumed = 0usize;
-        while li < s.lines.len() && consumed + s.row_cache.get(li).copied().unwrap_or(1) <= target
-        {
+        while li < s.lines.len() && consumed + s.row_cache.get(li).copied().unwrap_or(1) <= target {
             consumed += s.row_cache.get(li).copied().unwrap_or(1);
             li += 1;
         }
@@ -1348,11 +1368,7 @@ impl App {
     /// wrong mode (`/tab close` in Normal lands here as `tab close`).
     fn looks_like_command(query: &str) -> bool {
         let q = query.trim().to_lowercase();
-        q == "sessions"
-            || q == "vim"
-            || q == "help"
-            || q == "tab"
-            || q.starts_with("tab ")
+        q == "sessions" || q == "vim" || q == "help" || q == "tab" || q.starts_with("tab ")
     }
 
     pub fn run_search(&mut self) {
@@ -1470,10 +1486,7 @@ mod tests {
         let mut app = App::new();
         assert!(app.sessions[0].lines.is_empty());
         app.open_tab();
-        assert!(app.sessions[1]
-            .lines
-            .iter()
-            .all(|l| l.contains("fresh")));
+        assert!(app.sessions[1].lines.iter().all(|l| l.contains("fresh")));
     }
 
     #[test]
@@ -1500,7 +1513,10 @@ mod tests {
         // Seed must be cleared; replayed lines start at index 0.
         let mut app = App::new();
         crate::mock::seed(&mut app.sessions[0]);
-        assert!(app.sessions[0].lines.len() > 2, "precondition: seed present");
+        assert!(
+            app.sessions[0].lines.len() > 2,
+            "precondition: seed present"
+        );
         app.store = Some(store);
         app.open_session_chooser(String::new());
         assert_eq!(app.mode, Mode::Sessions);
@@ -1534,11 +1550,7 @@ mod tests {
 
     #[test]
     fn backends_needed_unique_preserves_order() {
-        let mut sessions = vec![
-            Session::new("a"),
-            Session::new("b"),
-            Session::new("c"),
-        ];
+        let mut sessions = vec![Session::new("a"), Session::new("b"), Session::new("c")];
         sessions[0].backend = BackendKind::Mock;
         sessions[1].backend = BackendKind::Codex;
         sessions[2].backend = BackendKind::Muse;
@@ -1850,7 +1862,9 @@ mod tests {
         });
         assert_eq!(s.risk_gen, 1);
         assert!(s.pending_diff.is_some());
-        s.approval_risk = Some(crate::typesafe::ApprovalJudgment::compose(0.0, 1.0, 0.0, 0.0));
+        s.approval_risk = Some(crate::typesafe::ApprovalJudgment::compose(
+            0.0, 1.0, 0.0, 0.0,
+        ));
         s.risk_spawned_gen = Some(1);
         let taken = s.clear_diff();
         assert_eq!(taken.unwrap().file, "f");
@@ -2011,10 +2025,7 @@ mod tests {
     fn replace_lines_builds_cache_at_width_and_caps() {
         let mut s = Session::new("t");
         // 14 ASCII cols at width 7 = 2 rows; wide chars take the slow path.
-        s.replace_lines(
-            vec!["0123456789ABCD".to_string(), "あいう".to_string()],
-            7,
-        );
+        s.replace_lines(vec!["0123456789ABCD".to_string(), "あいう".to_string()], 7);
         assert_eq!(s.cache_width, Some(7));
         assert_eq!(s.row_cache, vec![2, Session::wrap_line("あいう", 7).len()]);
         assert_eq!(s.total_rows, s.row_cache.iter().sum::<usize>());

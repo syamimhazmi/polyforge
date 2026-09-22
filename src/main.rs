@@ -29,21 +29,20 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc;
 
-use agy::{agy_submit, apply_agy_notif, spawn_agy, AgyHandle};
+use agy::{AgyHandle, agy_submit, apply_agy_notif, spawn_agy};
 use app::{App, BackendKind, DecisionKind, Mode, OutboxDecide};
-use config::Config;
-use msp::ServerMsg;
 use codex::{
-    apply_codex_approval, apply_codex_notif, codex_bringup, codex_respond,
-    codex_resume_thread, codex_start_thread, map_codex_decision,
+    apply_codex_approval, apply_codex_notif, codex_bringup, codex_respond, codex_resume_thread,
+    codex_start_thread, map_codex_decision,
 };
+use config::Config;
 use grok::{
-    apply_grok_notif, apply_grok_permission, grok_bringup, grok_close_session,
-    grok_new_session, grok_respond, grok_resume_session, grok_submit, map_grok_decision,
+    apply_grok_notif, apply_grok_permission, grok_bringup, grok_close_session, grok_new_session,
+    grok_respond, grok_resume_session, grok_submit, map_grok_decision,
 };
+use msp::ServerMsg;
 use provider::{
-    map_decision, muse_bringup, muse_decide, muse_resume_session, muse_start_session,
-    muse_submit,
+    map_decision, muse_bringup, muse_decide, muse_resume_session, muse_start_session, muse_submit,
 };
 
 #[tokio::main]
@@ -200,7 +199,11 @@ fn grey_out(app: &mut App, kind: BackendKind, reason: &str) {
 }
 
 /// Bring up the serve/app-server host for `kind` if not running.
-async fn ensure_host(backends: &mut Backends, kind: BackendKind, cfg: &Config) -> Result<(), String> {
+async fn ensure_host(
+    backends: &mut Backends,
+    kind: BackendKind,
+    cfg: &Config,
+) -> Result<(), String> {
     let present = match kind {
         BackendKind::Muse => backends.muse.is_some(),
         BackendKind::Codex => backends.codex.is_some(),
@@ -299,7 +302,13 @@ async fn ensure_agy_tab(
         args.push("--conversation".to_string());
         args.push(id);
     }
-    match spawn_agy(&cfg.agy_bin(), &args, &cfg.workspace_root(), events_tx.clone()).await
+    match spawn_agy(
+        &cfg.agy_bin(),
+        &args,
+        &cfg.workspace_root(),
+        events_tx.clone(),
+    )
+    .await
     {
         Ok(h) => {
             backends.agy[tab] = Some(h);
@@ -414,33 +423,25 @@ async fn open_tab_session(
                 }
             };
             match resume {
-                Some(old) => {
-                    match grok_resume_session(&ctx.host, &old, workspace.clone()).await {
-                        Ok(id) => opened(app, id, true),
-                        Err(rerr) => {
-                            match grok_new_session(
-                                &ctx.host,
-                                cfg.grok_model(),
-                                workspace.clone(),
-                            )
-                            .await
-                            {
-                                Ok((id, note)) => {
-                                    let s = &mut app.sessions[tab];
-                                    s.push_line(format!(
-                                        "{tag}: resume failed ({rerr}) — started fresh"
-                                    ));
-                                    fresh_note(app, note);
-                                    opened(app, id, false);
-                                }
-                                Err(e) => fail(app, &e),
+                Some(old) => match grok_resume_session(&ctx.host, &old, workspace.clone()).await {
+                    Ok(id) => opened(app, id, true),
+                    Err(rerr) => {
+                        match grok_new_session(&ctx.host, cfg.grok_model(), workspace.clone()).await
+                        {
+                            Ok((id, note)) => {
+                                let s = &mut app.sessions[tab];
+                                s.push_line(format!(
+                                    "{tag}: resume failed ({rerr}) — started fresh"
+                                ));
+                                fresh_note(app, note);
+                                opened(app, id, false);
                             }
+                            Err(e) => fail(app, &e),
                         }
                     }
-                }
+                },
                 None => {
-                    match grok_new_session(&ctx.host, cfg.grok_model(), workspace.clone()).await
-                    {
+                    match grok_new_session(&ctx.host, cfg.grok_model(), workspace.clone()).await {
                         Ok((id, note)) => {
                             fresh_note(app, note);
                             opened(app, id, false);
@@ -462,8 +463,7 @@ async fn open_tab_session(
             // Keep expected resume id so init can match by conversation_id.
             if let Some(ref id) = resume {
                 app.sessions[tab].remote_id = Some(id.clone());
-                app.sessions[tab]
-                    .push_line(format!("{tag}: continuing previous conversation"));
+                app.sessions[tab].push_line(format!("{tag}: continuing previous conversation"));
             }
             let had_resume = resume.is_some();
             match ensure_agy_tab(backends, tab, cfg, agy_tx, resume).await {
@@ -787,11 +787,9 @@ fn handle_server_msg(app: &mut App, kind: BackendKind, msg: ServerMsg) -> bool {
                 (BackendKind::Agy, "agy/init") => tab_for_session(app, kind, &params)
                     .or_else(|| {
                         while let Some(t) = app.agy_init_fifo.pop_front() {
-                            if app
-                                .sessions
-                                .get(t)
-                                .is_some_and(|s| s.backend == BackendKind::Agy && s.pending_agy_init)
-                            {
+                            if app.sessions.get(t).is_some_and(|s| {
+                                s.backend == BackendKind::Agy && s.pending_agy_init
+                            }) {
                                 return Some(t);
                             }
                         }
@@ -802,9 +800,7 @@ fn handle_server_msg(app: &mut App, kind: BackendKind, msg: ServerMsg) -> bool {
                             .sessions
                             .iter()
                             .enumerate()
-                            .filter(|(_, s)| {
-                                s.backend == BackendKind::Agy && s.remote_id.is_none()
-                            })
+                            .filter(|(_, s)| s.backend == BackendKind::Agy && s.remote_id.is_none())
                             .map(|(i, _)| i)
                             .collect();
                         (waiting.len() == 1).then_some(waiting[0])
@@ -861,17 +857,16 @@ fn handle_server_msg(app: &mut App, kind: BackendKind, msg: ServerMsg) -> bool {
                     }
                 }
             }
-            BackendKind::Grok => {
-                match tab_for_session(app, kind, &params) {
-                    Some(tab) => apply_grok_permission(app, tab, &method, id, &params),
-                    None => {
-                        grok::queue_grok_cancelled(app, app.active, id);
-                        app.active_mut().push_line(format!("grok: cancelled orphan request {method}"));
-                        app.flash = format!("grok: cancelled orphan request {method}");
-                        false
-                    }
+            BackendKind::Grok => match tab_for_session(app, kind, &params) {
+                Some(tab) => apply_grok_permission(app, tab, &method, id, &params),
+                None => {
+                    grok::queue_grok_cancelled(app, app.active, id);
+                    app.active_mut()
+                        .push_line(format!("grok: cancelled orphan request {method}"));
+                    app.flash = format!("grok: cancelled orphan request {method}");
+                    false
                 }
-            }
+            },
             _ => {
                 app.flash = format!("{tag}: unexpected server request {method}");
                 false
@@ -886,11 +881,7 @@ fn handle_server_msg(app: &mut App, kind: BackendKind, msg: ServerMsg) -> bool {
 
 /// Route a frame to the tab whose remote session it names (muse:
 /// `sessionId`; codex: `threadId`, falling back to `conversationId`).
-fn tab_for_session(
-    app: &App,
-    kind: BackendKind,
-    params: &serde_json::Value,
-) -> Option<usize> {
+fn tab_for_session(app: &App, kind: BackendKind, params: &serde_json::Value) -> Option<usize> {
     let keys: &[&str] = match kind {
         BackendKind::Muse | BackendKind::Grok => &["sessionId"],
         BackendKind::Codex => &["threadId", "conversationId"],
@@ -898,9 +889,9 @@ fn tab_for_session(
         BackendKind::Mock => return None,
     };
     let sid = keys.iter().filter_map(|k| params.get(k)?.as_str()).next()?;
-    app.sessions.iter().position(|s| {
-        s.backend == kind && s.remote_id.as_deref() == Some(sid)
-    })
+    app.sessions
+        .iter()
+        .position(|s| s.backend == kind && s.remote_id.as_deref() == Some(sid))
 }
 
 /// Wheel = 3 lines, Shift+wheel = page (M1 spec, unchanged).
@@ -949,7 +940,9 @@ async fn drain_outbox(
                 _ => {
                     let s = &mut app.sessions[sub.tab];
                     s.busy = false;
-                    s.push_line(format!("{tag}: no session for this tab — press P to respawn"));
+                    s.push_line(format!(
+                        "{tag}: no session for this tab — press P to respawn"
+                    ));
                 }
             }
             continue;
@@ -967,7 +960,9 @@ async fn drain_outbox(
                 None => {
                     let s = &mut app.sessions[sub.tab];
                     s.busy = false;
-                    s.push_line(format!("{tag}: no session for this tab — press P to respawn"));
+                    s.push_line(format!(
+                        "{tag}: no session for this tab — press P to respawn"
+                    ));
                 }
             }
             continue;
@@ -977,14 +972,12 @@ async fn drain_outbox(
         match (host, sid) {
             (Some(host), Some(id)) => {
                 let res = match sub.backend {
-                    BackendKind::Muse => {
-                        muse_submit(host, &id, &sub.prompt).await.map_err(|e| e.to_string())
-                    }
-                    BackendKind::Codex => {
-                        codex::codex_submit(host, &id, &sub.prompt)
-                            .await
-                            .map_err(|e| e.to_string())
-                    }
+                    BackendKind::Muse => muse_submit(host, &id, &sub.prompt)
+                        .await
+                        .map_err(|e| e.to_string()),
+                    BackendKind::Codex => codex::codex_submit(host, &id, &sub.prompt)
+                        .await
+                        .map_err(|e| e.to_string()),
                     // Grok exits via the spawned early-continue above.
                     BackendKind::Mock | BackendKind::Agy | BackendKind::Grok => Ok(()),
                 };
@@ -997,7 +990,9 @@ async fn drain_outbox(
             _ => {
                 let s = &mut app.sessions[sub.tab];
                 s.busy = false;
-                s.push_line(format!("{tag}: no session for this tab — press P to respawn"));
+                s.push_line(format!(
+                    "{tag}: no session for this tab — press P to respawn"
+                ));
             }
         }
     }
@@ -1008,9 +1003,8 @@ async fn drain_outbox(
         // requests. They must not depend on a surviving tab/session.
         if d.backend == BackendKind::Grok {
             if let Some(host) = backends.get(d.backend).map(|c| &c.host) {
-                let payload = serde_json::from_str(&d.choice_id).unwrap_or(
-                    serde_json::json!({"outcome": {"outcome": "cancelled"}}),
-                );
+                let payload = serde_json::from_str(&d.choice_id)
+                    .unwrap_or(serde_json::json!({"outcome": {"outcome": "cancelled"}}));
                 if let Err(e) = grok_respond(host, d.requirement_id, payload).await {
                     app.flash = format!("grok: decide failed: {e}");
                 }
@@ -1078,9 +1072,10 @@ fn ring_bell() {
     let _ = io::stdout().flush();
 }
 
-/// Copy entry point: grok-parity legs (native + tmux + OSC 52) with an
-/// always-written backup file. Returns the status flash naming where the
-/// text landed.
+/// Copy entry point: grok-parity legs (native + tmux + OSC 52, the last
+/// capped at `clipboard::MAX_OSC52_RAW_BYTES`) with a backup file unless
+/// `POLYFORGE_CLIPBOARD_NO_BACKUP` is set. Returns the status flash naming
+/// where the text landed.
 fn copy_to_clipboard(text: &str) -> String {
     clipboard::copy_text_or_file(text).toast_message()
 }
@@ -1485,8 +1480,7 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             }
             KeyCode::Char('k') | KeyCode::Up if no_mods => {
                 if !app.sess_list.is_empty() {
-                    app.sess_sel =
-                        (app.sess_sel + app.sess_list.len() - 1) % app.sess_list.len();
+                    app.sess_sel = (app.sess_sel + app.sess_list.len() - 1) % app.sess_list.len();
                 }
             }
             KeyCode::Enter => app.choose_session(app.sess_sel),
@@ -1519,27 +1513,52 @@ mod tests {
     #[tokio::test]
     async fn grok_cancelled_requests_reach_host_without_remote_session() {
         let (tx, rx) = mpsc::channel(4);
-        let host = msp::Host::spawn("/bin/sh", &["-c", r#"
+        let host = msp::Host::spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                r#"
             while read -r response; do
                 printf '{"method":"observed","params":%s}\n' "$response"
             done
-        "#], &[], tx).await.unwrap();
+        "#,
+            ],
+            &[],
+            tx,
+        )
+        .await
+        .unwrap();
         let mut backends = Backends {
-            grok: Some(LiveBackend { host: std::sync::Arc::new(host), rx }),
+            grok: Some(LiveBackend {
+                host: std::sync::Arc::new(host),
+                rx,
+            }),
             ..Default::default()
         };
         let mut app = App::new();
         app.active_mut().backend = BackendKind::Grok;
         app.active_mut().remote_id = Some("known".into());
         let (agy_tx, _agy_rx) = mpsc::channel(1);
-        for (id, method, sid) in [(1, "x.ai/ask_user_question", "known"),
-            (2, "session/request_permission", "orphan")] {
-            handle_server_msg(&mut app, BackendKind::Grok, ServerMsg::Request {
-                id: serde_json::json!(id), method: method.into(),
-                params: serde_json::json!({"sessionId":sid}),
-            });
+        for (id, method, sid) in [
+            (1, "x.ai/ask_user_question", "known"),
+            (2, "session/request_permission", "orphan"),
+        ] {
+            handle_server_msg(
+                &mut app,
+                BackendKind::Grok,
+                ServerMsg::Request {
+                    id: serde_json::json!(id),
+                    method: method.into(),
+                    params: serde_json::json!({"sessionId":sid}),
+                },
+            );
         }
-        assert!(app.active().lines.iter().any(|l| l.contains("question, not an approval")));
+        assert!(
+            app.active()
+                .lines
+                .iter()
+                .any(|l| l.contains("question, not an approval"))
+        );
         // A tab can disappear before drain; host-level responses still apply.
         app.sessions.clear();
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
@@ -1553,7 +1572,9 @@ mod tests {
                     other => panic!("unexpected: {other:?}"),
                 }
             }
-        }).await.expect("cancelled response did not reach host");
+        })
+        .await
+        .expect("cancelled response did not reach host");
     }
 
     #[test]
@@ -1562,23 +1583,40 @@ mod tests {
         app.active_mut().busy = true;
         for sid in [serde_json::json!("orphan"), serde_json::Value::Null] {
             for method in ["session/request_permission", "x.ai/ask_user_question"] {
-                handle_server_msg(&mut app, BackendKind::Grok, ServerMsg::Request {
-                    id: serde_json::json!(17), method: method.into(),
-                    params: serde_json::json!({"sessionId": sid}),
-                });
+                handle_server_msg(
+                    &mut app,
+                    BackendKind::Grok,
+                    ServerMsg::Request {
+                        id: serde_json::json!(17),
+                        method: method.into(),
+                        params: serde_json::json!({"sessionId": sid}),
+                    },
+                );
                 let reply = app.outbox.decides.pop().unwrap();
                 assert_eq!(reply.backend, BackendKind::Grok);
                 assert_eq!(reply.requirement_id, 17);
-                assert_eq!(serde_json::from_str::<serde_json::Value>(&reply.choice_id).unwrap()["outcome"]["outcome"], "cancelled");
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&reply.choice_id).unwrap()["outcome"]
+                        ["outcome"],
+                    "cancelled"
+                );
                 assert!(app.flash.contains("orphan"));
             }
             for method in ["grok/prompt_completed", "session/update"] {
-                assert!(!handle_server_msg(&mut app, BackendKind::Grok, ServerMsg::Notif {
-                    method: method.into(), params: serde_json::json!({"sessionId": sid, "stopReason":"end_turn"}),
-                }));
+                assert!(!handle_server_msg(
+                    &mut app,
+                    BackendKind::Grok,
+                    ServerMsg::Notif {
+                        method: method.into(),
+                        params: serde_json::json!({"sessionId": sid, "stopReason":"end_turn"}),
+                    }
+                ));
             }
             assert!(app.active().busy);
-            assert_eq!(app.active().pending_approval.as_ref().unwrap().approval_id, "a1");
+            assert_eq!(
+                app.active().pending_approval.as_ref().unwrap().approval_id,
+                "a1"
+            );
             assert!(app.active().pending_diff.is_some());
         }
     }
@@ -1587,14 +1625,22 @@ mod tests {
     fn grok_unmappable_decision_queues_cancelled_and_closes_card() {
         let mut app = muse_modal_app();
         app.active_mut().backend = BackendKind::Grok;
-        app.active_mut().pending_approval.as_mut().unwrap().requirement_id = serde_json::json!(42);
+        app.active_mut()
+            .pending_approval
+            .as_mut()
+            .unwrap()
+            .requirement_id = serde_json::json!(42);
         decide_ui(&mut app, DecisionKind::ApproveAll, "approved-all");
         assert!(app.active().pending_approval.is_none());
         assert!(app.active().pending_diff.is_none());
         assert!(app.flash.contains("no matching option"));
         assert_eq!(app.outbox.decides.len(), 1);
         assert_eq!(app.outbox.decides[0].requirement_id, 42);
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&app.outbox.decides[0].choice_id).unwrap()["outcome"]["outcome"], "cancelled");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&app.outbox.decides[0].choice_id).unwrap()["outcome"]
+                ["outcome"],
+            "cancelled"
+        );
     }
 
     const NONE: KeyModifiers = KeyModifiers::empty();
@@ -1629,18 +1675,33 @@ mod tests {
     fn q_keeps_modal_open_without_deny_choice() {
         let mut app = muse_modal_app();
         handle_key(&mut app, KeyCode::Char('q'), NONE);
-        assert!(app.active().pending_diff.is_some(), "q silently closed a deny-less card");
+        assert!(
+            app.active().pending_diff.is_some(),
+            "q silently closed a deny-less card"
+        );
         assert!(app.outbox.decides.is_empty(), "q must not send a decision");
-        assert!(app.flash.contains("no deny path"), "flash must name the missing deny path");
+        assert!(
+            app.flash.contains("no deny path"),
+            "flash must name the missing deny path"
+        );
         let mut app = muse_modal_app();
         handle_key(&mut app, KeyCode::Esc, NONE);
-        assert!(app.active().pending_diff.is_some(), "Esc silently closed a deny-less card");
-        assert!(app.outbox.decides.is_empty(), "Esc must not send a decision");
+        assert!(
+            app.active().pending_diff.is_some(),
+            "Esc silently closed a deny-less card"
+        );
+        assert!(
+            app.outbox.decides.is_empty(),
+            "Esc must not send a decision"
+        );
         // The offered approve path still closes (fail-closed: y queues
         // the allow choice; n/q never fabricate a denial).
         let mut app = muse_modal_app();
         handle_key(&mut app, KeyCode::Char('n'), NONE);
-        assert!(app.active().pending_diff.is_some(), "n silently closed a deny-less card");
+        assert!(
+            app.active().pending_diff.is_some(),
+            "n silently closed a deny-less card"
+        );
         assert!(app.outbox.decides.is_empty(), "n must not send a decision");
     }
 
@@ -1750,7 +1811,10 @@ mod tests {
                 ));
             }
             assert!(app.active().busy);
-            assert_eq!(app.active().pending_approval.as_ref().unwrap().approval_id, "a1");
+            assert_eq!(
+                app.active().pending_approval.as_ref().unwrap().approval_id,
+                "a1"
+            );
             assert!(app.active().pending_diff.is_some());
             assert_eq!(app.active().lines.len(), before);
             assert!(app.outbox.decides.is_empty());
@@ -1828,13 +1892,26 @@ mod tests {
     #[tokio::test]
     async fn codex_orphan_deny_reaches_host_without_session() {
         let (tx, rx) = mpsc::channel(4);
-        let host = msp::Host::spawn("/bin/sh", &["-c", r#"
+        let host = msp::Host::spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                r#"
             while read -r response; do
                 printf '{"method":"observed","params":%s}\n' "$response"
             done
-        "#], &[], tx).await.unwrap();
+        "#,
+            ],
+            &[],
+            tx,
+        )
+        .await
+        .unwrap();
         let mut backends = Backends {
-            codex: Some(LiveBackend { host: std::sync::Arc::new(host), rx }),
+            codex: Some(LiveBackend {
+                host: std::sync::Arc::new(host),
+                rx,
+            }),
             ..Default::default()
         };
         let mut app = App::new();

@@ -9,7 +9,10 @@ use crate::app::Session;
 #[cfg(test)]
 pub fn seed(s: &mut Session) {
     for i in 1..=60 {
-        s.push_line(format!("{} seed line {i:02}: scroll me with j/k, C-u/d, g/G", s.name));
+        s.push_line(format!(
+            "{} seed line {i:02}: scroll me with j/k, C-u/d, g/G",
+            s.name
+        ));
     }
 }
 

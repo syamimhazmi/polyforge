@@ -3,11 +3,11 @@
 //! scroll offsets stay exact.
 
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap},
-    Frame,
 };
 
 use crate::app::{App, Mode};
@@ -68,12 +68,7 @@ fn render_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     app.viewport_width = width;
     // Inner origin for mouse cell → text mapping (recorded every frame).
     app.text_area = if area.width > 2 && area.height > 2 {
-        Some((
-            area.x + 1,
-            area.y + 1,
-            area.width - 2,
-            area.height - 2,
-        ))
+        Some((area.x + 1, area.y + 1, area.width - 2, area.height - 2))
     } else {
         None
     };
@@ -136,7 +131,11 @@ fn render_transcript(f: &mut Frame, app: &mut App, area: Rect) {
             None
         };
         let chunks = crate::app::Session::wrap_line(&line, width);
-        let mut coff = chunks.iter().take(sub).map(|c| c.chars().count()).sum::<usize>();
+        let mut coff = chunks
+            .iter()
+            .take(sub)
+            .map(|c| c.chars().count())
+            .sum::<usize>();
         for chunk in chunks.iter().skip(sub) {
             let spans = match span {
                 Some((ss, se)) => hl_spans(chunk, coff, ss, se, style),
@@ -159,13 +158,7 @@ fn render_transcript(f: &mut Frame, app: &mut App, area: Rect) {
 
 /// Split one wrapped chunk into plain/highlighted spans for the selected
 /// char range [ss, se). `coff` is the chunk's first-char index in the line.
-fn hl_spans(
-    chunk: &str,
-    coff: usize,
-    ss: usize,
-    se: usize,
-    style: Style,
-) -> Vec<Span<'static>> {
+fn hl_spans(chunk: &str, coff: usize, ss: usize, se: usize, style: Style) -> Vec<Span<'static>> {
     let chars: Vec<char> = chunk.chars().collect();
     let len = chars.len();
     let s = ss.saturating_sub(coff).min(len);
@@ -230,10 +223,22 @@ fn render_input(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let (title, content) = match app.mode {
         Mode::Normal => (normal_title, app.active().input.clone()),
-        Mode::Insert => (" input — INSERT (Esc done, Enter send · ↑/↓ pick · Tab completes) ", app.active().input.clone()),
-        Mode::Search => (" search — (Enter find, Esc cancel) ", format!("/{}", app.search_input)),
-        Mode::Picker => (" provider — (j/k move, Enter switch, 1-5 quick, Esc cancel) ", String::new()),
-        Mode::Sessions => (" sessions — (j/k move, Enter view + continue, d delete, 1-9 quick, Esc cancel) ", String::new()),
+        Mode::Insert => (
+            " input — INSERT (Esc done, Enter send · ↑/↓ pick · Tab completes) ",
+            app.active().input.clone(),
+        ),
+        Mode::Search => (
+            " search — (Enter find, Esc cancel) ",
+            format!("/{}", app.search_input),
+        ),
+        Mode::Picker => (
+            " provider — (j/k move, Enter switch, 1-5 quick, Esc cancel) ",
+            String::new(),
+        ),
+        Mode::Sessions => (
+            " sessions — (j/k move, Enter view + continue, d delete, 1-9 quick, Esc cancel) ",
+            String::new(),
+        ),
     };
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
@@ -241,8 +246,14 @@ fn render_input(f: &mut Frame, app: &mut App, area: Rect) {
     // Place the terminal cursor at the edit point in text-entry modes.
     if matches!(app.mode, Mode::Insert | Mode::Search) {
         let col = match app.mode {
-            Mode::Insert => char_count(&app.active().input[..char_byte_index(&app.active().input, app.active().cursor)]),
-            _ => 1 + char_count(&app.search_input[..char_byte_index(&app.search_input, app.search_cursor)]),
+            Mode::Insert => char_count(
+                &app.active().input[..char_byte_index(&app.active().input, app.active().cursor)],
+            ),
+            _ => {
+                1 + char_count(
+                    &app.search_input[..char_byte_index(&app.search_input, app.search_cursor)],
+                )
+            }
         };
         f.set_cursor_position((inner.x + col as u16, inner.y));
     }
@@ -280,14 +291,13 @@ fn render_cmd_popup(f: &mut Frame, app: &App, input_area: Rect) {
             let (template, _, desc) = crate::app::SLASH_COMMANDS[i];
             let cursor = if row == sel { "> " } else { "  " };
             let style = if row == sel {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
-            Line::from(Span::styled(
-                format!("{cursor}{template} — {desc}"),
-                style,
-            ))
+            Line::from(Span::styled(format!("{cursor}{template} — {desc}"), style))
         })
         .collect();
     let block = Block::default()
@@ -312,7 +322,10 @@ fn render_diff_modal(f: &mut Frame, app: &App) {
     let body = crate::app::sanitize_text(&diff.body);
     let file = crate::app::sanitize_text(&diff.file);
     let text = if risk.is_empty() {
-        format!("{}\n\n{}", body, "y approve · n reject · a approve-all · q later")
+        format!(
+            "{}\n\n{}",
+            body, "y approve · n reject · a approve-all · q later"
+        )
     } else {
         format!(
             "{}\n\n{}\n\n{}",
@@ -348,7 +361,9 @@ fn render_picker_modal(f: &mut Frame, app: &App) {
             let cursor = if i == app.picker_sel { "> " } else { "  " };
             let here = if *b == cur { " (current)" } else { "" };
             let style = if i == app.picker_sel {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
@@ -362,7 +377,9 @@ fn render_picker_modal(f: &mut Frame, app: &App) {
         .borders(Borders::ALL)
         .title(" PROVIDER — switch starts a fresh session ");
     f.render_widget(
-        Paragraph::new(lines).block(block).wrap(Wrap { trim: false }),
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
         area,
     );
 }
@@ -386,7 +403,9 @@ fn render_sessions_modal(f: &mut Frame, app: &App) {
                 crate::app::sanitize_text(&s.title)
             };
             let style = if i == app.sess_sel {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
@@ -408,7 +427,9 @@ fn render_sessions_modal(f: &mut Frame, app: &App) {
         .borders(Borders::ALL)
         .title(" SESSIONS — Enter views + continues · d deletes · Esc cancels ");
     f.render_widget(
-        Paragraph::new(lines).block(block).wrap(Wrap { trim: false }),
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
         area,
     );
 }
@@ -447,7 +468,7 @@ fn char_byte_index(s: &str, char_idx: usize) -> usize {
 mod tests {
     use super::*;
     use crate::app::App;
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{Terminal, backend::TestBackend};
 
     /// S3-F1: even a raw line that bypassed `push_line` renders inert —
     /// no control byte may reach the terminal buffer, while visible text
@@ -455,9 +476,9 @@ mod tests {
     #[test]
     fn render_neutralizes_injected_line() {
         let mut app = App::new();
-        app.sessions[0].lines.push(
-            "\x1b[2J\x1b]8;;http://evil\x07pwned\x00".to_string(),
-        );
+        app.sessions[0]
+            .lines
+            .push("\x1b[2J\x1b]8;;http://evil\x07pwned\x00".to_string());
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal.draw(|f| render(f, &mut app)).expect("draw");

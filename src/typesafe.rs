@@ -72,10 +72,15 @@ pub struct ApprovalJudgment {
 
 impl ApprovalJudgment {
     /// Weights live in code (composite scoring). Change without re-asking.
-    pub fn compose(risk: f64, risk_confidence: f64, touches_secrets: f64, destructive: f64) -> Self {
+    pub fn compose(
+        risk: f64,
+        risk_confidence: f64,
+        touches_secrets: f64,
+        destructive: f64,
+    ) -> Self {
         let risk_norm = (risk / 2.0).clamp(0.0, 1.0);
-        let composite = (0.50 * risk_norm + 0.30 * destructive + 0.20 * touches_secrets)
-            .clamp(0.0, 1.0);
+        let composite =
+            (0.50 * risk_norm + 0.30 * destructive + 0.20 * touches_secrets).clamp(0.0, 1.0);
         let band = if composite < 0.35 {
             RiskBand::Low
         } else if composite < 0.65 {
@@ -164,8 +169,7 @@ fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
 
 impl Client {
     pub fn new(api_key: String) -> Result<Self, String> {
-        let http =
-            build_http_client().map_err(|e| format!("typesafe http client: {e}"))?;
+        let http = build_http_client().map_err(|e| format!("typesafe http client: {e}"))?;
         Ok(Self {
             api_key,
             http,
@@ -177,13 +181,8 @@ impl Client {
     /// [`DEFAULT_URL`].
     #[cfg(test)]
     fn with_url(api_key: String, url: String) -> Result<Self, String> {
-        let http =
-            build_http_client().map_err(|e| format!("typesafe http client: {e}"))?;
-        Ok(Self {
-            api_key,
-            http,
-            url,
-        })
+        let http = build_http_client().map_err(|e| format!("typesafe http client: {e}"))?;
+        Ok(Self { api_key, http, url })
     }
 
     /// Env first, then `~/.config/typesafe/env`.
@@ -198,11 +197,7 @@ impl Client {
         }
     }
 
-    pub async fn judge_approval(
-        &self,
-        tool: &str,
-        body: &str,
-    ) -> Result<ApprovalJudgment, String> {
+    pub async fn judge_approval(&self, tool: &str, body: &str) -> Result<ApprovalJudgment, String> {
         // S4-F2: redact tool and body before either leaves the process.
         // Agent-controlled titles can carry secrets; redact at this boundary
         // so all callers are covered. Scoring is already opt-in
@@ -238,13 +233,10 @@ impl Client {
         let text =
             String::from_utf8(bytes.to_vec()).map_err(|e| format!("typesafe read body: {e}"))?;
         if !status.is_success() {
-            return Err(format!(
-                "typesafe HTTP {status}: {}",
-                truncate(&text, 200)
-            ));
+            return Err(format!("typesafe HTTP {status}: {}", truncate(&text, 200)));
         }
-        let parsed: SystemOneResponse = serde_json::from_str(&text)
-            .map_err(|e| format!("typesafe parse: {e}"))?;
+        let parsed: SystemOneResponse =
+            serde_json::from_str(&text).map_err(|e| format!("typesafe parse: {e}"))?;
         ApprovalJudgment::from_answers(&parsed.answers)
     }
 }
@@ -366,9 +358,20 @@ pub const REDACTED: &str = "[REDACTED]";
 /// left of `=`/`:` before the value is redacted. Over-redaction is the safe
 /// direction here: the body is scored, never executed.
 const SENSITIVE_KEY_CORES: &[&str] = &[
-    "apikey", "apisecret", "secret", "token", "password", "passwd", "pwd",
-    "bearer", "authorization", "privatekey", "secretkey", "accesskey",
-    "credential", "passphrase",
+    "apikey",
+    "apisecret",
+    "secret",
+    "token",
+    "password",
+    "passwd",
+    "pwd",
+    "bearer",
+    "authorization",
+    "privatekey",
+    "secretkey",
+    "accesskey",
+    "credential",
+    "passphrase",
 ];
 
 /// `(prefix, minimum trailing token chars)` redacted wherever they appear.
@@ -423,10 +426,7 @@ fn redact_pem_blocks(text: &str) -> String {
         };
         // First `-----` after `-----END` closes the END marker.
         let after = &body[end_rel + "-----END".len()..];
-        let marker_len = after
-            .find("-----")
-            .map(|i| i + "-----".len())
-            .unwrap_or(0);
+        let marker_len = after.find("-----").map(|i| i + "-----".len()).unwrap_or(0);
         let end = end_rel + "-----END".len() + marker_len;
         out.push_str(&rest[..start]);
         out.push_str(REDACTED);
@@ -797,9 +797,7 @@ mod tests {
             .ok();
         let mut buf = Vec::new();
         let mut chunk = [0u8; 1024];
-        while buf.len() < 16_384
-            && !buf.windows(4).any(|w| w == b"\r\n\r\n")
-        {
+        while buf.len() < 16_384 && !buf.windows(4).any(|w| w == b"\r\n\r\n") {
             match conn.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => buf.extend_from_slice(&chunk[..n]),
@@ -825,8 +823,7 @@ mod tests {
             let first = read_http_headers(&mut conn);
             let has_auth = first.lines().any(|l| {
                 l.eq_ignore_ascii_case("authorization: Bearer super-secret-token")
-                    || l.to_ascii_lowercase()
-                        == "authorization: bearer super-secret-token"
+                    || l.to_ascii_lowercase() == "authorization: bearer super-secret-token"
             });
             if !has_auth {
                 let _ = tx.send("missing-auth-on-first-hop".to_string());
@@ -847,9 +844,9 @@ mod tests {
                 match hop2.accept() {
                     Ok((mut c, _)) => {
                         let req = read_http_headers(&mut c);
-                        let leaked = req.lines().any(|l| {
-                            l.to_ascii_lowercase().starts_with("authorization:")
-                        });
+                        let leaked = req
+                            .lines()
+                            .any(|l| l.to_ascii_lowercase().starts_with("authorization:"));
                         let _ = tx.send(if leaked {
                             "followed-with-auth".to_string()
                         } else {
@@ -939,9 +936,7 @@ mod tests {
     #[test]
     fn redact_secrets_prefixes_are_case_insensitive() {
         // S4-GAP-4: vendor prefixes match regardless of ASCII case.
-        let out = redact_secrets(
-            "keys akiaIOSFODNN7EXAMPLE and SK-abcdefghijklmnop live nearby",
-        );
+        let out = redact_secrets("keys akiaIOSFODNN7EXAMPLE and SK-abcdefghijklmnop live nearby");
         assert!(!out.contains("akiaIOSFODNN7EXAMPLE"), "leaked: {out}");
         assert!(!out.contains("SK-abcdefghijklmnop"), "leaked: {out}");
         assert!(out.contains(REDACTED), "no marker: {out}");
@@ -970,7 +965,10 @@ mod tests {
         let req = approval_request(&tool, &body);
         let tool_s = req["state"]["tool"].as_str().expect("tool");
         let body_s = req["state"]["body"].as_str().expect("body");
-        assert!(!tool_s.contains("AKIAIOSFODNN7EXAMPLE"), "leaked tool: {tool_s}");
+        assert!(
+            !tool_s.contains("AKIAIOSFODNN7EXAMPLE"),
+            "leaked tool: {tool_s}"
+        );
         assert!(!body_s.contains("AKIAIOSFODNN7EXAMPLE"), "leaked: {body_s}");
         assert!(!body_s.contains("hunter2-hunter2"), "leaked: {body_s}");
         assert!(tool_s.contains(REDACTED), "no tool marker: {tool_s}");
@@ -1026,11 +1024,7 @@ mod tests {
                 }
             }
             let raw = String::from_utf8_lossy(&buf).into_owned();
-            let body_json = raw
-                .split("\r\n\r\n")
-                .nth(1)
-                .unwrap_or("")
-                .to_string();
+            let body_json = raw.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
             let answers = concat!(
                 r#"{"answers":{"risk":{"score":0.2,"confidence":0.9},"#,
                 r#""touches_secrets":{"noul":0.1},"destructive":{"noul":0.1}}}"#,
@@ -1044,17 +1038,11 @@ mod tests {
             let _ = tx.send(body_json);
         });
 
-        let client = Client::with_url(
-            "test-key".into(),
-            format!("http://127.0.0.1:{port}/score"),
-        )
-        .expect("client");
+        let client = Client::with_url("test-key".into(), format!("http://127.0.0.1:{port}/score"))
+            .expect("client");
         let tool = "Edit AKIAIOSFODNN7EXAMPLE";
         let body = "patch with sk_live_51AbCdEfGhIjKlMnOp and password=hunter2-hunter2";
-        let _ = client
-            .judge_approval(tool, body)
-            .await
-            .expect("judge");
+        let _ = client.judge_approval(tool, body).await.expect("judge");
         let posted = rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("posted body");
@@ -1109,10 +1097,7 @@ mod tests {
             None => panic!("TYPESAFE_API_KEY present but Client::from_env returned None"),
         };
         let j = client
-            .judge_approval(
-                "Bash",
-                "rm -rf ~/.ssh && cat ~/.aws/credentials",
-            )
+            .judge_approval("Bash", "rm -rf ~/.ssh && cat ~/.aws/credentials")
             .await
             .expect("live typesafe call");
         assert_eq!(j.band, RiskBand::High);

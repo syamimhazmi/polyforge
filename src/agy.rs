@@ -81,10 +81,7 @@ pub async fn spawn_agy(
                     }
                     match serde_json::from_str::<Value>(&line) {
                         Ok(v) => {
-                            let kind = v
-                                .get("event")
-                                .and_then(|e| e.as_str())
-                                .unwrap_or("unknown");
+                            let kind = v.get("event").and_then(|e| e.as_str()).unwrap_or("unknown");
                             let _ = stdout_tx
                                 .send(ServerMsg::Notif {
                                     method: format!("agy/{kind}"),
@@ -194,7 +191,10 @@ pub fn apply_agy_notif(app: &mut App, tab: usize, method: &str, params: &Value) 
                     false
                 }
                 "tool" => {
-                    let name = su.get("tool_name").and_then(|v| v.as_str()).unwrap_or("tool");
+                    let name = su
+                        .get("tool_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("tool");
                     let info = su.get("tool_info").unwrap_or(&Value::Null);
                     let summary = tool_summary(name, info);
                     app.sessions[tab].push_line(format!("agy {name}: {summary}"));
@@ -356,7 +356,12 @@ mod tests {
             });
             assert!(!apply_agy_notif(&mut app, 0, "agy/step_update", &p));
         }
-        assert!(app.active().lines.iter().any(|l| l.contains("rewrites history")));
+        assert!(
+            app.active()
+                .lines
+                .iter()
+                .any(|l| l.contains("rewrites history"))
+        );
     }
 
     #[test]
@@ -370,14 +375,24 @@ mod tests {
                     "output": "hi\r\n"}}
         });
         apply_agy_notif(&mut app, 0, "agy/step_update", &p);
-        assert!(app.active().lines.iter().any(|l| l.contains("run_command") && l.contains("hi")));
+        assert!(
+            app.active()
+                .lines
+                .iter()
+                .any(|l| l.contains("run_command") && l.contains("hi"))
+        );
         let fail: Value = serde_json::json!({
             "event": "step_update",
             "step_update": {"step_type": "tool", "tool_name": "write_to_file",
                 "tool_info": {"error": {"type": "denied", "message": "needs allow(path)"}}}
         });
         apply_agy_notif(&mut app, 0, "agy/step_update", &fail);
-        assert!(app.active().lines.iter().any(|l| l.contains("FAILED") && l.contains("needs allow")));
+        assert!(
+            app.active()
+                .lines
+                .iter()
+                .any(|l| l.contains("FAILED") && l.contains("needs allow"))
+        );
     }
 
     #[test]

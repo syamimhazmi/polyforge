@@ -119,10 +119,12 @@ impl Store {
     }
 
     fn transcript_path(&self, id: &str) -> PathBuf {
+        debug_assert!(assert_safe_id(id), "unsafe store id: {id:?}");
         self.dir.join(format!("sess-{id}.jsonl"))
     }
 
     fn meta_path(&self, id: &str) -> PathBuf {
+        debug_assert!(assert_safe_id(id), "unsafe store id: {id:?}");
         self.dir.join(format!("sess-{id}.meta.json"))
     }
 
@@ -134,6 +136,9 @@ impl Store {
     /// so peak memory stays at one copy of the tail (never the whole
     /// file twice over plus a tail clone).
     pub fn load_transcript(&self, id: &str) -> Vec<String> {
+        if !assert_safe_id(id) {
+            return Vec::new();
+        }
         let path = self.transcript_path(id);
         let file = match File::open(&path) {
             Ok(f) => f,
@@ -159,12 +164,22 @@ impl Store {
     /// line only: listing must stay fast no matter how large transcripts
     /// grow. None when the transcript is missing or empty.
     pub fn first_line(&self, id: &str) -> Option<String> {
+        if !assert_safe_id(id) {
+            return None;
+        }
         let file = File::open(self.transcript_path(id)).ok()?;
         let line = BufReader::new(file).lines().next()?.ok()?;
         Some(decode_line(&line))
     }
 
     fn rewrite(&self, id: &str, tail: &[String]) -> std::io::Result<()> {
+        debug_assert!(assert_safe_id(id), "unsafe store id: {id:?}");
+        if !assert_safe_id(id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "unsafe session id",
+            ));
+        }
         let file = File::create(self.transcript_path(id))?;
         let mut out = BufWriter::new(file);
         for l in tail {
@@ -177,6 +192,9 @@ impl Store {
     /// Append sink for a session (created on demand). Attached AFTER replay
     /// so viewing a previous session never duplicates history.
     pub fn open_sink(&self, id: &str) -> Option<BufWriter<File>> {
+        if !assert_safe_id(id) {
+            return None;
+        }
         OpenOptions::new()
             .create(true)
             .append(true)
@@ -187,6 +205,9 @@ impl Store {
 
     /// Load the meta file. Unknown backends are rejected (fresh default).
     pub fn load_meta(&self, id: &str) -> Option<SessionMeta> {
+        if !assert_safe_id(id) {
+            return None;
+        }
         let raw = fs::read_to_string(self.meta_path(id)).ok()?;
         let meta: SessionMeta = serde_json::from_str(&raw).ok()?;
         BackendKind::parse(&meta.backend)?;
@@ -194,6 +215,9 @@ impl Store {
     }
 
     pub fn save_meta(&self, id: &str, meta: &SessionMeta) {
+        if !assert_safe_id(id) {
+            return;
+        }
         if let Ok(raw) = serde_json::to_string(meta) {
             let _ = fs::write(self.meta_path(id), raw);
         }
@@ -254,13 +278,26 @@ impl Store {
     /// Permanently delete a session's files (`grok sessions delete`).
     /// Returns true when something was removed.
     pub fn delete_session(&self, id: &str) -> bool {
-        if id.contains('/') || id.contains('\0') || id.is_empty() {
+        if !assert_safe_id(id) {
             return false;
         }
         let t = fs::remove_file(self.transcript_path(id)).is_ok();
         let m = fs::remove_file(self.meta_path(id)).is_ok();
         t || m
     }
+}
+
+/// Shared session-id gate for every store path helper (S6-F1). Session ids
+/// are embedded in filenames (`sess-{id}.jsonl`), so an id containing a
+/// separator or dot-dot could redirect a read, write, or delete outside the
+/// store dir. Minted ids (`{millis}-{pid}-{seq}`) never contain dots, so any
+/// `..` substring is rejected outright. Fail-closed: callers refuse the op.
+fn assert_safe_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.contains('\0')
+        && !id.contains('/')
+        && !id.contains('\\')
+        && !id.contains("..")
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -296,7 +333,10 @@ mod tests {
                 .unwrap_or(0)
         ));
         let _ = fs::remove_dir_all(&dir);
-        (Store::open_in(dir.clone()).expect("open_in"), TempGuard(dir))
+        (
+            Store::open_in(dir.clone()).expect("open_in"),
+            TempGuard(dir),
+        )
     }
 
     struct TempGuard(PathBuf);
@@ -374,10 +414,7 @@ mod tests {
         let loaded = store.load_transcript("w");
         assert_eq!(loaded.len(), MAX_LINES);
         assert_eq!(loaded[0], "line 000100");
-        assert_eq!(
-            loaded[MAX_LINES - 1],
-            format!("line {:06}", MAX_LINES + 99)
-        );
+        assert_eq!(loaded[MAX_LINES - 1], format!("line {:06}", MAX_LINES + 99));
         // Under the rewrite slop: the file itself is untouched.
         let raw = fs::read_to_string(store.transcript_path("w")).expect("read");
         assert_eq!(raw.lines().count(), MAX_LINES + 100);
@@ -423,10 +460,7 @@ mod tests {
         let (store, _g) = tmp_store();
         // "old" was created later but "new" was active more recently:
         // UPDATED-first ordering (grok's `sessions list` contract).
-        for (id, created, updated) in [
-            ("old", 2000u64, 2000u64),
-            ("new", 1000u64, 3000u64),
-        ] {
+        for (id, created, updated) in [("old", 2000u64, 2000u64), ("new", 1000u64, 3000u64)] {
             let mut meta = test_meta();
             meta.created_at = created;
             meta.updated_at = updated;
@@ -465,6 +499,93 @@ mod tests {
         assert!(!store.delete_session("../evil"));
         assert!(!store.delete_session(""));
         assert!(!store.list_sessions().iter().any(|s| s.id == "gone"));
+    }
+
+    #[test]
+    fn assert_safe_id_allows_minted_ids_and_rejects_traversal() {
+        assert!(assert_safe_id(&Store::new_session_id()));
+        for good in ["a", "tab", "old", "123-456-7", "sess-x"] {
+            assert!(assert_safe_id(good), "good id rejected: {good:?}");
+        }
+        for bad in [
+            "",
+            "..",
+            "../evil",
+            "..\\evil",
+            "a/b",
+            "/abs",
+            "a\\b",
+            "C:\\evil",
+            "evil\0",
+            "\0",
+            "a\0b",
+            "...",
+            "a..b",
+        ] {
+            assert!(!assert_safe_id(bad), "traversal id accepted: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn traversal_ids_are_rejected_on_all_store_paths() {
+        let (store, _g) = tmp_store();
+        let bad_ids = [
+            "",
+            "..",
+            "../evil",
+            "..\\evil",
+            "a/b",
+            "a\\b",
+            "evil\0",
+            "a\0b",
+        ];
+        for id in bad_ids {
+            assert!(store.open_sink(id).is_none(), "sink opened for {id:?}");
+            assert!(
+                store.load_transcript(id).is_empty(),
+                "transcript loaded for {id:?}"
+            );
+            assert_eq!(store.first_line(id), None, "first line read for {id:?}");
+            assert_eq!(store.load_meta(id), None, "meta loaded for {id:?}");
+            store.save_meta(id, &test_meta());
+            assert_eq!(
+                store.load_meta(id),
+                None,
+                "meta persisted for {id:?}"
+            );
+            assert!(!store.delete_session(id), "delete ran for {id:?}");
+        }
+        // Fail-closed means no files or subdirectories were created.
+        let entries: Vec<_> = fs::read_dir(&store.dir)
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(entries.is_empty(), "traversal created files: {entries:?}");
+        // Legit ids still work.
+        let mut sink = store.open_sink("ok-id").expect("sink");
+        append_line(&mut sink, "hello");
+        use std::io::Write;
+        sink.flush().expect("flush");
+        drop(sink);
+        assert_eq!(store.load_transcript("ok-id"), vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn planted_traversal_meta_cannot_launder_through_list() {
+        let (store, _g) = tmp_store();
+        // A planted file whose id parses back to `..` must not reach the fs:
+        // preview falls back and every op on the laundered id refuses.
+        fs::write(
+            store.dir.join("sess-...meta.json"),
+            serde_json::to_string(&test_meta()).expect("meta json"),
+        )
+        .expect("plant");
+        let listed = store.list_sessions();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "..");
+        assert_eq!(listed[0].preview, "(no lines yet)");
+        assert!(store.load_transcript("..").is_empty());
+        assert!(!store.delete_session(".."));
     }
 
     #[test]

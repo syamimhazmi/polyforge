@@ -232,10 +232,7 @@ pub fn apply_grok_notif(app: &mut App, tab: usize, method: &str, params: &Value)
         }
         "x.ai/session_notification" => {
             let update = params.get("update").unwrap_or(params);
-            if update
-                .get("sessionUpdate")
-                .and_then(|v| v.as_str())
-                == Some("interaction_resolved")
+            if update.get("sessionUpdate").and_then(|v| v.as_str()) == Some("interaction_resolved")
             {
                 let resolved = update
                     .get("tool_call_id")
@@ -250,9 +247,7 @@ pub fn apply_grok_notif(app: &mut App, tab: usize, method: &str, params: &Value)
                     let s = &mut app.sessions[tab];
                     s.push_line("grok: permission resolved".to_string());
                     match s.pending_approval.as_ref() {
-                        Some(a)
-                            if a.approval_id.ends_with(resolved) && !resolved.is_empty() =>
-                        {
+                        Some(a) if a.approval_id.ends_with(resolved) && !resolved.is_empty() => {
                             let decided = app
                                 .outbox
                                 .decides
@@ -335,10 +330,7 @@ fn apply_session_update(app: &mut App, tab: usize, update: &Value) -> bool {
                 .get("title")
                 .and_then(|v| v.as_str())
                 .unwrap_or("tool");
-            let k = update
-                .get("kind")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let k = update.get("kind").and_then(|v| v.as_str()).unwrap_or("");
             let s = &mut app.sessions[tab];
             if k.is_empty() {
                 s.push_line(format!("grok: ⚙ {title}"));
@@ -353,10 +345,7 @@ fn apply_session_update(app: &mut App, tab: usize, update: &Value) -> bool {
         }
         "tool_call_update" => {
             flush_grok_drafts(app, tab);
-            let status = update
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let status = update.get("status").and_then(|v| v.as_str()).unwrap_or("");
             let name = update
                 .get("title")
                 .and_then(|v| v.as_str())
@@ -506,10 +495,7 @@ pub fn apply_grok_permission(
         .get("title")
         .and_then(|v| v.as_str())
         .unwrap_or("tool call");
-    let kind = tool
-        .get("kind")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let kind = tool.get("kind").and_then(|v| v.as_str()).unwrap_or("");
     let input = tool
         .get("input")
         .map(|v| truncate(&v.to_string(), 1200))
@@ -564,10 +550,7 @@ pub fn apply_grok_permission(
 /// server request id plus the outcome payload. `q` ("later") maps to
 /// `cancelled` — the turn may continue or stop at the agent's discretion,
 /// which the transcript line says. Never approves on the user's behalf.
-pub fn map_grok_decision(
-    approval: &PendingApproval,
-    kind: DecisionKind,
-) -> Option<(Value, Value)> {
+pub fn map_grok_decision(approval: &PendingApproval, kind: DecisionKind) -> Option<(Value, Value)> {
     use DecisionKind::*;
     if matches!(kind, Later) {
         return Some((
@@ -604,7 +587,13 @@ fn tail6(id: &str) -> String {
     if id.len() <= 6 {
         return id.to_string();
     }
-    id.chars().rev().take(6).collect::<String>().chars().rev().collect()
+    id.chars()
+        .rev()
+        .take(6)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect()
 }
 
 #[cfg(test)]
@@ -631,7 +620,12 @@ mod tests {
     #[test]
     fn chunk_lines_land_in_transcript() {
         let mut app = grok_tab();
-        assert!(!apply_grok_notif(&mut app, 0, "session/update", &chunk("hello\nworld")));
+        assert!(!apply_grok_notif(
+            &mut app,
+            0,
+            "session/update",
+            &chunk("hello\nworld")
+        ));
         assert!(app.active().lines.iter().any(|l| l == "hello"));
         // Trailing segment without `\n` stays in the open answer draft.
         assert_eq!(app.active().draft_answer, "world");
@@ -679,8 +673,18 @@ mod tests {
         });
         assert!(!apply_grok_notif(&mut app, 0, "session/update", &tool));
         assert!(app.active().draft_thought.is_none());
-        assert!(app.active().lines.iter().any(|l| l == "grok: ∴ hmm let me think"));
-        assert!(app.active().lines.iter().any(|l| l == "grok: ⚙ read foo.rs [read]"));
+        assert!(
+            app.active()
+                .lines
+                .iter()
+                .any(|l| l == "grok: ∴ hmm let me think")
+        );
+        assert!(
+            app.active()
+                .lines
+                .iter()
+                .any(|l| l == "grok: ⚙ read foo.rs [read]")
+        );
         assert!(app.active().busy);
         let upd = serde_json::json!({
             "sessionId": "s", "update": {
@@ -692,9 +696,16 @@ mod tests {
         assert!(app.active().lines.iter().any(|l| l.starts_with("grok: ✓")));
         // Unknown updates and the _x.ai firehose stay silent.
         let before = app.active().lines.len();
-        assert!(!apply_grok_notif(&mut app, 0, "_x.ai/models/update", &serde_json::json!({})));
         assert!(!apply_grok_notif(
-            &mut app, 0, "session/update",
+            &mut app,
+            0,
+            "_x.ai/models/update",
+            &serde_json::json!({})
+        ));
+        assert!(!apply_grok_notif(
+            &mut app,
+            0,
+            "session/update",
             &serde_json::json!({"sessionId": "s", "update": {"sessionUpdate": "frobnicator"}}),
         ));
         assert_eq!(app.active().lines.len(), before);
@@ -742,7 +753,12 @@ mod tests {
     fn answer_chunks_coalesce_until_newline() {
         let mut app = grok_tab();
         for part in ["Hel", "lo ", "world\n", "Next"] {
-            assert!(!apply_grok_notif(&mut app, 0, "session/update", &chunk(part)));
+            assert!(!apply_grok_notif(
+                &mut app,
+                0,
+                "session/update",
+                &chunk(part)
+            ));
         }
         assert!(app.active().lines.iter().any(|l| l == "Hello world"));
         assert_eq!(app.active().draft_answer, "Next");
@@ -767,20 +783,45 @@ mod tests {
         let mut app = grok_tab();
         app.active_mut().busy = true;
         let done = serde_json::json!({"sessionId": "sess-1", "stopReason": "end_turn"});
-        assert!(apply_grok_notif(&mut app, 0, "grok/prompt_completed", &done));
+        assert!(apply_grok_notif(
+            &mut app,
+            0,
+            "grok/prompt_completed",
+            &done
+        ));
         assert!(!app.active().busy);
         assert!(app.active().lines.iter().any(|l| l == "grok: done ✓"));
         // Non-default reasons are named, not hidden.
         app.active_mut().busy = true;
         let capped = serde_json::json!({"sessionId": "sess-1", "stopReason": "max_tokens"});
-        assert!(apply_grok_notif(&mut app, 0, "grok/prompt_completed", &capped));
-        assert!(app.active().lines.iter().any(|l| l == "grok: done (max_tokens) ✓"));
+        assert!(apply_grok_notif(
+            &mut app,
+            0,
+            "grok/prompt_completed",
+            &capped
+        ));
+        assert!(
+            app.active()
+                .lines
+                .iter()
+                .any(|l| l == "grok: done (max_tokens) ✓")
+        );
         // Transport errors clear busy WITHOUT a bell.
         app.active_mut().busy = true;
         let err = serde_json::json!({"sessionId": "sess-1", "error": "boom"});
-        assert!(!apply_grok_notif(&mut app, 0, "grok/prompt_completed", &err));
+        assert!(!apply_grok_notif(
+            &mut app,
+            0,
+            "grok/prompt_completed",
+            &err
+        ));
         assert!(!app.active().busy);
-        assert!(app.active().lines.iter().any(|l| l.contains("prompt failed")));
+        assert!(
+            app.active()
+                .lines
+                .iter()
+                .any(|l| l.contains("prompt failed"))
+        );
     }
 
     fn permission_req() -> Value {
@@ -801,49 +842,93 @@ mod tests {
         let mut app = grok_tab();
         let mut req = permission_req();
         req["options"].as_array_mut().unwrap().reverse();
-        req["options"].as_array_mut().unwrap().insert(0, serde_json::json!({
-            "optionId": "deny-all", "kind": "reject_always", "name": "Allow"
-        }));
-        apply_grok_permission(&mut app, 0, "session/request_permission", serde_json::json!(11), &req);
+        req["options"].as_array_mut().unwrap().insert(
+            0,
+            serde_json::json!({
+                "optionId": "deny-all", "kind": "reject_always", "name": "Allow"
+            }),
+        );
+        apply_grok_permission(
+            &mut app,
+            0,
+            "session/request_permission",
+            serde_json::json!(11),
+            &req,
+        );
         let mut approval = app.active().pending_approval.clone().unwrap();
-        for (kind, expected) in [(DecisionKind::Approve, "allow-once"),
-            (DecisionKind::ApproveAll, "allow-always-x"), (DecisionKind::Reject, "opt-reject-once")] {
-            assert_eq!(map_grok_decision(&approval, kind).unwrap().1["outcome"]["optionId"], expected);
+        for (kind, expected) in [
+            (DecisionKind::Approve, "allow-once"),
+            (DecisionKind::ApproveAll, "allow-always-x"),
+            (DecisionKind::Reject, "opt-reject-once"),
+        ] {
+            assert_eq!(
+                map_grok_decision(&approval, kind).unwrap().1["outcome"]["optionId"],
+                expected
+            );
         }
         approval.choices.retain(|c| c.scope != "reject_once");
-        assert_eq!(map_grok_decision(&approval, DecisionKind::Reject).unwrap().1["outcome"]["optionId"], "deny-all");
+        assert_eq!(
+            map_grok_decision(&approval, DecisionKind::Reject)
+                .unwrap()
+                .1["outcome"]["optionId"],
+            "deny-all"
+        );
         approval.choices.retain(|c| c.scope == "allow_once");
         approval.choices[0].label = "Reject deny reject_once".into();
         assert!(map_grok_decision(&approval, DecisionKind::Reject).is_none());
         assert!(map_grok_decision(&approval, DecisionKind::ApproveAll).is_none());
         approval.choices[0].scope = "custom_allow_once".into();
         approval.choices[0].label = "Allow once".into();
-        for kind in [DecisionKind::Approve, DecisionKind::ApproveAll, DecisionKind::Reject] {
+        for kind in [
+            DecisionKind::Approve,
+            DecisionKind::ApproveAll,
+            DecisionKind::Reject,
+        ] {
             assert!(map_grok_decision(&approval, kind).is_none());
         }
-        assert_eq!(map_grok_decision(&approval, DecisionKind::Later).unwrap().1["outcome"]["outcome"], "cancelled");
+        assert_eq!(
+            map_grok_decision(&approval, DecisionKind::Later).unwrap().1["outcome"]["outcome"],
+            "cancelled"
+        );
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn model_override_sends_string_and_preserves_failure_note() {
         let (tx, mut events) = tokio::sync::mpsc::channel(4);
-        let host = Host::spawn("/bin/sh", &["-c", r#"
+        let host = Host::spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                r#"
             read -r request
             printf '%s\n' '{"id":1,"result":{"sessionId":"sess-1"}}'
             read -r request
             printf '{"method":"observed","params":%s}\n' "$request"
             printf '%s\n' '{"id":2,"error":{"code":-32602,"message":"unsupported model"}}'
-        "#], &[], tx).await.unwrap();
-        let (id, note) = tokio::time::timeout(std::time::Duration::from_secs(3),
-            grok_new_session(&host, Some("model-x".into()), "/tmp".into()))
-            .await.unwrap().unwrap();
+        "#,
+            ],
+            &[],
+            tx,
+        )
+        .await
+        .unwrap();
+        let (id, note) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            grok_new_session(&host, Some("model-x".into()), "/tmp".into()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(id, "sess-1");
         assert!(note.unwrap().contains("model override ignored"));
         match events.recv().await.unwrap() {
             ServerMsg::Notif { params, .. } => {
                 assert_eq!(params["method"], "session/set_config_option");
-                assert_eq!(params["params"], serde_json::json!({"sessionId":"sess-1", "configId":"model", "value":"model-x"}));
+                assert_eq!(
+                    params["params"],
+                    serde_json::json!({"sessionId":"sess-1", "configId":"model", "value":"model-x"})
+                );
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -853,18 +938,33 @@ mod tests {
     #[test]
     fn permission_request_builds_card_and_maps() {
         let mut app = grok_tab();
-        assert!(apply_grok_permission(&mut app, 0, "session/request_permission", serde_json::json!(11), &permission_req()));
+        assert!(apply_grok_permission(
+            &mut app,
+            0,
+            "session/request_permission",
+            serde_json::json!(11),
+            &permission_req()
+        ));
         let s = app.active();
         assert!(s.pending_diff.is_some());
         assert_eq!(s.pending_diff.as_ref().unwrap().file, "edit a.rs");
         let a = s.pending_approval.clone().expect("approval");
         assert_eq!(a.choices.len(), 3);
         let (_, p) = map_grok_decision(&a, DecisionKind::Approve).unwrap();
-        assert_eq!(p, serde_json::json!({"outcome": {"outcome": "selected", "optionId": "allow-once"}}));
+        assert_eq!(
+            p,
+            serde_json::json!({"outcome": {"outcome": "selected", "optionId": "allow-once"}})
+        );
         let (_, p) = map_grok_decision(&a, DecisionKind::ApproveAll).unwrap();
-        assert_eq!(p["outcome"]["optionId"], serde_json::json!("allow-always-x"));
+        assert_eq!(
+            p["outcome"]["optionId"],
+            serde_json::json!("allow-always-x")
+        );
         let (_, p) = map_grok_decision(&a, DecisionKind::Reject).unwrap();
-        assert_eq!(p["outcome"]["optionId"], serde_json::json!("opt-reject-once"));
+        assert_eq!(
+            p["outcome"]["optionId"],
+            serde_json::json!("opt-reject-once")
+        );
         // Later maps to cancelled, never to an allow option.
         let (req, p) = map_grok_decision(&a, DecisionKind::Later).unwrap();
         assert_eq!(req, serde_json::json!(11));
@@ -875,13 +975,22 @@ mod tests {
     fn question_requests_respond_cancelled() {
         let mut app = grok_tab();
         assert!(!apply_grok_permission(
-            &mut app, 0, "x.ai/ask_user_question", serde_json::json!(3), &serde_json::json!({}),
+            &mut app,
+            0,
+            "x.ai/ask_user_question",
+            serde_json::json!(3),
+            &serde_json::json!({}),
         ));
         assert!(app.active().pending_approval.is_none());
         assert_eq!(app.outbox.decides.len(), 1);
         assert_eq!(app.outbox.decides[0].requirement_id, serde_json::json!(3));
         assert!(app.outbox.decides[0].choice_id.contains("cancelled"));
-        assert!(app.active().lines.iter().any(|l| l.contains("question, not an approval")));
+        assert!(
+            app.active()
+                .lines
+                .iter()
+                .any(|l| l.contains("question, not an approval"))
+        );
     }
 
     /// S2-F3: an UNANSWERED card must not silently vanish on
@@ -890,20 +999,36 @@ mod tests {
     #[test]
     fn interaction_resolved_without_decision_sends_cancel() {
         let mut app = grok_tab();
-        assert!(apply_grok_permission(&mut app, 0, "session/request_permission", serde_json::json!(11), &permission_req()));
+        assert!(apply_grok_permission(
+            &mut app,
+            0,
+            "session/request_permission",
+            serde_json::json!(11),
+            &permission_req()
+        ));
         assert!(app.active().pending_approval.is_some());
         assert!(app.outbox.decides.is_empty());
         let resolved = serde_json::json!({
             "sessionId": "sess-1",
             "update": {"sessionUpdate": "interaction_resolved", "tool_call_id": "tc-9"},
         });
-        assert!(!apply_grok_notif(&mut app, 0, "x.ai/session_notification", &resolved));
+        assert!(!apply_grok_notif(
+            &mut app,
+            0,
+            "x.ai/session_notification",
+            &resolved
+        ));
         assert!(app.active().pending_approval.is_none());
         assert!(app.active().pending_diff.is_none());
         assert_eq!(app.outbox.decides.len(), 1);
         assert_eq!(app.outbox.decides[0].requirement_id, serde_json::json!(11));
         assert!(app.outbox.decides[0].choice_id.contains("cancelled"));
-        assert!(app.active().lines.iter().any(|l| l.contains("permission resolved")));
+        assert!(
+            app.active()
+                .lines
+                .iter()
+                .any(|l| l.contains("permission resolved"))
+        );
         assert!(app.active().lines.iter().any(|l| l.contains("sent cancel")));
     }
 
@@ -912,16 +1037,31 @@ mod tests {
     #[test]
     fn interaction_resolved_with_decision_retires_quietly() {
         let mut app = grok_tab();
-        assert!(apply_grok_permission(&mut app, 0, "session/request_permission", serde_json::json!(11), &permission_req()));
+        assert!(apply_grok_permission(
+            &mut app,
+            0,
+            "session/request_permission",
+            serde_json::json!(11),
+            &permission_req()
+        ));
         queue_grok_cancelled(&mut app, 0, serde_json::json!(11));
         let resolved = serde_json::json!({
             "sessionId": "sess-1",
             "update": {"sessionUpdate": "interaction_resolved", "tool_call_id": "tc-9"},
         });
-        assert!(!apply_grok_notif(&mut app, 0, "x.ai/session_notification", &resolved));
+        assert!(!apply_grok_notif(
+            &mut app,
+            0,
+            "x.ai/session_notification",
+            &resolved
+        ));
         assert!(app.active().pending_approval.is_none());
         assert!(app.active().pending_diff.is_none());
-        assert_eq!(app.outbox.decides.len(), 1, "answered card must not queue a second cancel");
+        assert_eq!(
+            app.outbox.decides.len(),
+            1,
+            "answered card must not queue a second cancel"
+        );
     }
 
     /// Live bringup against a real `grok agent stdio`: initialize needs no

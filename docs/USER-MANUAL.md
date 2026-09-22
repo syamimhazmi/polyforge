@@ -25,9 +25,15 @@ on macOS), the tmux buffer (`tmux load-buffer`) when inside tmux, and
 OSC 52 toward the outer terminal (always on Linux; on macOS only in
 tmux/SSH/display-less containers or with a wrap sink). Helpers run with
 a 2-second deadline so a wedged `pbcopy` can never hang the UI, and the
-selection is always also written to `POLYFORGE_COPY_FILE` (default
-`$XDG_DATA_HOME/polyforge/last-copy.txt`, mode 0600) — the status flash
-names that path when every clipboard leg misses. Kill OSC 52 entirely
+selection is also written to `POLYFORGE_COPY_FILE` (default
+`$XDG_DATA_HOME/polyforge/last-copy.txt`, mode 0600, single-file
+overwrite — no history kept; wipe with `rm` on that path) unless
+`POLYFORGE_CLIPBOARD_NO_BACKUP` is set — the status flash
+names that path when every clipboard leg misses. A custom
+`POLYFORGE_COPY_FILE` must stay under `$XDG_DATA_HOME/polyforge/`
+(relative paths remap there; anything else is rejected) and a symlink at
+`polyforge` or below is refused. Selections over 100 KiB skip the OSC 52 leg
+but still reach the other legs and the backup file. Kill OSC 52 entirely
 with `POLYFORGE_CLIPBOARD_NO_OSC52`; advertise a wrapping sink with
 `POLYFORGE_OSC52_SINK`. A plain click clears the highlight. Selection
 maps through scroll, wrapped rows, and wide characters, so what you

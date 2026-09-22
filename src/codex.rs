@@ -95,16 +95,15 @@ pub async fn codex_resume_thread(host: &Host, thread_id: &str) -> Result<String,
 }
 
 pub async fn codex_submit(host: &Host, thread_id: &str, prompt: &str) -> Result<(), RpcError> {
-    host
-        .call(
-            "turn/start",
-            serde_json::json!({
-                "threadId": thread_id,
-                "input": [{"type": "text", "text": prompt}],
-            }),
-        )
-        .await
-        .map(|_| ())
+    host.call(
+        "turn/start",
+        serde_json::json!({
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": prompt}],
+        }),
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Answer a codex approval request. `payload` must match the request kind's
@@ -160,10 +159,7 @@ pub fn apply_codex_notif(app: &mut App, tab: usize, method: &str, params: &Value
         "turn/failed" | "thread/realtime/error" => {
             let s = &mut app.sessions[tab];
             s.push_line("codex: turn failed (see flash)".to_string());
-            app.flash = format!(
-                "codex: {}",
-                truncate(&params.to_string(), 300)
-            );
+            app.flash = format!("codex: {}", truncate(&params.to_string(), 300));
             false
         }
         "error" => {
@@ -335,10 +331,7 @@ pub fn apply_codex_approval(
                 .get("fileChanges")
                 .map(|v| truncate(&v.to_string(), 2000))
                 .unwrap_or_default();
-            let reason = params
-                .get("reason")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let reason = params.get("reason").and_then(|v| v.as_str()).unwrap_or("");
             ("applyPatch".to_string(), format!("{reason}\n{files}"))
         }
         "execCommandApproval" => {
@@ -346,10 +339,7 @@ pub fn apply_codex_approval(
                 .get("command")
                 .map(|v| truncate(&v.to_string(), 1200))
                 .unwrap_or_default();
-            let reason = params
-                .get("reason")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let reason = params.get("reason").and_then(|v| v.as_str()).unwrap_or("");
             ("exec".to_string(), format!("{reason}\n$ {cmd}"))
         }
         _ => (method.to_string(), truncate(&params.to_string(), 2000)),
@@ -534,7 +524,12 @@ mod tests {
                 {"path": "old/c.rs", "kind": {"type": "delete"}, "diff": ""},
             ]
         });
-        assert!(!apply_codex_notif(&mut app, 0, "fileChange/patchUpdated", &params));
+        assert!(!apply_codex_notif(
+            &mut app,
+            0,
+            "fileChange/patchUpdated",
+            &params
+        ));
         assert_eq!(
             tail(&app, 3),
             vec![
@@ -627,7 +622,10 @@ mod tests {
             1,
             Some("gpt-5.6".to_string()),
             "/tmp".to_string(),
-            vec![("CODEX_HOME".to_string(), home.to_string_lossy().into_owned())],
+            vec![(
+                "CODEX_HOME".to_string(),
+                home.to_string_lossy().into_owned(),
+            )],
             tx,
         )
         .await;

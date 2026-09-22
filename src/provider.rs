@@ -5,9 +5,7 @@
 
 use serde_json::Value;
 
-use crate::app::{
-    App, ApprovalChoice, DecisionKind, OutboxDecide, PendingApproval, PendingDiff,
-};
+use crate::app::{App, ApprovalChoice, DecisionKind, OutboxDecide, PendingApproval, PendingDiff};
 use crate::msp::{self, Host, RpcError, ServerMsg};
 
 /// Bring up the muse backend: spawn serve, handshake, start one session per
@@ -99,7 +97,10 @@ pub async fn muse_resume_session(host: &Host, session_id: &str) -> Result<String
         .map_err(|e| format!("muse session/resume failed: {e}"))?;
     // Best-effort live subscription; events arrive anyway.
     let _ = host
-        .call("view/subscribe", serde_json::json!({"sessionId": session_id}))
+        .call(
+            "view/subscribe",
+            serde_json::json!({"sessionId": session_id}),
+        )
         .await;
     // The resumed id echoes the request; tolerate servers that omit it.
     let resumed = res
@@ -118,29 +119,20 @@ fn friendly_start_error(e: &RpcError) -> String {
     format!("muse session/start failed: {e}")
 }
 
-pub async fn muse_submit(
-    host: &Host,
-    session_id: &str,
-    prompt: &str,
-) -> Result<(), RpcError> {
-    host
-        .call(
-            "turn/start",
-            serde_json::json!({
-                "commandId": msp::uuid7(),
-                "sessionId": session_id,
-                "input": [{"type": "text", "text": prompt}],
-            }),
-        )
-        .await
-        .map(|_| ())
+pub async fn muse_submit(host: &Host, session_id: &str, prompt: &str) -> Result<(), RpcError> {
+    host.call(
+        "turn/start",
+        serde_json::json!({
+            "commandId": msp::uuid7(),
+            "sessionId": session_id,
+            "input": [{"type": "text", "text": prompt}],
+        }),
+    )
+    .await
+    .map(|_| ())
 }
 
-pub async fn muse_decide(
-    host: &Host,
-    session_id: &str,
-    d: &OutboxDecide,
-) -> Result<(), RpcError> {
+pub async fn muse_decide(host: &Host, session_id: &str, d: &OutboxDecide) -> Result<(), RpcError> {
     let mut params = serde_json::json!({
         "commandId": msp::uuid7(),
         "sessionId": session_id,
@@ -197,10 +189,7 @@ pub fn apply_notif(app: &mut App, tab: usize, method: &str, params: &Value) -> b
         }
         "approval/requested" => {
             let p = &params;
-            let tool = p
-                .get("toolName")
-                .and_then(|v| v.as_str())
-                .unwrap_or("tool");
+            let tool = p.get("toolName").and_then(|v| v.as_str()).unwrap_or("tool");
             let mut body = format!("tool: {tool}\n");
             if let Some(args) = p.get("rawArgs").and_then(|v| v.as_str()) {
                 body.push_str(&truncate(args, 1200));
@@ -214,8 +203,7 @@ pub fn apply_notif(app: &mut App, tab: usize, method: &str, params: &Value) -> b
             }
             let choices = parse_choices(p);
             if !choices.is_empty() {
-                let labels: Vec<&str> =
-                    choices.iter().map(|c| c.label.as_str()).collect();
+                let labels: Vec<&str> = choices.iter().map(|c| c.label.as_str()).collect();
                 body.push_str(&format!("\nchoices: {}", labels.join(" · ")));
             }
             // S2-F2: refuse to show a y/n modal the user cannot deny.
@@ -294,9 +282,10 @@ pub fn map_decision(
     kind: DecisionKind,
 ) -> Option<(String, Option<String>)> {
     let pick = |dec: &str, scope: Option<&str>| {
-        approval.choices.iter().find(|c| {
-            c.decision == dec && scope.map(|s| c.scope == s).unwrap_or(true)
-        })
+        approval
+            .choices
+            .iter()
+            .find(|c| c.decision == dec && scope.map(|s| c.scope == s).unwrap_or(true))
     };
     match kind {
         DecisionKind::Approve => pick("approved", Some("once"))
@@ -401,18 +390,12 @@ mod tests {
     #[test]
     fn decisions_map_to_choices() {
         let a = approval();
-        assert_eq!(
-            map_decision(&a, DecisionKind::Approve).unwrap().0,
-            "c-once"
-        );
+        assert_eq!(map_decision(&a, DecisionKind::Approve).unwrap().0, "c-once");
         assert_eq!(
             map_decision(&a, DecisionKind::ApproveAll).unwrap().0,
             "c-sess"
         );
-        assert_eq!(
-            map_decision(&a, DecisionKind::Reject).unwrap().0,
-            "c-deny"
-        );
+        assert_eq!(map_decision(&a, DecisionKind::Reject).unwrap().0, "c-deny");
         let (id, fb) = map_decision(&a, DecisionKind::Later).unwrap();
         assert_eq!(id, "c-deny");
         assert!(fb.unwrap().contains("deferred"));
@@ -454,10 +437,12 @@ mod tests {
         assert!(app.sessions[0].pending_diff.is_none());
         assert!(app.sessions[0].pending_approval.is_none());
         assert!(app.flash.contains("no way to deny"));
-        assert!(app.sessions[0]
-            .lines
-            .iter()
-            .any(|l| l.contains("modal refused")));
+        assert!(
+            app.sessions[0]
+                .lines
+                .iter()
+                .any(|l| l.contains("modal refused"))
+        );
     }
 
     /// Control: a request offering deny still stages the modal.
@@ -510,7 +495,9 @@ mod tests {
                 return;
             }
         };
-        host.handshake("polyforge_test", "0.0.0").await.expect("handshake");
+        host.handshake("polyforge_test", "0.0.0")
+            .await
+            .expect("handshake");
         host.notify("initialized").await;
         let res = host
             .call(
@@ -519,18 +506,20 @@ mod tests {
             )
             .await
             .expect("session/start");
-        let sid = res["session"]["sessionId"].as_str().expect("sessionId").to_string();
+        let sid = res["session"]["sessionId"]
+            .as_str()
+            .expect("sessionId")
+            .to_string();
         let _ = host
             .call("view/subscribe", serde_json::json!({"sessionId": sid}))
             .await;
-        host
-            .call(
-                "turn/start",
-                serde_json::json!({"commandId": msp::uuid7(), "sessionId": sid,
+        host.call(
+            "turn/start",
+            serde_json::json!({"commandId": msp::uuid7(), "sessionId": sid,
                     "input": [{"type": "text", "text": "say probe-ok"}]}),
-            )
-            .await
-            .expect("turn/start");
+        )
+        .await
+        .expect("turn/start");
         let mut saw_text = false;
         let mut done = false;
         let deadline = tokio::time::sleep(std::time::Duration::from_secs(45));

@@ -30,10 +30,17 @@ impl std::error::Error for RpcError {}
 /// Server-originated frames the provider layer must route.
 #[derive(Debug)]
 pub enum ServerMsg {
-    Notif { method: String, params: Value },
+    Notif {
+        method: String,
+        params: Value,
+    },
     /// Server→client request (e.g. Codex approvals): must be answered with
     /// [`Host::respond`]; the id space is the server's own.
-    Request { id: Value, method: String, params: Value },
+    Request {
+        id: Value,
+        method: String,
+        params: Value,
+    },
     /// Transport/parse failure or an id-less error frame.
     Transport(String),
 }
@@ -51,15 +58,22 @@ pub const MAX_NDJSON_LINE_BYTES: usize = 1_048_576;
 pub enum CappedLine {
     Line(String),
     /// Line exceeded the cap; `bytes` is cap + 1 (what we buffered).
-    Oversize { bytes: usize },
+    Oversize {
+        bytes: usize,
+    },
     /// Line was not valid UTF-8.
-    InvalidUtf8 { bytes: usize },
+    InvalidUtf8 {
+        bytes: usize,
+    },
     Eof,
 }
 
 /// Read one `\n`-terminated line while never buffering more than
 /// [`MAX_NDJSON_LINE_BYTES`] + 1 bytes, even before the first newline.
-pub async fn read_capped_line<R>(reader: &mut R, scratch: &mut Vec<u8>) -> std::io::Result<CappedLine>
+pub async fn read_capped_line<R>(
+    reader: &mut R,
+    scratch: &mut Vec<u8>,
+) -> std::io::Result<CappedLine>
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
@@ -103,7 +117,9 @@ where
 fn to_line(scratch: &[u8]) -> std::io::Result<CappedLine> {
     match String::from_utf8(scratch.to_vec()) {
         Ok(s) => Ok(CappedLine::Line(s)),
-        Err(_) => Ok(CappedLine::InvalidUtf8 { bytes: scratch.len() }),
+        Err(_) => Ok(CappedLine::InvalidUtf8 {
+            bytes: scratch.len(),
+        }),
     }
 }
 
@@ -209,7 +225,8 @@ impl Host {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
-        let frame = serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        let frame =
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         {
             let mut w = self.writer.lock().await;
             if let Err(e) = w.write_all(format!("{frame}\n").as_bytes()).await {
@@ -261,11 +278,7 @@ impl Host {
     }
 }
 
-async fn route_line(
-    line: &str,
-    pending: &Pending,
-    events_tx: &mpsc::Sender<ServerMsg>,
-) {
+async fn route_line(line: &str, pending: &Pending, events_tx: &mpsc::Sender<ServerMsg>) {
     let line = line.trim();
     if line.is_empty() {
         return;
@@ -343,7 +356,14 @@ pub fn uuid7() -> String {
     buf[6] = (buf[6] & 0x0f) | 0x70; // version 7
     buf[8] = (buf[8] & 0x3f) | 0x80; // variant 10
     let h: String = buf.iter().map(|b| format!("{b:02x}")).collect();
-    format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..]
+    )
 }
 
 /// Best-effort text out of item/delta-style notification params.
@@ -378,18 +398,36 @@ mod tests {
     async fn pending_call_allows_permission_response() {
         let (tx, mut events) = mpsc::channel(4);
         // A local peer waits for our permission response before ending the call.
-        let host = Host::spawn("/bin/sh", &["-c", r#"
+        let host = Host::spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                r#"
             read -r prompt
             printf '%s\n' '{"id":"permission","method":"session/request_permission"}'
             read -r response
             printf '{"method":"observed","params":%s}\n' "$response"
             printf '%s\n' '{"id":1,"result":{"stopReason":"end_turn"}}'
-        "#], &[], tx).await.unwrap();
+        "#,
+            ],
+            &[],
+            tx,
+        )
+        .await
+        .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             let call = host.call("session/prompt", Value::Null);
             let respond = async {
-                assert!(matches!(events.recv().await, Some(ServerMsg::Request { .. })));
-                host.respond(serde_json::json!("permission"), serde_json::json!({"outcome":{"outcome":"cancelled"}})).await.unwrap();
+                assert!(matches!(
+                    events.recv().await,
+                    Some(ServerMsg::Request { .. })
+                ));
+                host.respond(
+                    serde_json::json!("permission"),
+                    serde_json::json!({"outcome":{"outcome":"cancelled"}}),
+                )
+                .await
+                .unwrap();
                 match events.recv().await.unwrap() {
                     ServerMsg::Notif { params, .. } => {
                         assert_eq!(params["id"], "permission");
@@ -400,7 +438,9 @@ mod tests {
             };
             let (result, ()) = tokio::join!(call, respond);
             assert_eq!(result.unwrap()["stopReason"], "end_turn");
-        }).await.expect("call held writer while awaiting response");
+        })
+        .await
+        .expect("call held writer while awaiting response");
         host.shutdown().await;
     }
 
@@ -411,7 +451,10 @@ mod tests {
         for id in [&a, &b] {
             assert_eq!(id.len(), 36);
             assert_eq!(&id[14..15], "7", "version nibble: {id}");
-            assert!(matches!(&id[19..20], "8" | "9" | "a" | "b"), "variant: {id}");
+            assert!(
+                matches!(&id[19..20], "8" | "9" | "a" | "b"),
+                "variant: {id}"
+            );
         }
         // Same-millisecond ids are unordered by design; only the 48-bit
         // timestamp prefix is non-decreasing.
