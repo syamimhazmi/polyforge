@@ -193,6 +193,9 @@ pub fn apply_codex_notif(app: &mut App, tab: usize, method: &str, params: &Value
             // approval card when the turn gates, so streaming stays
             // readable. Segment-matched (`/` before tail); exact live
             // names remain UNCONFIRMED.
+            // S7-F2: these writes are ALREADY APPLIED server-side — the
+            // y/n modal never gated them. Every line says so; never
+            // claim y/n covers all writes.
             let s = &mut app.sessions[tab];
             let changes = params
                 .get("changes")
@@ -200,7 +203,9 @@ pub fn apply_codex_notif(app: &mut App, tab: usize, method: &str, params: &Value
                 .cloned()
                 .unwrap_or_default();
             if changes.is_empty() {
-                s.push_line("codex: files updated".to_string());
+                s.push_line(
+                    "codex: files updated (already applied — not gated by y/n)".to_string(),
+                );
             }
             for ch in &changes {
                 let path = ch.get("path").and_then(|p| p.as_str()).unwrap_or("?");
@@ -214,7 +219,7 @@ pub fn apply_codex_notif(app: &mut App, tab: usize, method: &str, params: &Value
                     "delete" => "-",
                     _ => "~",
                 };
-                s.push_line(format!("codex: {mark} {path}"));
+                s.push_line(format!("codex: {mark} {path} (already applied)"));
             }
             if tab == app.active {
                 app.stick_to_bottom();
@@ -258,6 +263,11 @@ pub fn apply_codex_notif(app: &mut App, tab: usize, method: &str, params: &Value
                 if !r.is_empty() {
                     line.push_str(&format!(" ({})", truncate(r, 200)));
                 }
+            }
+            // S7-F2: an approved guardian review applies the side effect
+            // without ever raising the y/n modal — say so on the line.
+            if status == "approved" {
+                line.push_str(" [already applied — no y/n modal]");
             }
             let s = &mut app.sessions[tab];
             s.push_line(line);
@@ -530,12 +540,13 @@ mod tests {
             "fileChange/patchUpdated",
             &params
         ));
+        // S7-F2: every mid-turn write line carries the already-applied note.
         assert_eq!(
             tail(&app, 3),
             vec![
-                "codex: ~ src/a.rs",
-                "codex: + new/b.rs",
-                "codex: - old/c.rs",
+                "codex: ~ src/a.rs (already applied)",
+                "codex: + new/b.rs (already applied)",
+                "codex: - old/c.rs (already applied)",
             ]
         );
     }
@@ -548,11 +559,14 @@ mod tests {
             {"path": "x.rs", "kind": {"type": "update"}, "diff": ""}
         ]});
         apply_codex_notif(&mut app, 0, "item/patchUpdated", &params);
-        assert_eq!(tail(&app, 1), vec!["codex: ~ x.rs"]);
+        assert_eq!(tail(&app, 1), vec!["codex: ~ x.rs (already applied)"]);
         // Empty change list degrades to a single line, never silence.
         let empty = serde_json::json!({"changes": []});
         apply_codex_notif(&mut app, 0, "fileChange/patchUpdated", &empty);
-        assert_eq!(tail(&app, 1), vec!["codex: files updated"]);
+        assert_eq!(
+            tail(&app, 1),
+            vec!["codex: files updated (already applied — not gated by y/n)"]
+        );
         // Glued false positive must not match.
         let before = app.sessions[0].lines.len();
         assert!(!apply_codex_notif(&mut app, 0, "foopatchUpdated", &params));
@@ -586,9 +600,12 @@ mod tests {
             "review": {"status": "approved", "rationale": "read-only test run"},
         });
         apply_codex_notif(&mut app, 0, "item/autoApprovalReview/completed", &done);
+        // S7-F2: approved guardian reviews bypass the modal — noted inline.
         assert_eq!(
             tail(&app, 1),
-            vec!["codex: guardian approved — `cargo test` (read-only test run)"]
+            vec![
+                "codex: guardian approved — `cargo test` (read-only test run) [already applied — no y/n modal]"
+            ]
         );
     }
 

@@ -241,6 +241,20 @@ pub fn apply_agy_notif(app: &mut App, tab: usize, method: &str, params: &Value) 
     }
 }
 
+/// S7-F1: hard no-modal warning printed on every agy session open (fresh
+/// or resumed). Headless agy has no interactive approval round-trip, so
+/// opening the tab trusts the agent with workspace writes.
+pub const AGY_NO_MODAL_WARNING: &str = "agy: WARNING — no y/n approval modal on this tab (headless vendor limitation): tools run ungated, workspace writes auto-allow. Opening this session trusts the agent — watch the transcript.";
+
+/// Push the S7-F1 warning onto a freshly opened agy tab. Call only after
+/// the child spawned: a failed open has no agent to warn about.
+pub fn push_agy_open_notice(s: &mut crate::app::Session, resumed: bool) {
+    if resumed {
+        s.push_line("agy: continuing previous conversation".to_string());
+    }
+    s.push_line(AGY_NO_MODAL_WARNING.to_string());
+}
+
 fn push_text(app: &mut App, tab: usize, t: &str) {
     let s = &mut app.sessions[tab];
     for line in t.split('\n') {
@@ -317,6 +331,26 @@ mod tests {
         let mut app = App::new();
         app.active_mut().backend = BackendKind::Agy;
         app
+    }
+
+    /// S7-F1: every agy open warns loudly that no y/n modal exists.
+    #[test]
+    fn open_notice_warns_no_modal_fresh_and_resumed() {
+        use crate::app::Session;
+        assert!(AGY_NO_MODAL_WARNING.contains("y/n"));
+        assert!(AGY_NO_MODAL_WARNING.contains("modal"));
+        let mut fresh = Session::new("agy");
+        push_agy_open_notice(&mut fresh, false);
+        assert_eq!(fresh.lines, vec![AGY_NO_MODAL_WARNING.to_string()]);
+        let mut resumed = Session::new("agy");
+        push_agy_open_notice(&mut resumed, true);
+        assert_eq!(resumed.lines.len(), 2);
+        assert!(
+            resumed.lines[0].contains("continuing previous conversation"),
+            "resume keeps its context line: {:?}",
+            resumed.lines
+        );
+        assert_eq!(resumed.lines[1], AGY_NO_MODAL_WARNING);
     }
 
     /// Frames below are shaped exactly like the first-party headless docs.

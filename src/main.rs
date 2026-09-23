@@ -29,7 +29,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc;
 
-use agy::{AgyHandle, agy_submit, apply_agy_notif, spawn_agy};
+use agy::{AGY_NO_MODAL_WARNING, AgyHandle, agy_submit, apply_agy_notif, push_agy_open_notice, spawn_agy};
 use app::{App, BackendKind, DecisionKind, Mode, OutboxDecide};
 use codex::{
     apply_codex_approval, apply_codex_notif, codex_bringup, codex_respond, codex_resume_thread,
@@ -463,11 +463,14 @@ async fn open_tab_session(
             // Keep expected resume id so init can match by conversation_id.
             if let Some(ref id) = resume {
                 app.sessions[tab].remote_id = Some(id.clone());
-                app.sessions[tab].push_line(format!("{tag}: continuing previous conversation"));
             }
             let had_resume = resume.is_some();
             match ensure_agy_tab(backends, tab, cfg, agy_tx, resume).await {
                 Ok(()) => {
+                    // S7-F1: the child is live, so the no-modal warning
+                    // fires here — fresh or resumed, every open.
+                    push_agy_open_notice(&mut app.sessions[tab], had_resume);
+                    app.flash = AGY_NO_MODAL_WARNING.to_string();
                     app.sessions[tab].pending_agy_init = true;
                     // Resume tabs match by conversation_id; only fresh
                     // spawns claim a FIFO slot.

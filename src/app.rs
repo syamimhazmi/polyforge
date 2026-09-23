@@ -533,6 +533,14 @@ impl Session {
 
     /// Open the DIFF card and invalidate any in-flight risk judgment.
     pub fn stage_diff(&mut self, diff: PendingDiff) {
+        // S7-F3: replacing an undecided card is the intra-client TOCTOU —
+        // the user may have read the old card and be about to press `y`.
+        // Re-prompt loudly so they review the new content instead.
+        // (Render→keypress itself is race-free: the event loop is
+        // single-threaded, so the pressed key always answers the last
+        // rendered card. Server-side content changes past the request
+        // stay outside any client gate and are documented as such.)
+        let replaced = self.pending_diff.is_some();
         self.pending_diff = Some(PendingDiff {
             file: sanitize_text(&diff.file),
             body: sanitize_text(&diff.body),
@@ -540,6 +548,12 @@ impl Session {
         self.approval_risk = None;
         self.risk_gen = self.risk_gen.wrapping_add(1);
         self.risk_spawned_gen = None;
+        if replaced {
+            self.push_line(
+                "approval card updated before your decision — review again before y (content changed)"
+                    .to_string(),
+            );
+        }
     }
 
     /// Close the DIFF card; bump gen so late TypeSafe answers are ignored.
@@ -1871,6 +1885,30 @@ mod tests {
         assert_eq!(s.risk_gen, 2);
         assert!(s.approval_risk.is_none());
         assert!(s.risk_spawned_gen.is_none());
+    }
+
+    /// S7-F3: staging a second card over an undecided one re-prompts in
+    /// the transcript; a first stage stays silent.
+    #[test]
+    fn stage_replacing_open_card_reprompts() {
+        let mut s = Session::new("t");
+        s.stage_diff(PendingDiff {
+            file: "old".into(),
+            body: "old body".into(),
+        });
+        assert!(s.lines.is_empty(), "first stage stays silent");
+        s.stage_diff(PendingDiff {
+            file: "new".into(),
+            body: "new body".into(),
+        });
+        assert_eq!(s.pending_diff.as_ref().unwrap().file, "new");
+        assert_eq!(s.risk_gen, 2);
+        assert_eq!(s.lines.len(), 1);
+        assert!(
+            s.lines[0].contains("review again before y"),
+            "re-prompt note missing: {:?}",
+            s.lines
+        );
     }
 
     #[test]
