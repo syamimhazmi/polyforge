@@ -1,9 +1,9 @@
 # polyforge — User Manual
 
 polyforge is a vim-modal, multi-tab terminal UI for chatting with coding
-agents. One tab = one agent session. It fronts five stdio backends: a
+agents. One tab = one agent session. It fronts six stdio backends: a
 quota-free offline `mock`, Muse Spark (`muse`), Codex (`codex`),
-Antigravity (`agy`), and Grok (`grok` / ACP).
+Antigravity (`agy`), Grok (`grok` / ACP), and Claude Code (`claude`).
 
 > Prototype. The interaction model and the agent wiring are the focus —
 > not a production client.
@@ -40,6 +40,10 @@ maps through scroll, wrapped rows, and wide characters, so what you
 highlight is what gets copied. Toggle mouse capture entirely with `m`
 (when off, your terminal's native selection applies instead).
 
+- **First launch** opens the provider picker before anything starts:
+  choose with `j`/`k` + `Enter` (or `1`-`5`). The choice is saved as
+  `provider` in the config (§8), so later launches skip it; `P` still
+  switches per tab. `Esc`/`q` here quits.
 - Every launch opens **one tab with a FRESH session**. Nothing from a
   previous run is replayed automatically.
 - Quit with `q` (Normal mode). Quitting ends all live backend
@@ -53,7 +57,9 @@ and everything runs offline.
 
 From top to bottom:
 
-1. **Tab bar** — one entry per tab: `○ s1:muse (1)`. `●` means the tab is
+1. **Tab bar** — hidden at startup while the single tab shows the
+   welcome screen; it appears once the tab has content or a second tab
+   opens. One entry per tab: `○ s1:muse (1)`. `●` means the tab is
    busy (an answer streams in even while you look at another tab); `○`
    means idle. The active tab is highlighted, with its backend and number.
 2. **Transcript** — the active tab's conversation, oldest at top. Your
@@ -104,6 +110,7 @@ Input starting with `/` is a **command**, never sent to the agent:
 | `/new` | fresh session in this tab (same as `R`) |
 | `/tab new` | open a tab (max 3), same backend as current |
 | `/tab close` | close this tab, killing its session |
+| `/theme [name]` | switch theme — `groknight` (default) or `tokyonight`; bare `/theme` cycles (saved to config) |
 | `/vim` | toggle the vim keymap (saved to config) |
 | `/help` | print the command + key summary into the transcript |
 
@@ -127,13 +134,18 @@ The tab's old session stays stored and browsable via `/sessions`.
 | 3 | codex — Codex via `codex app-server` |
 | 4 | agy — Antigravity via `agy` (visible, ungated — see §6) |
 | 5 | grok — Grok via `grok agent stdio` (ACP — see §6) |
+| 6 | claude — Claude Code via `claude -p` (stream-json — see §6) |
 
 ### SESSIONS — continue a previous session (`/sessions`)
 
 Session management follows the grok CLI. The list mirrors
 `grok sessions list`: one row per session with id, backend, created and
 updated timestamps, and summary (first-prompt title, else the first
-transcript line), ordered most-active-first. A `/sessions <query>`
+transcript line). Only sessions started in the current workspace
+(`workspace` in config, else the directory you launched from) are
+listed, so projects never collide. Rows are grouped by provider — the
+active tab's provider first — and ordered most-active-first within each
+group. A `/sessions <query>`
 argument filters like `grok sessions search` (title, summary, or id).
 
 `j/k` move, `Enter` loads, `d` deletes permanently
@@ -141,7 +153,9 @@ argument filters like `grok sessions search` (title, summary, or id).
 tab), `1-9` quick-picks, `Esc` cancels. Loading
 replays the transcript into the active tab **and re-attaches the live
 session**, so you continue where you left off (muse `session/resume`,
-codex `thread/resume`, grok `session/resume`, agy `--conversation`).
+codex `thread/resume`, grok `session/resume`, agy `--conversation`,
+claude `--resume`). A claude session that no longer exists prints the
+CLI's error and `claude: session ended` — press `R` for a fresh one.
 A failed re-attach starts fresh and says so in the transcript.
 
 ### DIFF modal — approve agent writes
@@ -168,7 +182,7 @@ server-side, and the transcript says so.
 - `Tab` cycles; digits jump (`1` = first tab). With one tab, other digits
   do nothing.
 - `/tab close` drops the tab's queued work and kills its session: an agy
-  child process is killed, grok gets a best-effort `session/close`;
+  or claude child process is killed, grok gets a best-effort `session/close`;
   muse/codex remote sessions have no vendor kill API, so the remote id is
   abandoned while the transcript stays stored.
   Remaining tabs are renumbered (`s1…`) and queued work follows its tab.
@@ -194,6 +208,7 @@ Think of it as: **a tab is a view, a session is history.**
 | `codex` | Talks to `codex app-server` over stdio: thread per tab, `turn/start` on send, deltas to transcript, `turn/completed` to the bell. Approvals arrive as server→client requests, answered `approved` / `approved_for_session` / `denied` (`accept*` for file edits when offered). Mid-turn writes render as `codex: ~ path (already applied)` (`+` add, `-` delete) — **those writes already applied server-side and were never gated by y/n**; the y/n modal only covers requests the server actually routes through it. Guardian auto-reviews show as `codex: reviewing …` / `codex: guardian approved — … [already applied — no y/n modal]`. |
 | `agy` | One `agy` child per tab (`--input-format/--output-format stream-json`). Deltas stream, tool steps render with outcome, `result` ends the turn with a bell. **Visible but ungated**: headless agy has no interactive approval round-trip, so no modal can ever fire on agy tabs — workspace writes auto-allow and Ask-actions soft-deny, with notices in the transcript. Nothing is ever pre-granted in your settings. **Trust assumption**: opening an agy tab prints an `agy: WARNING — no y/n approval modal …` line (plus flash) — opening the session trusts the agent with workspace writes. |
 | `grok` | One shared `grok agent stdio` host, one ACP session per tab. Text streams line by line, thoughts show as one truncated `grok: ∴ …` line, tool calls as `grok: ⚙ title [kind]` with `✓`/`✗` outcomes, plans as `grok: plan (N steps)`. The prompt result rings the bell (`grok: done ✓`). Permission requests raise the y/n/a/q modal, mapped to ACP kinds (`allow_once` / `allow_always` / `reject_*`); `q` answers `cancelled`. Question-style requests (`ask_user_question`, `exit_plan_mode`, `mcp/elicit`) are not approvals — they respond `cancelled` with a transcript line. |
+| `claude` | One `claude -p` child per tab (`--input-format/--output-format stream-json --verbose`). polyforge picks the session id up front (`--session-id`) so every frame routes by `session_id`; resume passes `--resume <id>`. Assistant text streams per message, tool calls render as `claude <Tool>: key=value …`, failed tool results as `claude: tool FAILED …`; `result` ends the turn with a bell (`claude: done ✓`). **Approvals**: tools your own Claude settings don't pre-allow raise the y/n/a/q modal (via `--permission-prompt-tool stdio`). `y` allows once, `n` denies (the turn continues), `a` allows and applies Claude's suggested rule for this session (falls back to once if none is offered), `q`/`Esc` denies and interrupts the turn. `AskUserQuestion` forms are declined so claude asks in plain text. `[claude] permission_mode` (e.g. `acceptEdits`) pre-allows more — polyforge never edits your Claude settings files. |
 
 **No login?** The tab stays navigable and shows the exact fix, e.g.
 `muse: not logged in — run \`muse login\`` (or the `codex login`
@@ -206,11 +221,12 @@ reason; only the failing backend is affected.
 `~/.local/share/polyforge/sessions/`):
 
 - `sess-{id}.jsonl` — one JSON-escaped line per transcript line.
-- `sess-{id}.meta.json` — backend, remote id, created + updated times, title.
+- `sess-{id}.meta.json` — backend, remote id, created + updated times, title,
+  workspace.
 
 Every push appends through a buffered sink, so a crash loses at most one
 frame's lines. Files over 50,000 lines are compacted to the tail on load.
-`/sessions` lists at most the newest 50. If the store directory can't be
+`/sessions` lists at most the newest 50 for the current workspace. If the store directory can't be
 opened, the app runs **storageless** (sessions work, nothing persists)
 instead of crashing.
 
@@ -223,9 +239,12 @@ Secrets never live here — `muse`/`codex` own their credentials
 
 ```toml
 [polyforge]
-provider = "muse"   # default backend for fresh tabs: muse | codex | agy | grok | mock
+provider = "muse"   # default backend for fresh tabs: muse | codex | agy | grok | claude | mock (unset = ask at launch)
 # workspace = "/path"  # default: the directory you launched from
 # vim = false  # vim keymap (j/k/g/G/i/a); /vim toggles it live and saves here
+
+[ui]
+# theme = "groknight"  # groknight (default) | tokyonight (+ dark/tokyo aliases); /theme switches live and saves here
 
 [muse]
 # bin = "muse"
@@ -244,18 +263,24 @@ provider = "muse"   # default backend for fresh tabs: muse | codex | agy | grok 
 [grok]
 # bin = "grok"
 # model = "grok-4.1"  # omitted = server default (session/set_config_option)
+
+[claude]
+# bin = "claude"
+# model = "opus"                   # omitted = Claude Code default (--model)
+# permission_mode = "acceptEdits"  # omitted = your Claude settings' default; unallowed tools ask y/n
 ```
 
 Environment overrides (checked before the file): `POLYFORGE_MUSE_BIN`,
 `POLYFORGE_MUSE_PROVIDER`, `POLYFORGE_CODEX_BIN`, `POLYFORGE_CODEX_MODEL`,
-`POLYFORGE_AGY_BIN`, `POLYFORGE_GROK_BIN`, `POLYFORGE_GROK_MODEL`.
+`POLYFORGE_AGY_BIN`, `POLYFORGE_GROK_BIN`, `POLYFORGE_GROK_MODEL`,
+`POLYFORGE_CLAUDE_BIN`.
 
 ## 9. First-run smoke test
 
 Needs a Muse login + quota:
 
 ```sh
-cargo run            # provider defaults to muse/meta
+cargo run            # first launch: pick a provider (2 = muse)
 # i → "reply with exactly: forge-ok" → Enter
 ```
 
@@ -271,7 +296,7 @@ alternative: `provider = "mock"` exercises tabs, search, picker,
 | `muse: not logged in — run \`muse login\`` | Backend unavailable; tab still navigable. Log in and `P` → respawn. |
 | `host not running — press P to respawn` | The provider host died or never started; respawn retries bringup. |
 | `…: resume failed (…) — started fresh` | Stored remote id was stale (server forgot it); you got a new session, history intact. |
-| `no previous sessions yet` | `/sessions` with an empty store. Send something first. |
+| `no previous sessions in this workspace` | `/sessions` with no stored sessions for this directory. Send something first. |
 | `can't close the last tab` | By design — `R` starts it fresh. |
 | `already 3 tabs (max)` | Prototype cap; close one first. |
 | agy tab never answers | `agy` needs a localhost listener; sandboxed/network-restricted environments deny it. |

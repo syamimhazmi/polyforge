@@ -6,6 +6,7 @@
 
 mod agy;
 mod app;
+mod claude;
 mod clipboard;
 mod codex;
 mod config;
@@ -14,6 +15,7 @@ mod mock;
 mod msp;
 mod provider;
 mod store;
+mod theme;
 mod typesafe;
 mod ui;
 
@@ -29,8 +31,14 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc;
 
-use agy::{AGY_NO_MODAL_WARNING, AgyHandle, agy_submit, apply_agy_notif, push_agy_open_notice, spawn_agy};
+use agy::{
+    AGY_NO_MODAL_WARNING, AgyHandle, agy_submit, apply_agy_notif, push_agy_open_notice, spawn_agy,
+};
 use app::{App, BackendKind, DecisionKind, Mode, OutboxDecide};
+use claude::{
+    ClaudeChildren, apply_claude_notif, claude_frame_matches, claude_send, claude_submit,
+    map_claude_decision, queue_claude_frame, spawn_claude,
+};
 use codex::{
     apply_codex_approval, apply_codex_notif, codex_bringup, codex_respond, codex_resume_thread,
     codex_start_thread, map_codex_decision,
@@ -85,6 +93,12 @@ struct Backends {
     grok_tx: Option<mpsc::Sender<ServerMsg>>,
     /// One agy child per tab (each holds its own conversation).
     agy: Vec<Option<AgyHandle>>,
+    /// One claude child per tab, keyed by session id.
+    claude: ClaudeChildren,
+    /// Shared event sender for claude children (set at boot).
+    claude_tx: Option<mpsc::Sender<ServerMsg>>,
+    /// Next spawn id. Default 0; each `spawn_claude` takes the next value.
+    claude_generation: u64,
 }
 
 impl Backends {
@@ -93,7 +107,7 @@ impl Backends {
             BackendKind::Muse => self.muse.as_ref(),
             BackendKind::Codex => self.codex.as_ref(),
             BackendKind::Grok => self.grok.as_ref(),
-            BackendKind::Mock | BackendKind::Agy => None,
+            BackendKind::Mock | BackendKind::Agy | BackendKind::Claude => None,
         }
     }
 }
@@ -208,8 +222,8 @@ async fn ensure_host(
         BackendKind::Muse => backends.muse.is_some(),
         BackendKind::Codex => backends.codex.is_some(),
         BackendKind::Grok => backends.grok.is_some(),
-        // Agy children are per-tab (see open_tab_session); nothing shared.
-        BackendKind::Agy | BackendKind::Mock => true,
+        // Agy/claude children are per-tab (see open_tab_session).
+        BackendKind::Agy | BackendKind::Claude | BackendKind::Mock => true,
     };
     if present {
         return Ok(());
@@ -265,7 +279,7 @@ async fn ensure_host(
         }
         // Agy is unreachable here (the respawn drain routes it to
         // open_tab_session first); keep the total match honest.
-        BackendKind::Agy | BackendKind::Mock => Ok(()),
+        BackendKind::Agy | BackendKind::Claude | BackendKind::Mock => Ok(()),
     }
 }
 
@@ -484,6 +498,46 @@ async fn open_tab_session(
                 }
             }
         }
+        BackendKind::Claude => {
+            // Resume keeps the stored id; fresh picks one up front so
+            // every frame routes by session_id from the first line.
+            // Another tab already holding this resume id must keep its
+            // child: removing the map entry would kill that tab.
+            let resumed = resume.is_some();
+            if let Some(ref resume_id) = resume {
+                if claude_id_open_elsewhere(app, tab, resume_id) {
+                    fail(app, "session is open in another tab — /tab close it first");
+                    return;
+                }
+            }
+            let id = resume.unwrap_or_else(msp::uuid7);
+            if let Some(old) = backends.claude.remove(&id) {
+                old.shutdown().await;
+            }
+            let Some(tx) = backends.claude_tx.clone() else {
+                fail(app, "claude event channel not ready");
+                return;
+            };
+            backends.claude_generation = backends.claude_generation.saturating_add(1);
+            let generation = backends.claude_generation;
+            match spawn_claude(
+                &cfg.claude_bin(),
+                &cfg.claude_args(),
+                &workspace,
+                &id,
+                resumed,
+                generation,
+                tx,
+            )
+            .await
+            {
+                Ok(h) => {
+                    backends.claude.insert(id.clone(), h);
+                    opened(app, id, resumed);
+                }
+                Err(e) => fail(app, &format!("could not spawn `claude`: {e}")),
+            }
+        }
     }
 }
 
@@ -495,6 +549,9 @@ async fn run(
     let def = cfg.default_backend();
     // Keymap is remembered in the config file (`/vim` toggles + saves).
     app.vim = cfg.polyforge.vim;
+    // Theme likewise (`/theme` switches + saves; typos fall back).
+    app.theme = cfg.theme_kind();
+    app.workspace = cfg.workspace_root();
     // Fresh boot: exactly one tab with a NEW session id (previous sessions
     // stay on disk for `/sessions`). Storageless falls back to no store.
     if let Some(store) = store::Store::open() {
@@ -507,15 +564,35 @@ async fn run(
         }
     }
 
+    // First run: no provider saved yet. Ask before bringing anything up;
+    // the choice queues the tab's respawn (drain_outbox starts the host).
+    if cfg.polyforge.provider.is_none() {
+        app.onboarding = true;
+        app.picker_sel = BackendKind::ALL
+            .iter()
+            .position(|(b, _)| *b == def)
+            .unwrap_or(0);
+        app.mode = Mode::Picker;
+    }
+
     let mut backends = Backends::default();
     // TypeSafe: optional. Missing key leaves approvals unscored.
     let typesafe = typesafe::Client::from_env();
     let (risk_tx, mut risk_rx) = mpsc::channel::<RiskMsg>(32);
     // One shared channel for all agy tab children.
     let (agy_tx, mut agy_rx) = mpsc::channel::<ServerMsg>(256);
+    // Likewise for claude tab children.
+    let (claude_tx, mut claude_rx) = mpsc::channel::<ServerMsg>(256);
+    backends.claude_tx = Some(claude_tx);
     // Bring up every shared host actually needed (not just the configured
-    // default). Grey-out only the backends whose ensure fails.
-    for kind in App::backends_needed(&app.sessions) {
+    // default). Grey-out only the backends whose ensure fails. Onboarding
+    // skips this: nothing is chosen yet.
+    let boot_tabs = if app.onboarding {
+        0
+    } else {
+        app.sessions.len()
+    };
+    for kind in App::backends_needed(&app.sessions[..boot_tabs]) {
         if matches!(
             kind,
             BackendKind::Muse | BackendKind::Codex | BackendKind::Grok
@@ -525,7 +602,7 @@ async fn run(
             }
         }
     }
-    for tab in 0..app.sessions.len() {
+    for tab in 0..boot_tabs {
         let kind = app.sessions[tab].backend;
         // Host already greyed out: skip so we don't clobber the ensure error.
         if matches!(
@@ -651,6 +728,23 @@ async fn run(
                     dirty = true;
                 }
             }
+            claude_msg = claude_rx.recv() => {
+                if let Some(msg) = claude_msg {
+                    let mut bell = false;
+                    if claude_frame_current(&backends, &msg) {
+                        bell = handle_server_msg(app, BackendKind::Claude, msg);
+                    }
+                    while let Ok(m) = claude_rx.try_recv() {
+                        if claude_frame_current(&backends, &m) {
+                            bell |= handle_server_msg(app, BackendKind::Claude, m);
+                        }
+                    }
+                    if bell {
+                        ring_bell();
+                    }
+                    dirty = true;
+                }
+            }
             risk_msg = risk_rx.recv() => {
                 if let Some(msg) = risk_msg {
                     apply_risk_msg(app, msg);
@@ -745,6 +839,9 @@ async fn run(
             h.shutdown().await;
         }
     }
+    for (_, h) in backends.claude.drain() {
+        h.shutdown().await;
+    }
     Ok(())
 }
 
@@ -778,6 +875,28 @@ fn backend_frame(
         bell |= handle_server_msg(app, kind, m);
     }
     bell
+}
+
+/// True when some tab other than `tab` already holds this Claude remote id.
+fn claude_id_open_elsewhere(app: &App, tab: usize, resume_id: &str) -> bool {
+    app.sessions
+        .iter()
+        .enumerate()
+        .any(|(i, s)| i != tab && s.remote_id.as_deref() == Some(resume_id))
+}
+
+/// Notif and Request apply only when `generation` is the live child's.
+/// Transport has no generation and still applies.
+fn claude_frame_current(backends: &Backends, msg: &ServerMsg) -> bool {
+    let params = match msg {
+        ServerMsg::Transport(_) => return true,
+        ServerMsg::Notif { params, .. } | ServerMsg::Request { params, .. } => params,
+    };
+    let live = params
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .and_then(|id| backends.claude.get(id).map(|h| h.generation));
+    claude_frame_matches(live, params["generation"].as_u64())
 }
 
 fn handle_server_msg(app: &mut App, kind: BackendKind, msg: ServerMsg) -> bool {
@@ -817,7 +936,7 @@ fn handle_server_msg(app: &mut App, kind: BackendKind, msg: ServerMsg) -> bool {
                 // session are dropped, never attributed to the active
                 // tab — a wrong-tab approval modal is worse than a
                 // dropped transcript line.
-                (BackendKind::Muse | BackendKind::Codex, _) => {
+                (BackendKind::Muse | BackendKind::Codex | BackendKind::Claude, _) => {
                     match tab_for_session(app, kind, &params) {
                         Some(tab) => tab,
                         None => return false,
@@ -830,6 +949,7 @@ fn handle_server_msg(app: &mut App, kind: BackendKind, msg: ServerMsg) -> bool {
                 BackendKind::Codex => apply_codex_notif(app, tab, &method, &params),
                 BackendKind::Grok => apply_grok_notif(app, tab, &method, &params),
                 BackendKind::Agy => apply_agy_notif(app, tab, &method, &params),
+                BackendKind::Claude => apply_claude_notif(app, tab, &method, &params),
                 BackendKind::Mock => false,
             }
         }
@@ -889,6 +1009,7 @@ fn tab_for_session(app: &App, kind: BackendKind, params: &serde_json::Value) -> 
         BackendKind::Muse | BackendKind::Grok => &["sessionId"],
         BackendKind::Codex => &["threadId", "conversationId"],
         BackendKind::Agy => &["conversation_id"],
+        BackendKind::Claude => &["session_id"],
         BackendKind::Mock => return None,
     };
     let sid = keys.iter().filter_map(|k| params.get(k)?.as_str()).next()?;
@@ -915,6 +1036,14 @@ async fn drain_outbox(
     agy_tx: &mpsc::Sender<ServerMsg>,
 ) -> bool {
     let mut did = false;
+    // Kill replaced/closed claude children before respawns: a re-attach
+    // of the same session id must not be killed after it spawns.
+    for id in std::mem::take(&mut app.pending_claude_kill) {
+        did = true;
+        if let Some(h) = backends.claude.remove(&id) {
+            h.shutdown().await;
+        }
+    }
     while let Some(r) = app.outbox.respawns.pop() {
         did = true;
         if r.backend == BackendKind::Agy {
@@ -950,6 +1079,22 @@ async fn drain_outbox(
             }
             continue;
         }
+        if sub.backend == BackendKind::Claude {
+            let handle = app.sessions[sub.tab]
+                .remote_id
+                .as_ref()
+                .and_then(|id| backends.claude.get(id));
+            let err = match handle {
+                Some(h) => claude_submit(h, sub.prompt).await.err(),
+                None => Some("no session for this tab — press P to respawn".to_string()),
+            };
+            if let Some(e) = err {
+                let s = &mut app.sessions[sub.tab];
+                s.busy = false;
+                s.push_line(format!("{tag}: {e}"));
+            }
+            continue;
+        }
         if sub.backend == BackendKind::Agy {
             let handle = backends.agy.get(sub.tab).and_then(|o| o.as_ref());
             match handle {
@@ -982,7 +1127,10 @@ async fn drain_outbox(
                         .await
                         .map_err(|e| e.to_string()),
                     // Grok exits via the spawned early-continue above.
-                    BackendKind::Mock | BackendKind::Agy | BackendKind::Grok => Ok(()),
+                    BackendKind::Mock
+                    | BackendKind::Agy
+                    | BackendKind::Grok
+                    | BackendKind::Claude => Ok(()),
                 };
                 if let Err(e) = res {
                     let s = &mut app.sessions[sub.tab];
@@ -1036,6 +1184,18 @@ async fn drain_outbox(
             }
             continue;
         }
+        // Claude answers go to the child named by the queued session id.
+        if d.backend == BackendKind::Claude {
+            let frame = serde_json::from_str(&d.choice_id).unwrap_or_default();
+            let err = match backends.claude.get(&d.approval_id) {
+                Some(h) => claude_send(h, frame).await.err(),
+                None => Some("claude session ended".to_string()),
+            };
+            if let Some(e) = err {
+                app.flash = format!("claude: decide failed: {e}");
+            }
+            continue;
+        }
         let sid = app.sessions[d.tab].remote_id.clone();
         let host = backends.get(d.backend).map(|c| &c.host);
         match (host, sid) {
@@ -1044,7 +1204,9 @@ async fn drain_outbox(
                     BackendKind::Muse => {
                         muse_decide(host, &id, &d).await.map_err(|e| e.to_string())
                     }
-                    BackendKind::Codex | BackendKind::Grok => unreachable!("handled above"),
+                    BackendKind::Codex | BackendKind::Grok | BackendKind::Claude => {
+                        unreachable!("handled above")
+                    }
                     BackendKind::Mock | BackendKind::Agy => Ok(()),
                 };
                 if let Err(e) = res {
@@ -1209,6 +1371,25 @@ fn decide_ui(app: &mut App, kind: DecisionKind, label: &str) {
                 }
             }
         }
+        BackendKind::Claude => {
+            if let Some(a) = app.active().pending_approval.clone() {
+                let sid = a.requirement_id["session_id"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                let frame = map_claude_decision(&a, kind);
+                let once = frame
+                    .pointer("/response/response/updatedPermissions")
+                    .is_none();
+                queue_claude_frame(app, tab, &sid, frame);
+                if matches!(kind, DecisionKind::ApproveAll) && once {
+                    app.flash = "claude: no 'always' rule offered — allowed once".to_string();
+                }
+            }
+            if app.approved("claude", label) {
+                ring_bell();
+            }
+        }
         BackendKind::Agy => {
             // Agy has no interactive approvals (vendor policy decides); the
             // modal can never appear, so any key here just ensures closure.
@@ -1216,6 +1397,25 @@ fn decide_ui(app: &mut App, kind: DecisionKind, label: &str) {
                 "agy: approvals aren't interactive — vendor policy decides (see transcript)"
                     .to_string();
         }
+    }
+}
+
+/// Picker Esc: back to Normal, or quit during onboarding (no backend yet).
+fn cancel_picker(app: &mut App) {
+    if app.onboarding {
+        app.should_quit = true;
+    } else {
+        app.mode = Mode::Normal;
+    }
+}
+
+/// Picker choice: onboarding starts the tab + saves the provider;
+/// otherwise the tab respawns fresh on the new backend.
+fn pick_backend(app: &mut App, backend: BackendKind) {
+    if app.onboarding {
+        app.choose_first_backend(backend);
+    } else {
+        app.respawn_active(backend);
     }
 }
 
@@ -1453,9 +1653,13 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             }
             _ => {}
         },
+        // First-run picker (onboarding): nothing to cancel back to, so
+        // the exits quit and a choice starts the tab instead of respawning.
         Mode::Picker => match code {
-            KeyCode::Esc => app.mode = Mode::Normal,
-            KeyCode::Char('[') if ctrl => app.mode = Mode::Normal,
+            KeyCode::Esc => cancel_picker(app),
+            KeyCode::Char('[') if ctrl => cancel_picker(app),
+            KeyCode::Char('c') if ctrl && app.onboarding => app.should_quit = true,
+            KeyCode::Char('q') if no_mods && app.onboarding => app.should_quit = true,
             KeyCode::Char('j') | KeyCode::Down if no_mods => {
                 app.picker_sel = (app.picker_sel + 1) % BackendKind::ALL.len();
             }
@@ -1463,13 +1667,10 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 app.picker_sel =
                     (app.picker_sel + BackendKind::ALL.len() - 1) % BackendKind::ALL.len();
             }
-            KeyCode::Enter => {
-                let (backend, _) = BackendKind::ALL[app.picker_sel];
-                app.respawn_active(backend);
-            }
+            KeyCode::Enter => pick_backend(app, BackendKind::ALL[app.picker_sel].0),
             KeyCode::Char(c) if no_mods && ['1', '2', '3', '4', '5'].contains(&c) => {
                 let i = (c as usize - '1' as usize).min(BackendKind::ALL.len() - 1);
-                app.respawn_active(BackendKind::ALL[i].0);
+                pick_backend(app, BackendKind::ALL[i].0);
             }
             _ => {}
         },
@@ -1578,6 +1779,31 @@ mod tests {
         })
         .await
         .expect("cancelled response did not reach host");
+    }
+
+    #[test]
+    fn claude_resume_sees_remote_id_open_on_another_tab() {
+        let mut app = App::new();
+        app.sessions[0].backend = BackendKind::Claude;
+        app.sessions[0].remote_id = Some("live-claude".into());
+        app.open_tab();
+        assert!(!claude_id_open_elsewhere(&app, 0, "live-claude"));
+        assert!(claude_id_open_elsewhere(&app, 1, "live-claude"));
+        assert!(!claude_id_open_elsewhere(&app, 1, "other"));
+    }
+
+    #[test]
+    fn claude_frame_current_drops_unmatched_and_keeps_transport() {
+        let backends = Backends::default();
+        let exit = ServerMsg::Notif {
+            method: "claude/exit".into(),
+            params: serde_json::json!({"session_id": "sid", "generation": 1}),
+        };
+        assert!(!claude_frame_current(&backends, &exit));
+        assert!(claude_frame_current(
+            &backends,
+            &ServerMsg::Transport("dropped line".into())
+        ));
     }
 
     #[test]
@@ -1996,6 +2222,22 @@ mod tests {
         assert!(app.outbox.respawns.is_empty());
     }
 
+    /// Onboarding picker: j/k still move, but Esc (and q) quit — there
+    /// is no backend to cancel back to.
+    #[test]
+    fn onboarding_picker_exits_quit() {
+        for key in [KeyCode::Esc, KeyCode::Char('q')] {
+            let mut app = App::new();
+            app.onboarding = true;
+            app.mode = Mode::Picker;
+            handle_key(&mut app, KeyCode::Char('j'), NONE);
+            assert_eq!(app.picker_sel, 1);
+            handle_key(&mut app, key, NONE);
+            assert!(app.should_quit, "{key:?} quits during onboarding");
+            assert!(app.outbox.respawns.is_empty());
+        }
+    }
+
     /// Agy submit queues unconditionally (no session id needed up front;
     /// the drain writes into the tab child's stdin).
     #[test]
@@ -2217,7 +2459,7 @@ mod tests {
         handle_key(&mut app, KeyCode::Char('/'), NONE);
         handle_key(&mut app, KeyCode::Char('t'), NONE);
         assert_eq!(app.active().input, "/t");
-        assert_eq!(app.slash_matches().len(), 2);
+        assert_eq!(app.slash_matches().len(), 3);
         handle_key(&mut app, KeyCode::Down, NONE);
         assert_eq!(app.cmd_sel, 1);
         handle_key(&mut app, KeyCode::Up, NONE);

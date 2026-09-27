@@ -11,6 +11,7 @@ One tab = one agent session. Built with Rust (`ratatui` + `crossterm` +
 | `codex` | OpenAI Codex via `codex app-server` |
 | `agy` | Antigravity via `agy` stream-json |
 | `grok` | Grok via `grok agent stdio` (ACP) |
+| `claude` | Claude Code via `claude -p` stream-json |
 | `mock` | Offline fake for UI work (no quota) |
 
 > Prototype. Interaction model and agent wiring are the focus — not a
@@ -24,6 +25,9 @@ Full operator guide: [`docs/USER-MANUAL.md`](docs/USER-MANUAL.md).
 cargo run
 ```
 
+Empty tabs open on a welcome dashboard (logo, backend status, workspace,
+theme, keymap, first keys); the first transcript line replaces it.
+
 Needs a real tty (alternate screen + mouse). Inside tmux: wheel and
 `Ctrl-u/d` scroll the TUI viewport — tmux copy-mode is never involved.
 
@@ -33,7 +37,7 @@ Needs a real tty (alternate screen + mouse). Inside tmux: wheel and
 | ---- | ---- |
 | NORMAL (default keys) | arrows line · `PgUp/PgDn` half-page · `Home/End` top/bottom · `/` search · `n/N` next/prev · `Space`/`Enter` insert · digits/`Tab` tabs · `P` provider · `R` fresh session · `m` mouse toggle · `q` quit |
 | NORMAL·vim (`/vim`) | `j/k` line · `Ctrl-u/d` half-page · `g`/`G` top/bottom · `Space`/`i`/`a` insert (rest as above; `Enter` does nothing) |
-| INSERT | type · `←/→` move · `Enter` send · `Esc`/`Ctrl-[` normal · `/sessions` `/new` `/tab new` `/tab close` `/vim` `/help` commands |
+| INSERT | type · `←/→` move · `Enter` send · `Esc`/`Ctrl-[` normal · `/sessions` `/new` `/tab new` `/tab close` `/theme` `/vim` `/help` commands |
 | SEARCH | `Enter` find · `Esc` cancel |
 | PICKER | `j/k` move · `Enter` switch · `1-5` quick · `Esc` cancel |
 | SESSIONS | `j/k` move · `Enter` view + continue · `d` delete · `1-9` quick · `Esc` cancel |
@@ -46,13 +50,17 @@ to highlight; releasing copies via native clipboard + tmux buffer + OSC 52
 
 ## Config
 
-`~/.config/polyforge/config.toml` (defaults to `muse` when absent):
+`~/.config/polyforge/config.toml`. On first launch (no `provider` set)
+polyforge asks you to pick a provider and saves the choice here:
 
 ```toml
 [polyforge]
-provider = "muse"   # default backend: muse | codex | agy | grok | mock
+provider = "muse"   # default backend: muse | codex | agy | grok | claude | mock (unset = ask at launch)
 # workspace = "/path"  # default: cwd
 # vim = false  # vim keymap (j/k/g/G/i/a); toggled live with /vim (saves here)
+
+[ui]
+# theme = "groknight"  # groknight (default) | tokyonight; /theme switches live and saves here
 
 [muse]
 # bin = "muse"
@@ -71,6 +79,11 @@ provider = "muse"   # default backend: muse | codex | agy | grok | mock
 [grok]
 # bin = "grok"
 # model = "grok-4.1"  # omitted = server default (session/set_config_option)
+
+[claude]
+# bin = "claude"
+# model = "opus"                   # omitted = Claude Code default (--model)
+# permission_mode = "acceptEdits"  # omitted = your Claude settings' default; unallowed tools ask y/n
 ```
 
 Press `P` on any tab for the provider picker (`j/k` + `Enter`, `1-5`
@@ -101,6 +114,7 @@ Missing key: approvals work unscored.
 | `codex` | `codex app-server`, one thread per tab. Approvals answer `approved` / `approved_for_session` / `denied` (`accept*` when offered). Mid-turn writes and guardian reviews render as one-liners. |
 | `agy` | One `agy` child per tab (stream-json). Visible but ungated: no interactive approval modal — workspace writes auto-allow, Ask-actions soft-deny (stderr notices in the transcript). |
 | `grok` | One shared `grok agent stdio` host (ACP), one session per tab. Chunks / thoughts / tools / plans stream; `session/request_permission` → y/n/a/q mapped to ACP option kinds; `q` and unsupported requests answer `cancelled`. |
+| `claude` | One `claude -p` child per tab (`--input-format/--output-format stream-json`), session id chosen up front (`--session-id`, resumed with `--resume`). Text and tool calls render; failed tool results and permission denials show in the transcript; `result` ends the turn with a bell. Tools your Claude settings don't pre-allow raise the y/n/a/q modal (`--permission-prompt-tool stdio`); `a` applies Claude's suggested "don't ask again" rule. |
 
 No login: tabs stay navigable and show the fix (`muse login`, `codex login`,
 or sign in via `grok`). A failed host greys out only that backend.
@@ -109,18 +123,20 @@ or sign in via `grok`). A failed host greys out only that backend.
 
 Boot opens ONE tab with a FRESH session. Transcripts append to
 `$XDG_DATA_HOME/polyforge/sessions/sess-{id}.jsonl` (capped at 50k lines)
-plus `sess-{id}.meta.json` (backend, remote id, timestamps, title).
+plus `sess-{id}.meta.json` (backend, remote id, timestamps, title, workspace).
 
 Session management follows the grok CLI shape:
 
-- `/sessions [query]` — list most-active-first; query filters like search
+- `/sessions [query]` — list this workspace's sessions only, grouped by
+  provider (active tab's first), most-active-first; query filters like search
 - `Enter` — replay transcript + re-attach remote (`session/resume` /
   `thread/resume` / `--conversation`; failed resume starts fresh and says so)
 - `d` — delete stored session (refused while open in a live tab)
 - `/new` or `R` — fresh session in the active tab (same backend)
 - `/tab new` — new tab (max 3, same backend as current)
 - `/tab close` — kill the tab's session (agy child killed; grok best-effort
-  `session/close`; muse/codex remotes abandoned, transcript kept)
+  `session/close`; claude child killed; muse/codex remotes abandoned,
+  transcript kept)
 
 The last tab cannot be closed — `R` starts it fresh instead.
 
@@ -129,7 +145,7 @@ The last tab cannot be closed — `R` starts it fresh instead.
 Needs Muse login + quota (or switch provider):
 
 ```sh
-cargo run            # provider defaults to muse/meta
+cargo run            # first launch: pick a provider (2 = muse)
 # i → "reply with exactly: forge-ok" → Enter
 ```
 

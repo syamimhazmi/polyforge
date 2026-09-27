@@ -38,6 +38,11 @@ pub struct SessionMeta {
     pub updated_at: u64,
     /// First user prompt, truncated (display only).
     pub title: String,
+    /// Workspace dir the session ran in; `/sessions` only lists sessions
+    /// of the current workspace. Metas written before this field load as
+    /// "" and match no real workspace.
+    #[serde(default)]
+    pub workspace: String,
 }
 
 /// One stored session for the `/sessions` chooser, newest activity first
@@ -223,10 +228,10 @@ impl Store {
         }
     }
 
-    /// Previous sessions, newest first (at most LIST_CAP). Sessions whose
-    /// meta is missing or unparsable are skipped; a missing transcript
-    /// previews as empty rather than dropping the entry.
-    pub fn list_sessions(&self) -> Vec<StoredSession> {
+    /// Previous sessions of `workspace`, newest first (at most LIST_CAP).
+    /// Sessions whose meta is missing or unparsable are skipped; a missing
+    /// transcript previews as empty rather than dropping the entry.
+    pub fn list_sessions(&self, workspace: &str) -> Vec<StoredSession> {
         let entries = fs::read_dir(&self.dir)
             .map(|rd| rd.filter_map(|e| e.ok()).collect::<Vec<_>>())
             .unwrap_or_default();
@@ -246,7 +251,7 @@ impl Store {
             let Ok(meta): Result<SessionMeta, _> = serde_json::from_str(&raw) else {
                 continue;
             };
-            if BackendKind::parse(&meta.backend).is_none() {
+            if BackendKind::parse(&meta.backend).is_none() || meta.workspace != workspace {
                 continue;
             }
             let preview = self
@@ -353,6 +358,7 @@ mod tests {
             created_at: 1_700_000_000_000,
             updated_at: 1_700_000_000_000,
             title: "hello".to_string(),
+            workspace: "/ws".to_string(),
         }
     }
 
@@ -450,6 +456,7 @@ mod tests {
                 created_at: 0,
                 updated_at: 0,
                 title: String::new(),
+                workspace: String::new(),
             },
         );
         assert!(store.load_meta("m").is_none());
@@ -475,7 +482,7 @@ mod tests {
         // Unparsable meta never surfaces; legacy tab files are ignored.
         fs::write(store.dir.join("sess-broken.meta.json"), "{nope").expect("write");
         fs::write(store.dir.join("tab0.meta.json"), "{}").expect("write");
-        let listed = store.list_sessions();
+        let listed = store.list_sessions("/ws");
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].id, "new");
         assert_eq!(listed[1].id, "old");
@@ -498,7 +505,7 @@ mod tests {
         assert!(!store.delete_session("gone"), "second delete is a no-op");
         assert!(!store.delete_session("../evil"));
         assert!(!store.delete_session(""));
-        assert!(!store.list_sessions().iter().any(|s| s.id == "gone"));
+        assert!(!store.list_sessions("/ws").iter().any(|s| s.id == "gone"));
     }
 
     #[test]
@@ -508,19 +515,8 @@ mod tests {
             assert!(assert_safe_id(good), "good id rejected: {good:?}");
         }
         for bad in [
-            "",
-            "..",
-            "../evil",
-            "..\\evil",
-            "a/b",
-            "/abs",
-            "a\\b",
-            "C:\\evil",
-            "evil\0",
-            "\0",
-            "a\0b",
-            "...",
-            "a..b",
+            "", "..", "../evil", "..\\evil", "a/b", "/abs", "a\\b", "C:\\evil", "evil\0", "\0",
+            "a\0b", "...", "a..b",
         ] {
             assert!(!assert_safe_id(bad), "traversal id accepted: {bad:?}");
         }
@@ -530,14 +526,7 @@ mod tests {
     fn traversal_ids_are_rejected_on_all_store_paths() {
         let (store, _g) = tmp_store();
         let bad_ids = [
-            "",
-            "..",
-            "../evil",
-            "..\\evil",
-            "a/b",
-            "a\\b",
-            "evil\0",
-            "a\0b",
+            "", "..", "../evil", "..\\evil", "a/b", "a\\b", "evil\0", "a\0b",
         ];
         for id in bad_ids {
             assert!(store.open_sink(id).is_none(), "sink opened for {id:?}");
@@ -548,11 +537,7 @@ mod tests {
             assert_eq!(store.first_line(id), None, "first line read for {id:?}");
             assert_eq!(store.load_meta(id), None, "meta loaded for {id:?}");
             store.save_meta(id, &test_meta());
-            assert_eq!(
-                store.load_meta(id),
-                None,
-                "meta persisted for {id:?}"
-            );
+            assert_eq!(store.load_meta(id), None, "meta persisted for {id:?}");
             assert!(!store.delete_session(id), "delete ran for {id:?}");
         }
         // Fail-closed means no files or subdirectories were created.
@@ -580,7 +565,7 @@ mod tests {
             serde_json::to_string(&test_meta()).expect("meta json"),
         )
         .expect("plant");
-        let listed = store.list_sessions();
+        let listed = store.list_sessions("/ws");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, "..");
         assert_eq!(listed[0].preview, "(no lines yet)");

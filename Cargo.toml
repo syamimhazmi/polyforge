@@ -2,7 +2,7 @@
 name = "polyforge"
 version = "0.1.0"
 edition = "2024"
-description = "Vim-modal multi-tab TUI for coding agents (muse, codex, agy, grok, mock)"
+description = "Vim-modal multi-tab TUI for coding agents (muse, codex, agy, grok, claude, mock)"
 
 [dependencies]
 ratatui = "0.29"

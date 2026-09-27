@@ -114,7 +114,7 @@ pub const TITLE_LEN: usize = 48;
 /// Slash commands available in Insert mode. The first element is the
 /// display template; `accept_slash_completion` inserts `insert` instead
 /// (e.g. `/sessions` completes to `/sessions ` so a query can follow).
-pub const SLASH_COMMANDS: [(&str, &str, &str); 6] = [
+pub const SLASH_COMMANDS: [(&str, &str, &str); 7] = [
     (
         "/sessions [query]",
         "/sessions ",
@@ -123,6 +123,7 @@ pub const SLASH_COMMANDS: [(&str, &str, &str); 6] = [
     ("/new", "/new", "fresh session in this tab"),
     ("/tab new", "/tab new", "open a tab (max 3)"),
     ("/tab close", "/tab close", "close this tab"),
+    ("/theme [name]", "/theme ", "switch theme (bare = next)"),
     ("/vim", "/vim", "toggle vim keymap"),
     ("/help", "/help", "command + key summary"),
 ];
@@ -259,10 +260,11 @@ pub enum BackendKind {
     Codex,
     Agy,
     Grok,
+    Claude,
 }
 
 impl BackendKind {
-    pub const ALL: [(BackendKind, &'static str); 5] = [
+    pub const ALL: [(BackendKind, &'static str); 6] = [
         (BackendKind::Mock, "mock — offline fake (no quota)"),
         (BackendKind::Muse, "muse — Muse Spark via `muse serve`"),
         (BackendKind::Codex, "codex — Codex via `codex app-server`"),
@@ -274,6 +276,10 @@ impl BackendKind {
             BackendKind::Grok,
             "grok — Grok via `grok agent stdio` (ACP)",
         ),
+        (
+            BackendKind::Claude,
+            "claude — Claude Code via `claude -p` (stream-json)",
+        ),
     ];
 
     pub fn label(self) -> &'static str {
@@ -283,6 +289,7 @@ impl BackendKind {
             BackendKind::Codex => "codex",
             BackendKind::Agy => "agy",
             BackendKind::Grok => "grok",
+            BackendKind::Claude => "claude",
         }
     }
 
@@ -295,6 +302,7 @@ impl BackendKind {
             "codex" => Some(BackendKind::Codex),
             "agy" => Some(BackendKind::Agy),
             "grok" => Some(BackendKind::Grok),
+            "claude" => Some(BackendKind::Claude),
             _ => None,
         }
     }
@@ -596,12 +604,25 @@ pub struct App {
     /// Vim keymap (j/k/g/G/i/a). Default off; `/vim` toggles + persists.
     /// Picker/sessions modals keep j/k either way (list navigation).
     pub vim: bool,
+    /// Active UI palette. Set from `[ui] theme` at boot; `/theme`
+    /// switches it live + persists. ui.rs resolves it per frame.
+    pub theme: crate::theme::ThemeKind,
+    /// Workspace root shown on the empty-tab welcome dashboard (set from
+    /// config at boot; empty hides the row).
+    pub workspace: String,
+    /// First run (no `[polyforge] provider` yet): boot opens the picker
+    /// and starts nothing until a provider is chosen. Esc quits instead
+    /// of cancelling — there is no backend to fall back to.
+    pub onboarding: bool,
     /// Closed agy tab indices awaiting child kill (main loop drains this;
     /// handles live there, not in App, because shutdown is async).
     pub pending_agy_kill: Vec<usize>,
     /// Closed grok ACP session ids awaiting server-side close (best-effort;
     /// ids, not indices, so later closes can't shift them).
     pub pending_grok_close: Vec<String>,
+    /// Claude session ids whose child must be killed (tab closed, switched
+    /// or re-attached). Ids, not indices, like grok.
+    pub pending_claude_kill: Vec<String>,
     /// Inner transcript rect (x, y, w, h) from the last render, for mouse
     /// cell → text mapping. None before the first frame.
     pub text_area: Option<(u16, u16, u16, u16)>,
@@ -636,7 +657,11 @@ impl App {
             sess_sel: 0,
             pending_agy_kill: Vec::new(),
             pending_grok_close: Vec::new(),
+            pending_claude_kill: Vec::new(),
             vim: false,
+            theme: crate::theme::ThemeKind::default(),
+            workspace: String::new(),
+            onboarding: false,
             text_area: None,
             sel: None,
         };
@@ -730,21 +755,23 @@ impl App {
         s.push_line(format!("> {prompt}"));
         match backend {
             BackendKind::Mock => crate::mock::start_job(s, &prompt),
-            BackendKind::Muse | BackendKind::Codex | BackendKind::Grok => match sid {
-                Some(_) => {
-                    s.busy = true;
-                    self.outbox.submits.push(OutboxSubmit {
-                        tab,
-                        backend,
-                        prompt,
-                    });
+            BackendKind::Muse | BackendKind::Codex | BackendKind::Grok | BackendKind::Claude => {
+                match sid {
+                    Some(_) => {
+                        s.busy = true;
+                        self.outbox.submits.push(OutboxSubmit {
+                            tab,
+                            backend,
+                            prompt,
+                        });
+                    }
+                    None => {
+                        let tag = backend.label();
+                        let why = degraded.unwrap_or_else(|| format!("{tag} session unavailable"));
+                        s.push_line(format!("{tag}: {why}"));
+                    }
                 }
-                None => {
-                    let tag = backend.label();
-                    let why = degraded.unwrap_or_else(|| format!("{tag} session unavailable"));
-                    s.push_line(format!("{tag}: {why}"));
-                }
-            },
+            }
             // Agy prompts queue into the tab's child stdin and run in turn
             // order; no session id is needed up front (init assigns it).
             BackendKind::Agy => {
@@ -803,7 +830,8 @@ impl App {
     }
 
     /// Slash commands (typed in Insert mode, never sent to a backend):
-    /// `/sessions [query]`, `/new`, `/tab new`, `/tab close`, `/vim`, `/help`.
+    /// `/sessions [query]`, `/new`, `/tab new`, `/tab close`, `/theme [name]`,
+    /// `/vim`, `/help`.
     pub fn run_command(&mut self, cmd: &str) {
         let mut parts = cmd.split_whitespace();
         match parts.next().unwrap_or("") {
@@ -827,10 +855,14 @@ impl App {
                 _ => self.flash = "usage: /tab new · /tab close".to_string(),
             },
             "/vim" => self.toggle_vim(),
+            "/theme" => {
+                let arg = parts.next().map(|s| s.to_string());
+                self.run_theme_command(arg);
+            }
             "/help" => self.show_help(),
             _ => {
                 self.flash =
-                    "unknown command — /sessions · /new · /tab new · /tab close · /vim · /help"
+                    "unknown command — /sessions · /new · /tab new · /tab close · /theme · /vim · /help"
                         .to_string()
             }
         }
@@ -860,6 +892,38 @@ impl App {
         }
     }
 
+    /// Switch the UI theme: `/theme <name>` applies it, bare `/theme`
+    /// cycles to the next palette. Persists to `[ui] theme` like `/vim`
+    /// so the choice sticks across runs; a failed save keeps the
+    /// in-memory theme and says so.
+    pub fn run_theme_command(&mut self, arg: Option<String>) {
+        let kind = match arg.as_deref() {
+            None => self.theme.cycle(),
+            Some(name) => match name.parse::<crate::theme::ThemeKind>() {
+                Ok(k) => k,
+                Err(e) => {
+                    self.flash = e;
+                    return;
+                }
+            },
+        };
+        self.theme = kind;
+        let mut cfg = crate::config::Config::load();
+        cfg.ui.theme = kind.name().to_string();
+        match cfg.save() {
+            Ok(()) => {
+                self.flash = format!(
+                    "theme {} (saved to {})",
+                    kind.name(),
+                    crate::config::Config::path().display()
+                );
+            }
+            Err(e) => {
+                self.flash = format!("theme {} (NOT saved: {e})", kind.name());
+            }
+        }
+    }
+
     /// Fill the `/sessions` chooser, most active first (grok's `sessions
     /// list` ordering). An optional query filters title + preview + id
     /// (grok's `sessions search`). Empty results flash instead of opening
@@ -871,7 +935,7 @@ impl App {
         };
         let q = query.trim().to_lowercase();
         self.sess_list = store
-            .list_sessions()
+            .list_sessions(&self.workspace)
             .into_iter()
             .filter(|s| {
                 q.is_empty()
@@ -880,9 +944,17 @@ impl App {
                     || s.id.to_lowercase().contains(&q)
             })
             .collect();
+        // Group by provider: the active tab's provider first, then picker
+        // order. Stable sort keeps most-active-first within each group.
+        let cur = self.active().backend;
+        self.sess_list.sort_by_key(|s| {
+            let b = BackendKind::parse(&s.backend).unwrap_or_default();
+            let pos = BackendKind::ALL.iter().position(|(k, _)| *k == b);
+            (b != cur, pos)
+        });
         if self.sess_list.is_empty() {
             self.flash = if q.is_empty() {
-                "no previous sessions yet".to_string()
+                "no previous sessions in this workspace".to_string()
             } else {
                 format!("no sessions match: {query}")
             };
@@ -933,12 +1005,26 @@ impl App {
         let Some(pick) = self.sess_list.get(idx).cloned() else {
             return;
         };
+        // Same-tab re-attach stays allowed. Another tab already showing
+        // this store id must keep its child (resume would kill it).
+        if let Some(open) =
+            self.sessions.iter().enumerate().position(|(i, s)| {
+                i != self.active && s.store_id.as_deref() == Some(pick.id.as_str())
+            })
+        {
+            self.flash = format!(
+                "session is open in {} — /tab close it first",
+                self.sessions[open].name
+            );
+            return;
+        }
         let tab = self.active;
         // Drop queued work for this tab; it belongs to the old session.
         self.outbox.submits.retain(|o| o.tab != tab);
         self.outbox.decides.retain(|o| o.tab != tab);
         self.outbox.respawns.retain(|o| o.tab != tab);
         self.agy_init_fifo.retain(|&t| t != tab);
+        self.queue_claude_kill(tab);
         let backend = BackendKind::parse(&pick.backend).unwrap_or_default();
         let store = self.store.as_ref().expect("chooser needs a store");
         // Re-read meta at choose time: the listing may predate another
@@ -1034,6 +1120,7 @@ impl App {
                 self.pending_grok_close.push(id);
             }
         }
+        self.queue_claude_kill(tab);
         // Flush before dropping the sink so the transcript keeps its tail.
         if let Some(sink) = self.sessions[tab].sink.as_mut() {
             use std::io::Write;
@@ -1087,6 +1174,7 @@ impl App {
             "  /new — fresh session in this tab (same as R)".to_string(),
             "  /tab new — open a tab (max 3), same backend as current".to_string(),
             "  /tab close — close this tab, killing its session".to_string(),
+            "  /theme [name] — switch theme, bare cycles (saved to config)".to_string(),
             "  /vim — toggle vim keymap (saved to config)".to_string(),
             format!("keys (Normal mode): {move_keys} · P provider · R fresh · q quit"),
         ] {
@@ -1124,6 +1212,7 @@ impl App {
                         created_at: s.created_at,
                         updated_at: s.updated_at,
                         title: s.title.clone(),
+                        workspace: self.workspace.clone(),
                     },
                 );
             }
@@ -1166,6 +1255,40 @@ impl App {
         }
     }
 
+    /// First-run provider choice: bring the still-empty tab up on it
+    /// (the welcome dashboard stays, no fresh-session marker) and save it
+    /// to `[polyforge] provider` so later runs skip the picker. A failed
+    /// save keeps the choice for this run and says so.
+    pub fn choose_first_backend(&mut self, backend: BackendKind) {
+        self.onboarding = false;
+        self.mode = Mode::Normal;
+        let tab = self.active;
+        self.sessions[tab].backend = backend;
+        self.save_tab_meta(tab);
+        self.outbox.respawns.push(OutboxRespawn { tab, backend });
+        let mut cfg = crate::config::Config::load();
+        cfg.polyforge.provider = Some(backend.label().to_string());
+        self.flash = match cfg.save() {
+            Ok(()) => format!(
+                "provider {} (saved to {}; P switches)",
+                backend.label(),
+                crate::config::Config::path().display()
+            ),
+            Err(e) => format!("provider {} (NOT saved: {e})", backend.label()),
+        };
+    }
+
+    /// Queue the tab's claude child (if any) for kill: its session is
+    /// being closed or replaced.
+    fn queue_claude_kill(&mut self, tab: usize) {
+        let s = &self.sessions[tab];
+        if s.backend == BackendKind::Claude {
+            if let Some(id) = s.remote_id.clone() {
+                self.pending_claude_kill.push(id);
+            }
+        }
+    }
+
     pub fn respawn_active(&mut self, backend: BackendKind) {
         let tab = self.active;
         // Drop queued work for this tab; it belongs to the old session.
@@ -1173,6 +1296,7 @@ impl App {
         self.outbox.decides.retain(|o| o.tab != tab);
         self.outbox.respawns.retain(|o| o.tab != tab);
         self.agy_init_fifo.retain(|&t| t != tab);
+        self.queue_claude_kill(tab);
         // Fresh session id on disk too (old files stay for `/sessions`).
         self.attach_fresh_store(tab);
         {
@@ -1464,6 +1588,15 @@ fn muse_mark(decision: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    /// Serializes the tests that mutate `XDG_CONFIG_HOME` (`/vim` and
+    /// `/theme` persistence): parallel mutation would redirect each
+    /// other's save/read mid-test.
+    static CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_config_env() -> std::sync::MutexGuard<'static, ()> {
+        CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     const VH: usize = 20; // fixed viewport
 
     fn bottom_app() -> App {
@@ -1522,6 +1655,7 @@ mod tests {
                 created_at: 1000,
                 updated_at: 2000,
                 title: "old title".to_string(),
+                workspace: String::new(),
             },
         );
         // Seed must be cleared; replayed lines start at index 0.
@@ -1560,6 +1694,43 @@ mod tests {
             "view banner must not grow JSONL"
         );
         let _ = std::fs::remove_dir_all(_dir);
+    }
+
+    #[test]
+    fn choose_session_refuses_store_id_open_on_another_tab() {
+        let (store, dir) = test_store("choose-open-tab");
+        let id = crate::store::Store::new_session_id();
+        store.save_meta(
+            &id,
+            &crate::store::SessionMeta {
+                backend: "claude".to_string(),
+                remote_id: Some("live-claude".to_string()),
+                created_at: 1000,
+                updated_at: 2000,
+                title: "live".to_string(),
+                workspace: String::new(),
+            },
+        );
+        let mut app = App::new();
+        app.store = Some(store);
+        app.sessions[0].backend = BackendKind::Claude;
+        app.sessions[0].store_id = Some(id.clone());
+        app.sessions[0].remote_id = Some("live-claude".to_string());
+        app.open_tab();
+        app.outbox.respawns.clear();
+        app.pending_claude_kill.clear();
+        app.open_session_chooser(String::new());
+        let row = app
+            .sess_list
+            .iter()
+            .position(|s| s.id == id)
+            .expect("saved row");
+        app.choose_session(row);
+        assert!(app.flash.contains("open in"));
+        assert!(app.pending_claude_kill.is_empty());
+        assert!(app.outbox.respawns.is_empty());
+        assert_eq!(app.sessions[0].remote_id.as_deref(), Some("live-claude"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1623,7 +1794,7 @@ mod tests {
         assert_eq!(fresh.len(), 1);
         assert!(fresh[0].starts_with("--- mock session (fresh) ---"));
         assert!(app.sessions[0].remote_id.is_none());
-        assert_eq!(store.list_sessions().len(), 2);
+        assert_eq!(store.list_sessions("").len(), 2);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1707,8 +1878,9 @@ mod tests {
 
     #[test]
     fn vim_command_toggles_and_persists() {
-        // Isolate the real config file: nothing else in this suite reads
-        // XDG_CONFIG_HOME, so a scoped override is race-free here.
+        // Isolate the real config file (serialized with the /theme
+        // persistence test via CONFIG_ENV_LOCK).
+        let _env = lock_config_env();
         let dir = std::env::temp_dir().join(format!("pf-vim-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let old = std::env::var_os("XDG_CONFIG_HOME");
@@ -1731,6 +1903,98 @@ mod tests {
         let raw = std::fs::read_to_string(dir.join("polyforge").join("config.toml"))
             .expect("config saved");
         assert!(raw.contains("vim = false"), "choice persisted: {raw}");
+        // SAFETY: restores the pre-test environment (see above).
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn theme_unknown_name_leaves_theme_and_lists_choices() {
+        let mut app = App::new();
+        let before = app.theme;
+        app.run_theme_command(Some("paper".to_string()));
+        assert_eq!(app.theme, before);
+        assert!(app.flash.contains("unknown theme"), "flash: {}", app.flash);
+        assert!(app.flash.contains("groknight"), "flash: {}", app.flash);
+    }
+
+    #[test]
+    fn theme_command_cycles_and_persists() {
+        // Same XDG isolation pattern as vim_command_toggles_and_persists
+        // (serialized via CONFIG_ENV_LOCK).
+        let _env = lock_config_env();
+        let dir = std::env::temp_dir().join(format!("pf-theme-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let old = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: nothing else in this suite reads XDG_CONFIG_HOME, and
+        // the original value is restored before this test returns.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+        let mut app = App::new();
+        assert_eq!(app.theme, crate::theme::ThemeKind::GrokNight);
+        // Bare /theme cycles to the next palette and saves it.
+        app.run_theme_command(None);
+        assert_eq!(app.theme, crate::theme::ThemeKind::TokyoNight);
+        assert!(
+            app.flash.contains("theme tokyonight"),
+            "flash: {}",
+            app.flash
+        );
+        let raw = std::fs::read_to_string(dir.join("polyforge").join("config.toml"))
+            .expect("config saved");
+        assert!(
+            raw.contains("theme = \"tokyonight\""),
+            "choice persisted: {raw}"
+        );
+        // Named /theme applies directly (alias accepted) and saves back.
+        app.run_theme_command(Some("dark".to_string()));
+        assert_eq!(app.theme, crate::theme::ThemeKind::GrokNight);
+        let raw = std::fs::read_to_string(dir.join("polyforge").join("config.toml"))
+            .expect("config saved");
+        assert!(
+            raw.contains("theme = \"groknight\""),
+            "choice persisted: {raw}"
+        );
+        // SAFETY: restores the pre-test environment (see above).
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn first_backend_choice_starts_tab_and_persists() {
+        // Same XDG isolation pattern as vim_command_toggles_and_persists.
+        let _env = lock_config_env();
+        let dir = std::env::temp_dir().join(format!("pf-first-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let old = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: serialized via CONFIG_ENV_LOCK; restored below.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+        let mut app = App::new();
+        app.onboarding = true;
+        app.mode = Mode::Picker;
+        app.choose_first_backend(BackendKind::Grok);
+        assert!(!app.onboarding);
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.active().backend, BackendKind::Grok);
+        assert!(app.active().lines.is_empty(), "welcome stays: no marker");
+        assert_eq!(app.outbox.respawns.len(), 1);
+        assert_eq!(app.outbox.respawns[0].backend, BackendKind::Grok);
+        assert!(app.flash.contains("provider grok"), "flash: {}", app.flash);
+        let cfg = crate::config::Config::load();
+        assert_eq!(cfg.polyforge.provider.as_deref(), Some("grok"));
         // SAFETY: restores the pre-test environment (see above).
         unsafe {
             match old {
@@ -1771,6 +2035,7 @@ mod tests {
                     created_at: 1000,
                     updated_at: 1000,
                     title: title.to_string(),
+                    workspace: String::new(),
                 },
             );
         }
@@ -1791,6 +2056,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(_dir);
     }
 
+    /// `/sessions` lists only this workspace's sessions, grouped by
+    /// provider with the active tab's provider first.
+    #[test]
+    fn sessions_scoped_to_workspace_and_grouped_by_provider() {
+        let (store, _dir) = test_store("sessions-group");
+        for (id, backend, updated, ws) in [
+            ("m-old", "mock", 1000u64, "/here"),
+            ("g-new", "grok", 4000, "/here"),
+            ("m-new", "mock", 3000, "/here"),
+            ("c-mid", "codex", 2000, "/here"),
+            ("elsewhere", "grok", 9000, "/there"),
+            ("legacy", "grok", 9000, ""),
+        ] {
+            store.save_meta(
+                id,
+                &crate::store::SessionMeta {
+                    backend: backend.to_string(),
+                    remote_id: None,
+                    created_at: 0,
+                    updated_at: updated,
+                    title: id.to_string(),
+                    workspace: ws.to_string(),
+                },
+            );
+        }
+        let mut app = App::new();
+        app.store = Some(store);
+        app.workspace = "/here".to_string();
+        app.active_mut().backend = BackendKind::Grok;
+        app.open_session_chooser(String::new());
+        let ids: Vec<&str> = app.sess_list.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["g-new", "m-new", "m-old", "c-mid"]);
+        let _ = std::fs::remove_dir_all(_dir);
+    }
+
     #[test]
     fn delete_selected_session_removes_and_guards_open() {
         let (store, _dir) = test_store("sessions-delete");
@@ -1803,6 +2103,7 @@ mod tests {
                 created_at: 1000,
                 updated_at: 1000,
                 title: "doomed".to_string(),
+                workspace: String::new(),
             },
         );
         let mut app = App::new();
@@ -1821,7 +2122,7 @@ mod tests {
         assert!(app.sess_list.is_empty());
         assert_eq!(app.mode, Mode::Normal, "empty chooser closes");
         let store = app.store.as_ref().expect("store");
-        assert!(store.list_sessions().is_empty());
+        assert!(store.list_sessions("").is_empty());
         let _ = std::fs::remove_dir_all(_dir);
     }
 
@@ -1843,6 +2144,7 @@ mod tests {
                 created_at: 1000,
                 updated_at: 1000,
                 title: "prior".to_string(),
+                workspace: String::new(),
             },
         );
         let mut app = App::new();
@@ -1930,14 +2232,14 @@ mod tests {
             .map(|&i| SLASH_COMMANDS[i].0)
             .collect();
         assert_eq!(names, vec!["/sessions [query]"]);
-        // "/t" narrows to the two /tab spellings.
+        // "/t" narrows to the /tab spellings + /theme.
         app.active_mut().input = "/t".to_string();
         let names: Vec<&str> = app
             .slash_matches()
             .iter()
             .map(|&i| SLASH_COMMANDS[i].0)
             .collect();
-        assert_eq!(names, vec!["/tab new", "/tab close"]);
+        assert_eq!(names, vec!["/tab new", "/tab close", "/theme [name]"]);
         app.active_mut().input = "/tab ".to_string();
         assert_eq!(app.slash_matches().len(), 2);
         app.active_mut().input = "/tab c".to_string();
@@ -1965,16 +2267,19 @@ mod tests {
     #[test]
     fn slash_cycle_wraps_and_accept_inserts() {
         let mut app = App::new();
+        // "/t" matches /tab new, /tab close, /theme [name].
         app.active_mut().input = "/t".to_string();
         app.cycle_cmd_sel(1);
         assert_eq!(app.cmd_sel, 1);
         app.cycle_cmd_sel(1);
+        assert_eq!(app.cmd_sel, 2, "third match (/theme)");
+        app.cycle_cmd_sel(1);
         assert_eq!(app.cmd_sel, 0, "wraps past the end");
         app.cycle_cmd_sel(-1);
-        assert_eq!(app.cmd_sel, 1, "wraps past the start");
+        assert_eq!(app.cmd_sel, 2, "wraps past the start");
         assert!(app.accept_slash_completion());
-        assert_eq!(app.active().input, "/tab close");
-        assert_eq!(app.active().cursor, "/tab close".chars().count());
+        assert_eq!(app.active().input, "/theme ");
+        assert_eq!(app.active().cursor, "/theme ".chars().count());
         // Sessions completes with a trailing space for the query.
         app.active_mut().input = "/s".to_string();
         assert!(app.accept_slash_completion());
@@ -2095,6 +2400,7 @@ mod tests {
                 created_at: 1000,
                 updated_at: 2000,
                 title: "wide".to_string(),
+                workspace: String::new(),
             },
         );
         let mut app = App::new();
