@@ -156,6 +156,7 @@ pub fn apply_notif(app: &mut App, tab: usize, method: &str, params: &Value) -> b
         "item/delta" => {
             if let Some(t) = msp::extract_text(params) {
                 let s = &mut app.sessions[tab];
+                s.set_phase(crate::activity::Phase::Responding);
                 for line in t.split('\n') {
                     if !line.is_empty() {
                         s.push_line(line.to_string());
@@ -178,6 +179,7 @@ pub fn apply_notif(app: &mut App, tab: usize, method: &str, params: &Value) -> b
                     .unwrap_or(false);
                 if !looks_like_prompt {
                     let s = &mut app.sessions[tab];
+                    s.set_phase(crate::activity::Phase::Responding);
                     for line in t.split('\n') {
                         if !line.is_empty() {
                             s.push_line(line.to_string());

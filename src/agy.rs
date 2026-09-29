@@ -186,6 +186,7 @@ pub fn apply_agy_notif(app: &mut App, tab: usize, method: &str, params: &Value) 
             match step_type {
                 "agent_response" => {
                     if let Some(t) = su.get("text_delta").and_then(|v| v.as_str()) {
+                        app.sessions[tab].set_phase(crate::activity::Phase::Responding);
                         push_text(app, tab, t);
                     }
                     false

@@ -223,16 +223,28 @@ pub fn apply_claude_notif(app: &mut App, tab: usize, method: &str, params: &Valu
                 match b.get("type").and_then(|t| t.as_str()) {
                     Some("text") => {
                         let t = b.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        let s = &mut app.sessions[tab];
+                        s.flush_thought();
+                        s.set_phase(crate::activity::Phase::Responding);
                         push_text(app, tab, t);
                     }
                     Some("tool_use") => {
+                        app.sessions[tab].flush_thought();
                         let name = b.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
                         let input = b.get("input").unwrap_or(&Value::Null);
                         let line =
                             truncate(&format!("claude {name}: {}", compact_params(input)), 300);
                         app.sessions[tab].push_line(line);
                     }
-                    _ => {} // thinking blocks: not shown
+                    // Thinking blocks feed the live thinking block.
+                    Some("thinking") => {
+                        let s = &mut app.sessions[tab];
+                        s.set_phase(crate::activity::Phase::Thinking);
+                        if let Some(t) = b.get("thinking").and_then(|v| v.as_str()) {
+                            s.push_thought(&format!("{t}\n"));
+                        }
+                    }
+                    _ => {}
                 }
             }
             if tab == app.active {
@@ -261,6 +273,7 @@ pub fn apply_claude_notif(app: &mut App, tab: usize, method: &str, params: &Valu
         }
         "claude/result" => {
             let s = &mut app.sessions[tab];
+            s.flush_thought();
             s.busy = false;
             if s.pending_approval.take().is_some() {
                 s.clear_diff();
@@ -303,6 +316,7 @@ pub fn apply_claude_notif(app: &mut App, tab: usize, method: &str, params: &Valu
         }
         "claude/exit" => {
             let s = &mut app.sessions[tab];
+            s.flush_thought();
             s.busy = false;
             if s.pending_approval.take().is_some() {
                 s.clear_diff();
@@ -513,6 +527,38 @@ mod tests {
         app.active_mut().backend = BackendKind::Claude;
         app.active_mut().remote_id = Some("sid-1".into());
         app
+    }
+
+    #[test]
+    fn thinking_text_is_live_then_collapses() {
+        let mut app = claude_app();
+        app.active_mut().busy = true;
+        let p = json!({"type": "assistant", "session_id": "sid-1", "message": {"content": [
+            {"type": "thinking", "thinking": "first idea\nsecond idea"},
+        ]}});
+        apply_claude_notif(&mut app, 0, "claude/assistant", &p);
+        let draft = app.active().stream_draft_lines();
+        assert_eq!(draft.len(), 3);
+        assert_eq!(draft[2], "  second idea");
+        assert!(app.active().lines.iter().all(|l| !l.contains("idea")));
+        let t = json!({"type": "assistant", "session_id": "sid-1", "message": {"content": [
+            {"type": "text", "text": "hi"},
+        ]}});
+        apply_claude_notif(&mut app, 0, "claude/assistant", &t);
+        let lines = &app.active().lines;
+        assert!(lines.iter().any(|l| l.starts_with("∴ Thought for ")));
+        assert!(lines.iter().all(|l| !l.contains("idea")));
+    }
+
+    #[test]
+    fn assistant_text_sets_responding_phase() {
+        let mut app = claude_app();
+        app.active_mut().busy = true;
+        let p = json!({"type": "assistant", "session_id": "sid-1", "message": {"content": [
+            {"type": "text", "text": "hi"},
+        ]}});
+        apply_claude_notif(&mut app, 0, "claude/assistant", &p);
+        assert_eq!(app.active().phase, Some(crate::activity::Phase::Responding));
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! approval/requested to the diff modal, turn/completed to the bell).
 //! Select via `~/.config/polyforge/config.toml` (`[polyforge] provider`).
 
+mod activity;
 mod agy;
 mod app;
 mod claude;
@@ -755,13 +756,18 @@ async fn run(
                 }
             }
             _ = ticker.tick() => {
-                // Mock streaming only; an idle TUI paints nothing.
+                // Mock streaming and the busy animation only; an idle TUI
+                // paints nothing.
                 if app.sessions.iter().any(|s| s.backend == BackendKind::Mock && s.busy)
                 {
                     if let Some(tab) = app.tick() {
                         ring_bell();
                         app.flash = format!("{tab} done ✓");
                     }
+                    dirty = true;
+                }
+                let a = app.active();
+                if a.busy && a.pending_diff.is_none() {
                     dirty = true;
                 }
             }
@@ -806,6 +812,9 @@ async fn run(
         }
         // Persist transcript lines toward disk (free when buffers are empty).
         app.flush_store();
+        for s in &mut app.sessions {
+            s.sync_activity();
+        }
         let due = last_draw.map(|t| t.elapsed() >= MIN_DRAW).unwrap_or(true);
         if dirty && due {
             terminal.draw(|f| ui::render(f, app))?;

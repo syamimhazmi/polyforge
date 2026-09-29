@@ -6,6 +6,11 @@
 pub const MAX_LINES: usize = 50_000;
 /// Assumed viewport width until the first render measures the real one.
 pub const DEFAULT_WIDTH: usize = 100;
+/// Live thought buffer cap (bytes; the tail is kept).
+const THOUGHT_CAP: usize = 4096;
+/// Thought lines shown in the live block, and the per-line display cap.
+const THOUGHT_LINES: usize = 3;
+const THOUGHT_LINE_CAP: usize = 240;
 
 /// Number of display rows `line` occupies at `width` (always ≥ 1).
 /// ASCII lines (the common case) skip the per-char width walk: every
@@ -396,12 +401,29 @@ pub struct Session {
     pub store_dirty: bool,
     /// Set when an agy child is spawned; cleared when `agy/init` lands.
     pub pending_agy_init: bool,
-    /// Live Grok thought body (no `grok: ∴` prefix). Mid-stream only;
-    /// committed via flush. Bounded; never written token-by-token to JSONL.
-    pub draft_thought: Option<String>,
+    /// Live thought text (any provider). Bounded to its tail; collapsed to
+    /// one `∴ Thought for Ns` line on flush, never persisted verbatim.
+    pub thought: String,
+    /// True once the head of `thought` was dropped to stay bounded.
+    pub thought_cut: bool,
+    /// When the first thought chunk of the current thought arrived.
+    pub thought_since: Option<std::time::Instant>,
+    /// (total rows incl. drafts, viewport rows) of the last drawn frame;
+    /// lets the renderer keep a bottom-pinned view pinned when the live
+    /// block or the turn-status row changes height. None until drawn.
+    pub last_geom: Option<(usize, usize)>,
     /// Open Grok answer line. Chunks append here; `\n` peels committed
     /// lines via `push_line`. Remainder flushes at turn/tool boundaries.
     pub draft_answer: String,
+    /// Current activity phase; Some only while busy.
+    pub phase: Option<crate::activity::Phase>,
+    /// Start of the current phase (status-bar timer).
+    pub phase_since: Option<std::time::Instant>,
+    /// Start of the turn (rail wave clock).
+    pub turn_since: Option<std::time::Instant>,
+    /// `lines.len()` when the turn was detected; lines at or past this
+    /// index belong to the live turn.
+    pub turn_first_line: usize,
 }
 
 impl Session {
@@ -433,25 +455,123 @@ impl Session {
             sink: None,
             store_dirty: false,
             pending_agy_init: false,
-            draft_thought: None,
+            thought: String::new(),
+            thought_cut: false,
+            thought_since: None,
+            last_geom: None,
             draft_answer: String::new(),
+            phase: None,
+            phase_since: None,
+            turn_since: None,
+            turn_first_line: 0,
         }
     }
 
-    /// Drop in-flight Grok stream drafts (tab reset / session replace).
+    /// Start or end the activity phase to match `busy` (`busy` is flipped
+    /// in many places; the main loop calls this once per iteration).
+    pub fn sync_activity(&mut self) {
+        if self.busy && self.phase.is_none() {
+            let now = std::time::Instant::now();
+            self.phase = Some(crate::activity::Phase::Thinking);
+            self.phase_since = Some(now);
+            self.turn_since = Some(now);
+            self.turn_first_line = self.lines.len();
+        } else if !self.busy && self.phase.is_some() {
+            // Catch-all for turn ends a provider did not flush itself.
+            self.flush_thought();
+            self.phase = None;
+            self.phase_since = None;
+            self.turn_since = None;
+        }
+    }
+
+    /// Switch the activity phase. Ignored while idle (late events).
+    pub fn set_phase(&mut self, p: crate::activity::Phase) {
+        if !self.busy {
+            return;
+        }
+        self.sync_activity();
+        if self.phase != Some(p) {
+            self.phase = Some(p);
+            self.phase_since = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Drop in-flight stream drafts (tab reset / session replace).
     pub fn clear_stream_drafts(&mut self) {
-        self.draft_thought = None;
+        self.thought.clear();
+        self.thought_cut = false;
+        self.thought_since = None;
         self.draft_answer.clear();
     }
 
-    /// Virtual trailing lines for the live thought + open answer (render).
-    pub fn stream_draft_lines(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        if let Some(t) = self.draft_thought.as_ref() {
-            if !t.is_empty() {
-                out.push(format!("grok: ∴ {t}"));
+    /// Append streamed thought text (word fragments, appended verbatim).
+    /// Ignored while idle (late events). Keeps only the last ~4 KB.
+    pub fn push_thought(&mut self, text: &str) {
+        let text = sanitize_text(text);
+        if !self.busy || text.is_empty() {
+            return;
+        }
+        self.set_phase(crate::activity::Phase::Thinking);
+        self.thought_since.get_or_insert_with(std::time::Instant::now);
+        self.thought.push_str(&text);
+        if self.thought.len() > THOUGHT_CAP {
+            let mut cut = self.thought.len() - THOUGHT_CAP;
+            while !self.thought.is_char_boundary(cut) {
+                cut += 1;
+            }
+            self.thought.drain(..cut);
+            self.thought_cut = true;
+        }
+    }
+
+    /// End the current thought: commit ONE `∴ Thought for Ns` line when any
+    /// thought text arrived, nothing otherwise.
+    pub fn flush_thought(&mut self) {
+        let since = self.thought_since.take();
+        let had = !self.thought.trim().is_empty();
+        self.thought.clear();
+        self.thought_cut = false;
+        if had {
+            let d = since.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+            self.push_line(format!("∴ Thought for {}", crate::activity::format_elapsed(d)));
+        }
+    }
+
+    /// Live thinking block (virtual, never persisted): spinner header, then
+    /// `…` if older text was cut, then the last 3 thought lines. Empty
+    /// unless the tab is busy, thinking and not waiting on a diff.
+    pub fn thought_block(&self) -> Vec<String> {
+        use crate::activity::{spinner_frame, Phase};
+        if !self.busy || self.phase != Some(Phase::Thinking) || self.pending_diff.is_some() {
+            return Vec::new();
+        }
+        let elapsed = self.turn_since.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+        let mut out = vec![format!("{} {}", spinner_frame(elapsed), Phase::Thinking.label())];
+        let lines: Vec<String> = self
+            .thought
+            .split('\n')
+            .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|l| !l.is_empty())
+            .collect();
+        if lines.len() > THOUGHT_LINES || (self.thought_cut && !lines.is_empty()) {
+            out.push("  …".to_string());
+        }
+        for l in &lines[lines.len().saturating_sub(THOUGHT_LINES)..] {
+            let n = l.chars().count();
+            if n > THOUGHT_LINE_CAP {
+                let tail: String = l.chars().skip(n - THOUGHT_LINE_CAP).collect();
+                out.push(format!("  …{tail}"));
+            } else {
+                out.push(format!("  {l}"));
             }
         }
+        out
+    }
+
+    /// Virtual trailing lines: live thinking block + open answer (render).
+    pub fn stream_draft_lines(&self) -> Vec<String> {
+        let mut out = self.thought_block();
         if !self.draft_answer.is_empty() {
             out.push(self.draft_answer.clone());
         }
@@ -514,6 +634,7 @@ impl Session {
         self.total_rows = total_rows;
         self.cache_width = Some(w);
         self.scroll = 0;
+        self.last_geom = None;
         self.clear_stream_drafts();
     }
 
@@ -1368,6 +1489,9 @@ impl App {
                     break;
                 }
             }
+            if pushed {
+                s.set_phase(crate::activity::Phase::Responding);
+            }
             if pushed && pinned {
                 s.scroll = s.total_rows.saturating_sub(vh);
             }
@@ -1598,6 +1722,120 @@ mod tests {
     }
 
     const VH: usize = 20; // fixed viewport
+
+    fn thinking_session() -> Session {
+        let mut s = Session::new("t");
+        s.push_line("> hi".into());
+        s.busy = true;
+        s.sync_activity();
+        s
+    }
+
+    #[test]
+    fn live_block_header_shows_while_thinking_for_any_provider() {
+        let mut s = thinking_session();
+        let d = s.stream_draft_lines();
+        assert_eq!(d.len(), 1);
+        assert!(d[0].ends_with(" Thinking…"));
+        // Hidden once answering, on a pending diff, or when idle.
+        s.set_phase(crate::activity::Phase::Responding);
+        assert!(s.stream_draft_lines().is_empty());
+        s.set_phase(crate::activity::Phase::Thinking);
+        s.stage_diff(PendingDiff {
+            file: "a".into(),
+            body: "b".into(),
+        });
+        assert!(s.stream_draft_lines().is_empty());
+        let _ = s.clear_diff();
+        s.busy = false;
+        assert!(s.stream_draft_lines().is_empty());
+    }
+
+    #[test]
+    fn live_block_body_is_last_three_lines_with_ellipsis() {
+        let mut s = thinking_session();
+        s.push_thought("one\ntwo\nthree");
+        let d = s.stream_draft_lines();
+        assert_eq!(d[1..], ["  one", "  two", "  three"]);
+        s.push_thought("\nfour\n");
+        let d = s.stream_draft_lines();
+        assert_eq!(d[1..], ["  …", "  two", "  three", "  four"]);
+    }
+
+    #[test]
+    fn thought_buffer_is_bounded_and_char_safe() {
+        let mut s = thinking_session();
+        for _ in 0..3000 {
+            s.push_thought("héllo wörld ");
+        }
+        assert!(s.thought.len() <= THOUGHT_CAP);
+        assert!(s.thought_cut);
+        assert!(s.stream_draft_lines()[1].starts_with("  …"));
+    }
+
+    #[test]
+    fn flush_thought_commits_only_when_text_existed() {
+        let mut s = thinking_session();
+        s.flush_thought();
+        assert_eq!(s.lines, ["> hi"]);
+        s.push_thought("   ");
+        s.flush_thought();
+        assert_eq!(s.lines, ["> hi"]);
+        s.push_thought("hmm");
+        s.flush_thought();
+        assert_eq!(s.lines, ["> hi", "∴ Thought for 0s"]);
+        assert!(s.thought.is_empty() && s.thought_since.is_none());
+    }
+
+    #[test]
+    fn thought_ignored_while_idle_and_flushed_at_turn_end() {
+        let mut s = Session::new("t");
+        s.push_thought("late");
+        assert!(s.thought.is_empty());
+        let mut s = thinking_session();
+        s.push_thought("hmm");
+        s.busy = false;
+        s.sync_activity();
+        assert!(s.lines.iter().any(|l| l.starts_with("∴ Thought for ")));
+        assert!(s.stream_draft_lines().is_empty());
+    }
+
+    #[test]
+    fn sync_activity_starts_and_clears_phase() {
+        use crate::activity::Phase;
+        let mut s = Session::new("t");
+        s.push_line("> hi".into());
+        s.sync_activity();
+        assert_eq!(s.phase, None);
+        s.busy = true;
+        s.sync_activity();
+        assert_eq!(s.phase, Some(Phase::Thinking));
+        assert_eq!(s.turn_first_line, 1);
+        assert!(s.phase_since.is_some() && s.turn_since.is_some());
+        s.busy = false;
+        s.sync_activity();
+        assert!(s.phase.is_none() && s.phase_since.is_none() && s.turn_since.is_none());
+    }
+
+    #[test]
+    fn set_phase_keeps_turn_clock_and_ignores_idle() {
+        use crate::activity::Phase;
+        let mut s = Session::new("t");
+        s.set_phase(Phase::Responding);
+        assert_eq!(s.phase, None);
+        s.busy = true;
+        s.sync_activity();
+        let turn = s.turn_since;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        s.set_phase(Phase::Responding);
+        assert_eq!(s.phase, Some(Phase::Responding));
+        assert_eq!(s.turn_since, turn);
+        assert_ne!(s.phase_since, turn);
+        let since = s.phase_since;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        s.set_phase(Phase::Responding);
+        assert_eq!(s.phase_since, since);
+    }
 
     fn bottom_app() -> App {
         let mut app = App::new();

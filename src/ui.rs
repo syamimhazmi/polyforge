@@ -6,11 +6,11 @@
 //! exact.
 
 use ratatui::{
-    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap},
+    Frame,
 };
 
 use crate::app::{App, Mode};
@@ -25,11 +25,15 @@ pub fn render(f: &mut Frame, app: &mut App) {
     } else {
         1
     };
+    // Turn-status row: only while the active tab is busy (steals one
+    // transcript row, like grok-build's turn_status view).
+    let turn_rows = u16::from(app.active().busy);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(tab_rows),
             Constraint::Min(3),
+            Constraint::Length(turn_rows),
             Constraint::Length(1),
             Constraint::Length(3),
         ])
@@ -37,9 +41,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     render_tabs(f, app, th, chunks[0]);
     render_transcript(f, app, th, chunks[1]);
-    render_status(f, app, th, chunks[2]);
-    render_input(f, app, th, chunks[3]);
-    render_cmd_popup(f, app, th, chunks[3]);
+    render_turn_status(f, app, th, chunks[2]);
+    render_status(f, app, th, chunks[3]);
+    render_input(f, app, th, chunks[4]);
+    render_cmd_popup(f, app, th, chunks[4]);
 
     if app.active().pending_diff.is_some() {
         render_diff_modal(f, app, th);
@@ -95,8 +100,12 @@ fn shows_welcome(app: &App) -> bool {
 }
 
 fn render_transcript(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
-    let width = area.width.max(1) as usize;
-    app.viewport_height = area.height.max(1) as usize;
+    // Inner size: the block borders take 2 columns and 2 rows (wrapping at
+    // the outer width clipped the last 2 chars of every full-width row).
+    let width = area.width.saturating_sub(2).max(1) as usize;
+    // Inner rows: the block borders take 2 (counting them hid the last two
+    // transcript rows when pinned to the bottom).
+    app.viewport_height = area.height.saturating_sub(2).max(1) as usize;
     app.viewport_width = width;
     // Inner origin for mouse cell → text mapping (recorded every frame).
     app.text_area = if area.width > 2 && area.height > 2 {
@@ -122,6 +131,19 @@ fn render_transcript(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
         .collect();
     let n_committed = s.lines.len();
     let n_view = n_committed + drafts.len();
+    // Keep a bottom-pinned view pinned when the live block or the
+    // turn-status row changes height; a scrolled-up view stays put.
+    let total = s.total_rows + draft_rows.iter().sum::<usize>();
+    let tail = total.saturating_sub(vh);
+    if let Some((prev_total, prev_vh)) = s.last_geom {
+        s.scroll = if s.scroll + prev_vh >= prev_total {
+            tail
+        } else {
+            s.scroll.min(tail)
+        };
+    }
+    s.last_geom = Some((total, vh));
+    let thought_n = s.thought_block().len();
     // Walk the height cache to the first visible row (grok-build-style
     // virtualized window: only visible rows are laid out, never the tail).
     let mut li = 0usize;
@@ -140,6 +162,13 @@ fn render_transcript(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
     }
     let mut sub = s.scroll.saturating_sub(consumed);
     let mut items = Vec::new();
+    // Live-turn rows get the activity rail (only while animating).
+    let rail = s
+        .phase
+        .filter(|_| s.pending_diff.is_none())
+        .zip(s.turn_since)
+        .map(|(p, t)| (p, t.elapsed(), s.scroll));
+    let mut live_rows: Vec<usize> = Vec::new();
     while items.len() < vh && li < n_view {
         let raw = if li < n_committed {
             s.lines[li].as_str()
@@ -149,7 +178,11 @@ fn render_transcript(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
         // S3-F1 render defense: lines are clean at ingress, but never
         // trust the buffer on the way to the terminal.
         let line = crate::app::sanitize_text(raw);
-        let style = transcript_style(&line, th);
+        let style = match li.checked_sub(n_committed) {
+            Some(0) if thought_n > 0 => Style::default().fg(th.assistant),
+            Some(d) if d < thought_n => Style::default().fg(th.muted),
+            _ => transcript_style(&line, th),
+        };
         let line_len = line.chars().count();
         // Drafts are not mouse-selectable (no stable line index in `lines`).
         let span = if li < n_committed {
@@ -163,7 +196,11 @@ fn render_transcript(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
             .take(sub)
             .map(|c| c.chars().count())
             .sum::<usize>();
+        let live = li >= n_committed || (li >= s.turn_first_line && !line.starts_with('>'));
         for chunk in chunks.iter().skip(sub) {
+            if live {
+                live_rows.push(items.len());
+            }
             let spans = match span {
                 Some((ss, se)) => hl_spans(chunk, coff, ss, se, style),
                 None => vec![Span::styled(chunk.clone(), style)],
@@ -186,6 +223,22 @@ fn render_transcript(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
             Style::default().fg(th.text_secondary),
         )));
     f.render_widget(List::new(items).block(block), area);
+    if let Some((phase, elapsed, scroll)) = rail {
+        use crate::activity::{blend, wave_brightness, Phase};
+        let accent = if phase == Phase::Thinking {
+            th.assistant
+        } else {
+            th.running
+        };
+        for i in live_rows {
+            let y = area.y + 1 + i as u16;
+            if area.width < 2 || y + 1 >= area.y + area.height {
+                continue;
+            }
+            let color = blend(th.border, accent, wave_brightness(elapsed, scroll + i));
+            f.buffer_mut()[(area.x, y)].set_symbol("┃").set_fg(color);
+        }
+    }
 }
 
 /// "POLYFORGE" in figlet ANSI Shadow, one glyph per letter (6 rows).
@@ -433,7 +486,7 @@ fn transcript_style(line: &str, th: Theme) -> Style {
         Style::default().fg(th.err)
     } else if line.contains("deferred") {
         Style::default().fg(th.warn)
-    } else if line.starts_with("grok: ∴") {
+    } else if line.starts_with("∴ Thought") || line.starts_with("grok: ∴") {
         Style::default().fg(th.assistant)
     } else if line.starts_with("grok: plan") {
         Style::default().fg(th.plan)
@@ -481,12 +534,6 @@ fn hl_spans(chunk: &str, coff: usize, ss: usize, se: usize, style: Style) -> Vec
 fn render_status(f: &mut Frame, app: &App, th: Theme, area: Rect) {
     let s = app.active();
     let total = s.total_rows;
-    let state = if s.busy { "BUSY" } else { "idle" };
-    let state_style = if s.busy {
-        Style::default().fg(th.running).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(th.muted)
-    };
     let mut spans = vec![
         Span::styled(
             format!(" {} ", app.mode.label()),
@@ -499,17 +546,24 @@ fn render_status(f: &mut Frame, app: &App, th: Theme, area: Rect) {
             format!(" tab {}/{} {} ", app.active + 1, app.sessions.len(), s.name,),
             Style::default().fg(th.text_secondary),
         ),
-        Span::styled(format!("[{state}]"), state_style),
-        Span::styled(
-            format!(
-                "  scroll {}/{}  mouse:{} ",
-                s.scroll.min(total.saturating_sub(1).max(0)) + 1,
-                total.max(1),
-                if app.mouse { "on" } else { "off" },
-            ),
-            Style::default().fg(th.muted),
-        ),
     ];
+    spans.push(if s.busy {
+        Span::styled(
+            "[busy]",
+            Style::default().fg(th.running).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled("[idle]", Style::default().fg(th.muted))
+    });
+    spans.extend([Span::styled(
+        format!(
+            "  scroll {}/{}  mouse:{} ",
+            s.scroll.min(total.saturating_sub(1).max(0)) + 1,
+            total.max(1),
+            if app.mouse { "on" } else { "off" },
+        ),
+        Style::default().fg(th.muted),
+    )]);
     if !app.flash.is_empty() {
         spans.push(Span::styled(
             // S3-F1: flash carries agent text (method names, errors).
@@ -518,6 +572,54 @@ fn render_status(f: &mut Frame, app: &App, th: Theme, area: Rect) {
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Turn-status row above the input (grok-build style): spinner, phase and
+/// phase timer on the left, turn timer on the right; a static marker while
+/// a diff awaits approval. Zero-height (skipped) when the tab is idle.
+fn render_turn_status(f: &mut Frame, app: &App, th: Theme, area: Rect) {
+    use crate::activity::{format_elapsed, spinner_frame, Phase};
+    use std::time::Duration;
+    let s = app.active();
+    if area.height == 0 || !s.busy {
+        return;
+    }
+    if s.pending_diff.is_some() {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                " ◆ awaiting approval",
+                Style::default().fg(th.warn),
+            )),
+            area,
+        );
+        return;
+    }
+    let now = std::time::Instant::now();
+    let since = |t: Option<std::time::Instant>| t.map_or(Duration::ZERO, |t| now - t);
+    let label = s.phase.unwrap_or(Phase::Thinking).label();
+    let left = Line::from(vec![
+        Span::styled(
+            format!(" {}", spinner_frame(since(s.turn_since))),
+            Style::default().fg(th.running),
+        ),
+        Span::styled(
+            format!(" {} ", label.trim_end_matches('…')),
+            Style::default().fg(th.text_secondary),
+        ),
+        Span::styled(
+            format_elapsed(since(s.phase_since)),
+            Style::default().fg(th.muted),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(left), area);
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            format!("{} ", format_elapsed(since(s.turn_since))),
+            Style::default().fg(th.muted),
+        ))
+        .alignment(ratatui::layout::Alignment::Right),
+        area,
+    );
 }
 
 fn render_input(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
@@ -847,7 +949,73 @@ mod tests {
     use super::*;
     use crate::app::App;
     use crate::theme::ThemeKind;
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn screen_rows(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+        terminal.draw(|f| render(f, app)).expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn turn_status_row_and_busy_marker_only_while_busy() {
+        let mut app = App::new();
+        app.sessions[0].lines.push("> hi".to_string());
+        let rows = screen_rows(&mut app, 80, 24);
+        assert!(rows.iter().any(|r| r.contains("[idle]")));
+        assert!(rows.iter().all(|r| !r.contains("Thinking")));
+        app.sessions[0].busy = true;
+        app.sessions[0].sync_activity();
+        let rows = screen_rows(&mut app, 80, 24);
+        // Turn-status row sits right above the status bar.
+        let status = rows.iter().position(|r| r.contains("[busy]")).expect("busy");
+        assert!(rows.iter().all(|r| !r.contains("[idle]")));
+        assert!(rows[status - 1].contains("Thinking 0s"), "{:?}", rows[status - 1]);
+        assert!(rows[status - 1].trim_end().ends_with("0s"));
+        // Live thinking block in the transcript.
+        assert!(rows.iter().any(|r| r.contains("Thinking…")));
+        assert!(!rows[status].contains("Thinking"));
+    }
+
+    #[test]
+    fn turn_status_shows_awaiting_approval_on_pending_diff() {
+        let mut app = App::new();
+        app.sessions[0].lines.push("> hi".to_string());
+        app.sessions[0].busy = true;
+        app.sessions[0].sync_activity();
+        app.sessions[0].stage_diff(crate::app::PendingDiff {
+            file: "a.rs".into(),
+            body: "x".into(),
+        });
+        let rows = screen_rows(&mut app, 80, 24);
+        assert!(rows.iter().any(|r| r.contains("◆ awaiting approval")));
+    }
+
+    #[test]
+    fn pinned_view_stays_pinned_when_live_block_and_turn_row_appear() {
+        let mut app = App::new();
+        for i in 0..60 {
+            app.sessions[0].push_line(format!("line {i}"));
+        }
+        let _ = screen_rows(&mut app, 80, 24);
+        app.stick_to_bottom();
+        let _ = screen_rows(&mut app, 80, 24);
+        app.sessions[0].busy = true;
+        app.sessions[0].sync_activity();
+        let rows = screen_rows(&mut app, 80, 24);
+        // Last committed line and the live header are both visible.
+        assert!(rows.iter().any(|r| r.contains("line 59")));
+        assert!(rows.iter().any(|r| r.contains("Thinking…")));
+        // Scrolled up: the view is not yanked when the block grows.
+        app.scroll_lines(-10);
+        let before = app.sessions[0].scroll;
+        app.sessions[0].push_thought("a\nb\nc");
+        let _ = screen_rows(&mut app, 80, 24);
+        assert_eq!(app.sessions[0].scroll, before);
+    }
 
     /// S3-F1: even a raw line that bypassed `push_line` renders inert —
     /// no control byte may reach the terminal buffer, while visible text

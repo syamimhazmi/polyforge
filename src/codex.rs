@@ -123,6 +123,9 @@ pub fn apply_codex_notif(app: &mut App, tab: usize, method: &str, params: &Value
     let lower = method.to_lowercase();
     match method {
         "agentMessageDelta" => {
+            let s = &mut app.sessions[tab];
+            s.flush_thought();
+            s.set_phase(crate::activity::Phase::Responding);
             if let Some(t) = params.get("delta").and_then(|v| v.as_str()) {
                 push_text(app, tab, t);
             } else if let Some(t) = msp::extract_text(params) {
@@ -141,12 +144,21 @@ pub fn apply_codex_notif(app: &mut App, tab: usize, method: &str, params: &Value
                 return false;
             }
             if let Some(t) = msp::extract_text(params) {
-                push_text(app, tab, &t);
+                let s = &mut app.sessions[tab];
+                if kind.contains("reasoning") {
+                    s.set_phase(crate::activity::Phase::Thinking);
+                    s.push_thought(&format!("{t}\n"));
+                } else {
+                    s.flush_thought();
+                    s.set_phase(crate::activity::Phase::Responding);
+                    push_text(app, tab, &t);
+                }
             }
             false
         }
         "turn/completed" => {
             let s = &mut app.sessions[tab];
+            s.flush_thought();
             if s.pending_diff.is_none() {
                 s.busy = false;
                 s.push_line("codex: done ✓".to_string());
@@ -158,6 +170,7 @@ pub fn apply_codex_notif(app: &mut App, tab: usize, method: &str, params: &Value
         }
         "turn/failed" | "thread/realtime/error" => {
             let s = &mut app.sessions[tab];
+            s.flush_thought();
             s.push_line("codex: turn failed (see flash)".to_string());
             app.flash = format!("codex: {}", truncate(&params.to_string(), 300));
             false
@@ -454,6 +467,23 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_item_is_thought_not_answer_text() {
+        let mut app = App::new();
+        app.active_mut().busy = true;
+        let reasoning = serde_json::json!({"item": {"type": "reasoning", "text": "weigh options"}});
+        apply_codex_notif(&mut app, 0, "item/completed", &reasoning);
+        assert_eq!(app.active().thought.trim(), "weigh options");
+        assert!(app.active().lines.iter().all(|l| !l.contains("weigh")));
+        assert_eq!(app.active().phase, Some(crate::activity::Phase::Thinking));
+        let msg = serde_json::json!({"item": {"type": "agentMessage", "text": "answer"}});
+        apply_codex_notif(&mut app, 0, "item/completed", &msg);
+        let lines = &app.active().lines;
+        assert!(lines.iter().any(|l| l.starts_with("∴ Thought for ")));
+        assert!(lines.iter().any(|l| l == "answer"));
+        assert!(app.active().thought.is_empty());
+    }
 
     fn patch_approval() -> PendingApproval {
         PendingApproval {

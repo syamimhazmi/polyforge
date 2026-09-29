@@ -301,26 +301,24 @@ fn apply_session_update(app: &mut App, tab: usize, update: &Value) -> bool {
                     .unwrap_or_else(|| msp::extract_text(update).unwrap_or_default()),
                 None => msp::extract_text(update).unwrap_or_default(),
             };
-            // Commit any live thought above the answer before tokens land.
-            flush_thought_draft(app, tab);
+            if !text.is_empty() {
+                app.sessions[tab].set_phase(crate::activity::Phase::Responding);
+            }
+            // Collapse any live thought before answer tokens land.
+            app.sessions[tab].flush_thought();
             push_text(app, tab, &text);
             false
         }
         "agent_thought_chunk" => {
-            // One live coalesced line (Session.draft_thought). Per-token
-            // push_line flooded the transcript when the model streamed
-            // word-by-word.
+            // Live thinking block (Session::thought), collapsed on flush.
             let text = update
                 .get("content")
                 .and_then(|c| c.get("text"))
                 .and_then(|v| v.as_str())
-                .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
-                .unwrap_or_default();
-            if !text.is_empty() {
-                append_thought_draft(app, tab, &text);
-                if tab == app.active {
-                    app.stick_to_bottom();
-                }
+                .unwrap_or("");
+            app.sessions[tab].push_thought(text);
+            if tab == app.active {
+                app.stick_to_bottom();
             }
             false
         }
@@ -394,8 +392,6 @@ fn apply_session_update(app: &mut App, tab: usize, update: &Value) -> bool {
 
 /// Cap on the open answer draft (force-commit if a turn never sends `\n`).
 const ANSWER_DRAFT_CAP: usize = 64 * 1024;
-/// Display + commit cap for the live thought line (matches prior truncate).
-const THOUGHT_DRAFT_CAP: usize = 160;
 
 /// Append answer deltas into `draft_answer`; peel complete lines on `\n`.
 fn push_text(app: &mut App, tab: usize, t: &str) {
@@ -420,33 +416,6 @@ fn push_text(app: &mut App, tab: usize, t: &str) {
     }
 }
 
-fn append_thought_draft(app: &mut App, tab: usize, piece: &str) {
-    let s = &mut app.sessions[tab];
-    match s.draft_thought.as_mut() {
-        Some(body) => {
-            if !body.is_empty() {
-                body.push(' ');
-            }
-            body.push_str(piece);
-            if body.len() > THOUGHT_DRAFT_CAP {
-                *body = truncate(body, THOUGHT_DRAFT_CAP);
-            }
-        }
-        None => {
-            s.draft_thought = Some(truncate(piece, THOUGHT_DRAFT_CAP));
-        }
-    }
-}
-
-fn flush_thought_draft(app: &mut App, tab: usize) {
-    let s = &mut app.sessions[tab];
-    if let Some(body) = s.draft_thought.take() {
-        if !body.is_empty() {
-            s.push_line(format!("grok: ∴ {}", truncate(&body, THOUGHT_DRAFT_CAP)));
-        }
-    }
-}
-
 fn flush_answer_draft(app: &mut App, tab: usize) {
     let s = &mut app.sessions[tab];
     let rest = std::mem::take(&mut s.draft_answer);
@@ -457,7 +426,7 @@ fn flush_answer_draft(app: &mut App, tab: usize) {
 
 /// Commit live thought + open answer before chrome / turn-end lines.
 fn flush_grok_drafts(app: &mut App, tab: usize) {
-    flush_thought_draft(app, tab);
+    app.sessions[tab].flush_thought();
     flush_answer_draft(app, tab);
 }
 
@@ -618,6 +587,24 @@ mod tests {
     }
 
     #[test]
+    fn chunks_set_activity_phase() {
+        use crate::activity::Phase;
+        let mut app = grok_tab();
+        app.active_mut().busy = true;
+        let thought = serde_json::json!({
+            "sessionId": "sess-1",
+            "update": {
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {"type": "text", "text": "hmm"},
+            },
+        });
+        apply_grok_notif(&mut app, 0, "session/update", &thought);
+        assert_eq!(app.active().phase, Some(Phase::Thinking));
+        apply_grok_notif(&mut app, 0, "session/update", &chunk("hi"));
+        assert_eq!(app.active().phase, Some(Phase::Responding));
+    }
+
+    #[test]
     fn chunk_lines_land_in_transcript() {
         let mut app = grok_tab();
         assert!(!apply_grok_notif(
@@ -652,19 +639,17 @@ mod tests {
     #[test]
     fn thought_tool_and_plan_render_one_line_each() {
         let mut app = grok_tab();
+        app.active_mut().busy = true;
         let thought = serde_json::json!({
             "sessionId": "s", "update": {
                 "sessionUpdate": "agent_thought_chunk",
-                "content": {"type": "text", "text": "hmm  let  me   think"},
+                "content": {"type": "text", "text": "hmm let me think"},
             },
         });
         assert!(!apply_grok_notif(&mut app, 0, "session/update", &thought));
-        // Live draft only — not committed until flush (tool / turn end).
-        assert_eq!(
-            app.active().draft_thought.as_deref(),
-            Some("hmm let me think")
-        );
-        assert!(!app.active().lines.iter().any(|l| l.starts_with("grok: ∴")));
+        // Live only — not committed until flush (tool / turn end).
+        assert_eq!(app.active().thought, "hmm let me think");
+        assert!(!app.active().lines.iter().any(|l| l.starts_with("∴")));
         let tool = serde_json::json!({
             "sessionId": "s", "update": {
                 "sessionUpdate": "tool_call",
@@ -672,13 +657,14 @@ mod tests {
             },
         });
         assert!(!apply_grok_notif(&mut app, 0, "session/update", &tool));
-        assert!(app.active().draft_thought.is_none());
+        assert!(app.active().thought.is_empty());
         assert!(
             app.active()
                 .lines
                 .iter()
-                .any(|l| l == "grok: ∴ hmm let me think")
+                .any(|l| l.starts_with("∴ Thought for "))
         );
+        assert!(!app.active().lines.iter().any(|l| l.contains("hmm let me")));
         assert!(
             app.active()
                 .lines
@@ -712,9 +698,10 @@ mod tests {
     }
 
     #[test]
-    fn thought_chunks_coalesce_one_line() {
+    fn thought_chunks_stream_into_live_block_then_collapse() {
         let mut app = grok_tab();
-        for word in ["The", "user", "said", "hello"] {
+        app.active_mut().busy = true;
+        for word in ["The", " user", " said", " hello\nsecond line"] {
             let thought = serde_json::json!({
                 "sessionId": "s", "update": {
                     "sessionUpdate": "agent_thought_chunk",
@@ -723,15 +710,13 @@ mod tests {
             });
             assert!(!apply_grok_notif(&mut app, 0, "session/update", &thought));
         }
-        assert_eq!(
-            app.active().draft_thought.as_deref(),
-            Some("The user said hello")
-        );
-        assert_eq!(
-            app.active().stream_draft_lines(),
-            vec!["grok: ∴ The user said hello".to_string()]
-        );
-        assert!(!app.active().lines.iter().any(|l| l.starts_with("grok: ∴")));
+        assert_eq!(app.active().thought, "The user said hello\nsecond line");
+        let draft = app.active().stream_draft_lines();
+        assert_eq!(draft.len(), 3);
+        assert!(draft[0].ends_with("Thinking…"));
+        assert_eq!(draft[1], "  The user said hello");
+        assert_eq!(draft[2], "  second line");
+        assert!(!app.active().lines.iter().any(|l| l.starts_with("∴")));
         assert!(apply_grok_notif(
             &mut app,
             0,
@@ -742,11 +727,12 @@ mod tests {
             .active()
             .lines
             .iter()
-            .filter(|l| l.starts_with("grok: ∴"))
+            .filter(|l| l.starts_with("∴"))
             .collect();
         assert_eq!(thought_lines.len(), 1);
-        assert_eq!(thought_lines[0], "grok: ∴ The user said hello");
-        assert!(app.active().draft_thought.is_none());
+        assert!(thought_lines[0].starts_with("∴ Thought for "));
+        assert!(app.active().thought.is_empty());
+        assert!(app.active().stream_draft_lines().is_empty());
     }
 
     #[test]

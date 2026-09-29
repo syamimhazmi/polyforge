@@ -66,6 +66,17 @@ From top to bottom:
    prompts show as `> …`. A bell rings whenever a tab's job finishes.
 3. **Status bar** — mode badge, `tab 1/2 s1`, busy/idle, scroll position,
    mouse state, and the latest notice (`flash`).
+   The marker is `[busy]` or `[idle]`.
+   While a tab works, a **turn-status row** appears just above the status
+   bar: `⠋ Thinking 3s` (or `Responding`, timed per phase) with the
+   whole turn's timer on the right; it disappears when the tab is idle.
+   A pending diff shows a static `◆ awaiting approval` there instead.
+   While the agent thinks, the transcript ends with a live block: a
+   `⠹ Thinking…` header plus the last three lines of thought text (when
+   the provider streams any). It collapses to one `∴ Thought for 6s`
+   line once the answer or a tool call starts; the thought text itself
+   is not kept. The current turn's transcript rows also get a pulsing
+   `┃` rail on the left border.
 4. **Input box** — its title always names the keys available in the
    current mode.
 
