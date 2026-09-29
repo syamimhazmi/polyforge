@@ -198,6 +198,23 @@ pub async fn claude_submit(handle: &ClaudeHandle, prompt: String) -> Result<(), 
     .await
 }
 
+/// Ask claude to interrupt the running turn. Never awaits: a full frame
+/// channel is reported instead of stalling the event loop. Claude answers
+/// with a `control_response` (ignored) and ends the turn with a `result`.
+pub fn claude_interrupt(handle: &ClaudeHandle) -> Result<(), String> {
+    handle
+        .frame_tx
+        .try_send(serde_json::json!({
+            "type": "control_request",
+            "request_id": crate::msp::uuid7(),
+            "request": {"subtype": "interrupt"},
+        }))
+        .map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => "channel full".to_string(),
+            mpsc::error::TrySendError::Closed(_) => "claude session ended".to_string(),
+        })
+}
+
 /// Write one raw frame (e.g. a `control_response`) to the child's stdin.
 pub async fn claude_send(handle: &ClaudeHandle, frame: Value) -> Result<(), String> {
     handle
@@ -214,6 +231,7 @@ pub fn apply_claude_notif(app: &mut App, tab: usize, method: &str, params: &Valu
     }
     match method {
         "claude/assistant" => {
+            app.sessions[tab].note_tokens(assistant_context_tokens(params));
             let blocks = params
                 .pointer("/message/content")
                 .and_then(|c| c.as_array())
@@ -338,6 +356,24 @@ pub fn apply_claude_notif(app: &mut App, tab: usize, method: &str, params: &Valu
         }
         _ => false, // system (init/hooks), rate_limit_event, stream noise
     }
+}
+
+/// Context occupancy from one assistant frame's `message.usage`: prompt
+/// tokens incl. cache reads/writes (output excluded). None when the frame
+/// carries none of them. `result.usage` is cumulative and never used.
+fn assistant_context_tokens(params: &Value) -> Option<u64> {
+    let usage = params.pointer("/message/usage")?;
+    let mut total = None;
+    for k in [
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ] {
+        if let Some(n) = usage.get(k).and_then(crate::app::take_u64) {
+            total = Some(total.unwrap_or(0) + n);
+        }
+    }
+    total
 }
 
 /// Stage a `can_use_tool` request as a DIFF card + live approval handle.
@@ -792,5 +828,54 @@ mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn assistant_usage_sets_context_tokens_without_output() {
+        let mut app = claude_app();
+        let p = json!({"type": "assistant", "session_id": "sid-1", "message": {
+            "content": [],
+            "usage": {
+                "input_tokens": 10,
+                "cache_creation_input_tokens": 200,
+                "cache_read_input_tokens": 3000,
+                "output_tokens": 999,
+            },
+        }});
+        apply_claude_notif(&mut app, 0, "claude/assistant", &p);
+        assert_eq!(app.active().tokens, Some(3210));
+        // No usage fields: previous value kept. Cumulative result.usage ignored.
+        let bare = json!({"type": "assistant", "session_id": "sid-1", "message": {"content": []}});
+        apply_claude_notif(&mut app, 0, "claude/assistant", &bare);
+        let r = json!({"type": "result", "session_id": "sid-1", "usage": {"input_tokens": 1_000_000}});
+        apply_claude_notif(&mut app, 0, "claude/result", &r);
+        assert_eq!(app.active().tokens, Some(3210));
+    }
+
+    #[test]
+    fn control_response_frames_are_silent() {
+        let mut app = claude_app();
+        let before = app.active().lines.len();
+        let ok = json!({"type": "control_response", "session_id": "sid-1",
+            "response": {"subtype": "success", "request_id": "r"}});
+        assert!(!apply_claude_notif(&mut app, 0, "claude/control_response", &ok));
+        assert_eq!(app.active().lines.len(), before);
+        assert!(app.flash.is_empty());
+    }
+
+    #[tokio::test]
+    async fn interrupt_reports_a_full_or_closed_channel() {
+        let (frame_tx, mut frame_rx) = mpsc::channel::<Value>(1);
+        let child = Command::new("true").spawn().unwrap();
+        let h = ClaudeHandle { frame_tx, child, generation: 1 };
+        assert!(claude_interrupt(&h).is_ok());
+        let sent = frame_rx.try_recv().unwrap();
+        assert_eq!(sent["type"], "control_request");
+        assert_eq!(sent["request"]["subtype"], "interrupt");
+        assert!(sent["request_id"].as_str().is_some_and(|s| !s.is_empty()));
+        claude_interrupt(&h).unwrap();
+        assert_eq!(claude_interrupt(&h).unwrap_err(), "channel full");
+        drop(frame_rx);
+        assert_eq!(claude_interrupt(&h).unwrap_err(), "claude session ended");
     }
 }

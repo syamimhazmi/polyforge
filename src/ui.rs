@@ -575,11 +575,14 @@ fn render_status(f: &mut Frame, app: &App, th: Theme, area: Rect) {
 }
 
 /// Turn-status row above the input (grok-build style): spinner, phase and
-/// phase timer on the left, turn timer on the right; a static marker while
-/// a diff awaits approval. Zero-height (skipped) when the tab is idle.
-fn render_turn_status(f: &mut Frame, app: &App, th: Theme, area: Rect) {
-    use crate::activity::{format_elapsed, spinner_frame, Phase};
+/// phase timer on the left; turn timer, context tokens and a `[stop]`
+/// button on the right. A static marker while a diff awaits approval.
+/// Zero-height (skipped) when the tab is idle. Records the button cells in
+/// `app.stop_hit` for mouse clicks (None whenever it is not drawn).
+fn render_turn_status(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
+    use crate::activity::{format_elapsed, format_tokens_short, spinner_frame, Phase};
     use std::time::Duration;
+    app.stop_hit = None;
     let s = app.active();
     if area.height == 0 || !s.busy {
         return;
@@ -596,30 +599,129 @@ fn render_turn_status(f: &mut Frame, app: &App, th: Theme, area: Rect) {
     }
     let now = std::time::Instant::now();
     let since = |t: Option<std::time::Instant>| t.map_or(Duration::ZERO, |t| now - t);
-    let label = s.phase.unwrap_or(Phase::Thinking).label();
-    let left = Line::from(vec![
-        Span::styled(
-            format!(" {}", spinner_frame(since(s.turn_since))),
-            Style::default().fg(th.running),
+    // While stopping the left timer counts the stop, not the phase.
+    let (label, phase_t) = match s.stopping {
+        Some(t) => ("Stopping…", since(Some(t))),
+        None => (
+            s.phase.unwrap_or(Phase::Thinking).label().trim_end_matches('…'),
+            since(s.phase_since),
         ),
-        Span::styled(
-            format!(" {} ", label.trim_end_matches('…')),
-            Style::default().fg(th.text_secondary),
-        ),
-        Span::styled(
-            format_elapsed(since(s.phase_since)),
-            Style::default().fg(th.muted),
-        ),
-    ]);
-    f.render_widget(Paragraph::new(left), area);
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            format!("{} ", format_elapsed(since(s.turn_since))),
-            Style::default().fg(th.muted),
-        ))
-        .alignment(ratatui::layout::Alignment::Right),
-        area,
+    };
+    let tokens = s
+        .tokens
+        .filter(|&n| n > 0)
+        .map(|n| format!("⇣{}", format_tokens_short(n)));
+    let spinner = format!(" {}", spinner_frame(since(s.turn_since)));
+    let row = plan_turn_row(
+        area.width as usize,
+        label,
+        &format_elapsed(phase_t),
+        &format_elapsed(since(s.turn_since)),
+        tokens.as_deref(),
     );
+    let mut left = vec![Span::styled(spinner, Style::default().fg(th.running))];
+    left.push(Span::styled(
+        format!(" {}", row.label),
+        Style::default().fg(th.text_secondary),
+    ));
+    if let Some(t) = row.timer {
+        left.push(Span::styled(format!(" {t}"), Style::default().fg(th.muted)));
+    }
+    f.render_widget(Paragraph::new(Line::from(left)), area);
+    let Some(pre) = row.right else {
+        return;
+    };
+    // pre (muted) + [stop] + one margin cell, right-aligned.
+    let pre_w = if pre.is_empty() { 0 } else { pre.chars().count() as u16 + 1 };
+    let w = pre_w + STOP_LABEL.len() as u16 + 1;
+    let x = area.x + area.width - w;
+    let mut spans = Vec::new();
+    if !pre.is_empty() {
+        spans.push(Span::styled(format!("{pre} "), Style::default().fg(th.muted)));
+    }
+    spans.push(Span::styled(
+        STOP_LABEL,
+        Style::default().fg(th.text_secondary),
+    ));
+    f.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect::new(x, area.y, w, 1),
+    );
+    app.stop_hit = Some(Rect::new(
+        x + pre_w,
+        area.y,
+        STOP_LABEL.len() as u16,
+        1,
+    ));
+}
+
+const STOP_LABEL: &str = "[stop]";
+
+/// What fits on the turn row at a given width.
+struct TurnRow {
+    /// Phase label, truncated when the row is tight.
+    label: String,
+    /// Phase timer; dropped before the label gives way further.
+    timer: Option<String>,
+    /// Right side before `[stop]` ("1m 05s ⇣12.3k", possibly empty).
+    /// None = not even `[stop]` fits, so the right side is omitted.
+    right: Option<String>,
+}
+
+/// Column plan: the right side (turn timer, tokens, `[stop]`) is placed
+/// first and sheds tokens, then the turn timer, when narrow; the left gets
+/// the rest and truncates its label first, then drops the phase timer.
+/// The two sides never overlap.
+fn plan_turn_row(
+    width: usize,
+    label: &str,
+    phase_t: &str,
+    turn: &str,
+    tokens: Option<&str>,
+) -> TurnRow {
+    let n = |s: &str| s.chars().count();
+    // Spinner cell(s) + a gap column between the sides.
+    const LEFT_FIXED: usize = 3;
+    let full = match tokens {
+        Some(t) => format!("{turn} {t}"),
+        None => turn.to_string(),
+    };
+    let right = [full, turn.to_string(), String::new()]
+        .into_iter()
+        // pre + space + [stop] + margin (no space when pre is empty)
+        .find(|pre| {
+            let w = if pre.is_empty() { 0 } else { n(pre) + 1 } + STOP_LABEL.len() + 1;
+            w + LEFT_FIXED <= width
+        });
+    let right_w = right.as_ref().map_or(0, |pre| {
+        (if pre.is_empty() { 0 } else { n(pre) + 1 }) + STOP_LABEL.len() + 1
+    });
+    // Columns left for " label" + " timer" after the spinner.
+    let avail = width.saturating_sub(right_w + LEFT_FIXED);
+    let clip = |s: &str, max: usize| -> String {
+        if n(s) <= max {
+            s.to_string()
+        } else if max == 0 {
+            String::new()
+        } else {
+            let keep = max.saturating_sub(1);
+            format!("{}…", s.chars().take(keep).collect::<String>())
+        }
+    };
+    let with_timer = 1 + n(label) + 1 + n(phase_t);
+    let (label, timer) = if with_timer <= avail {
+        (label.to_string(), Some(phase_t.to_string()))
+    } else if avail >= 1 + 3 + 1 + n(phase_t) {
+        // Label gives way first, keeping at least 3 columns of it.
+        (clip(label, avail - 1 - 1 - n(phase_t)), Some(phase_t.to_string()))
+    } else {
+        (clip(label, avail.saturating_sub(1)), None)
+    };
+    TurnRow {
+        label,
+        timer,
+        right,
+    }
 }
 
 fn render_input(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
@@ -974,7 +1076,8 @@ mod tests {
         let status = rows.iter().position(|r| r.contains("[busy]")).expect("busy");
         assert!(rows.iter().all(|r| !r.contains("[idle]")));
         assert!(rows[status - 1].contains("Thinking 0s"), "{:?}", rows[status - 1]);
-        assert!(rows[status - 1].trim_end().ends_with("0s"));
+        // The right side is the turn timer, then the stop button.
+        assert!(rows[status - 1].trim_end().ends_with("0s [stop]"));
         // Live thinking block in the transcript.
         assert!(rows.iter().any(|r| r.contains("Thinking…")));
         assert!(!rows[status].contains("Thinking"));
@@ -1134,5 +1237,95 @@ mod tests {
                 assert!(text.contains("hello"), "{kind:?} dropped content");
             }
         }
+    }
+
+    fn turn_row(app: &mut App, w: u16) -> String {
+        let rows = screen_rows(app, w, 24);
+        let status = rows.iter().position(|r| r.contains("[busy]")).expect("busy");
+        rows[status - 1].clone()
+    }
+
+    fn busy_app() -> App {
+        let mut app = App::new();
+        app.sessions[0].lines.push("> hi".to_string());
+        app.sessions[0].busy = true;
+        app.sessions[0].sync_activity();
+        app
+    }
+
+    #[test]
+    fn turn_row_shows_tokens_and_stop_button_at_the_right_end() {
+        let mut app = busy_app();
+        app.sessions[0].tokens = Some(1234);
+        let row = turn_row(&mut app, 80);
+        assert!(row.trim_end().ends_with("⇣1.23k [stop]"), "{row:?}");
+        assert!(row.contains("Thinking"));
+        let hit = app.stop_hit.expect("button recorded");
+        let cells: String = row.chars().skip(hit.x as usize).take(hit.width as usize).collect();
+        assert_eq!(cells, "[stop]");
+        // No tokens known: no arrow, button still there.
+        let mut app = busy_app();
+        let row = turn_row(&mut app, 80);
+        assert!(!row.contains('⇣'), "{row:?}");
+        assert!(row.trim_end().ends_with("0s [stop]"), "{row:?}");
+        let mut app = busy_app();
+        app.sessions[0].tokens = Some(0);
+        assert!(!turn_row(&mut app, 80).contains('⇣'));
+    }
+
+    #[test]
+    fn stopping_label_and_clock_replace_the_phase() {
+        let mut app = busy_app();
+        app.sessions[0].stopping = Some(std::time::Instant::now());
+        let row = turn_row(&mut app, 80);
+        assert!(row.contains("Stopping…"), "{row:?}");
+        assert!(!row.contains("Thinking"), "{row:?}");
+        assert!(row.trim_end().ends_with("[stop]"));
+    }
+
+    #[test]
+    fn stop_hit_only_while_the_button_is_drawn() {
+        let mut app = App::new();
+        app.sessions[0].lines.push("> hi".to_string());
+        let _ = screen_rows(&mut app, 80, 24);
+        assert!(app.stop_hit.is_none());
+        app.sessions[0].busy = true;
+        app.sessions[0].sync_activity();
+        let _ = screen_rows(&mut app, 80, 24);
+        assert!(app.stop_hit.is_some());
+        app.sessions[0].stage_diff(crate::app::PendingDiff {
+            file: "a.rs".into(),
+            body: "x".into(),
+        });
+        let rows = screen_rows(&mut app, 80, 24);
+        assert!(rows.iter().all(|r| !r.contains("[stop]")));
+        assert!(app.stop_hit.is_none(), "no button under a pending card");
+        app.sessions[0].busy = false;
+        app.sessions[0].clear_diff();
+        let _ = screen_rows(&mut app, 80, 24);
+        assert!(app.stop_hit.is_none());
+    }
+
+    #[test]
+    fn turn_row_sides_never_overlap_when_narrow() {
+        let n = |s: &str| s.chars().count();
+        for w in 3..=100usize {
+            let r = plan_turn_row(w, "Responding", "12s", "1m 05s", Some("⇣12.3k"));
+            let left = 2 + 1 + n(&r.label) + r.timer.as_ref().map_or(0, |t| 1 + n(t));
+            let right = r.right.as_ref().map_or(0, |p| {
+                (if p.is_empty() { 0 } else { n(p) + 1 }) + STOP_LABEL.len() + 1
+            });
+            assert!(left + right <= w, "w={w} left={left} right={right} {:?}", r.label);
+        }
+        // Shedding order: tokens go before the turn timer, timer before label.
+        let r = plan_turn_row(40, "Responding", "12s", "1m 05s", Some("⇣12.3k"));
+        assert_eq!(r.right.as_deref(), Some("1m 05s ⇣12.3k"));
+        assert_eq!(r.timer.as_deref(), Some("12s"));
+        let r = plan_turn_row(23, "Responding", "12s", "1m 05s", Some("⇣12.3k"));
+        assert_eq!(r.right.as_deref(), Some("1m 05s"));
+        let r = plan_turn_row(16, "Responding", "12s", "1m 05s", Some("⇣12.3k"));
+        assert_eq!(r.right.as_deref(), Some(""));
+        let r = plan_turn_row(8, "Responding", "12s", "1m 05s", None);
+        assert_eq!(r.right, None);
     }
 }

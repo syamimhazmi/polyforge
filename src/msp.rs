@@ -261,6 +261,13 @@ impl Host {
         let _ = w.write_all(format!("{frame}\n").as_bytes()).await;
     }
 
+    /// Notification carrying params (ACP `session/cancel`).
+    pub async fn notify_params(&self, method: &str, params: Value) {
+        let frame = serde_json::json!({"jsonrpc": "2.0", "method": method, "params": params});
+        let mut w = self.writer.lock().await;
+        let _ = w.write_all(format!("{frame}\n").as_bytes()).await;
+    }
+
     /// Full bring-up: initialize + initialized. Returns server info value.
     pub async fn handshake(&self, client: &str, version: &str) -> Result<Value, RpcError> {
         let res = self
@@ -330,6 +337,16 @@ async fn route_line(line: &str, pending: &Pending, events_tx: &mpsc::Sender<Serv
             .send(ServerMsg::Transport(format!("serve: {v}")))
             .await;
     }
+}
+
+/// Turn id from a `turn/start` result or `turn/started` params: `turnId`
+/// (muse) or `turn.id` (codex). Optional everywhere, so absence is fine.
+pub fn turn_id_of(v: &Value) -> Option<String> {
+    v.get("turnId")
+        .or_else(|| v.get("turn").and_then(|t| t.get("id")))
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
 
 /// RFC 9562 UUIDv7 (required for MSP commandId idempotency handles).

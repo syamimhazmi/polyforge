@@ -52,6 +52,43 @@ Feature: Live activity while a tab is busy
     Then the turn-status row shows a static "◆ awaiting approval"
     And no thinking block and no rail are drawn
 
+  Scenario: Token count and stop button on the turn row
+    Given a busy tab whose backend reported a context size of 12,345 tokens
+    Then the right side of the turn-status row reads "1m 20s ⇣12.3k [stop]"
+    And with no token report yet there is no "⇣" segment
+    And on a narrow terminal the tokens, then the timers, then the label give way first
+    And the two sides of the row never overlap
+
+  Scenario: Stopping a turn with Esc
+    Given a busy tab with no pending diff in Normal mode
+    When I press Esc
+    Then one stop is queued for that tab's backend and the row shows "Stopping…" with its own timer
+    And when the backend ends the turn exactly one "■ stopped" line is added
+    But Esc on an idle tab does nothing
+
+  Scenario: Stopping a turn by clicking [stop]
+    Given a busy tab with no pending diff and mouse capture on
+    When I left-click the "[stop]" cells
+    Then the tab behaves as if Esc was pressed
+    And a click anywhere else still starts a text selection
+
+  Scenario: A second stop press forces the stop
+    Given a tab that is stopping but whose backend has not ended the turn
+    When I press Esc or click "[stop]" again
+    Then the tab goes idle and one "■ stopped (forced; late output may still arrive)" line is added
+    And late status events do not make the tab busy again until my next prompt
+
+  Scenario: Approvals are not stoppable and are declined while stopping
+    Given a busy tab with a pending diff
+    Then the row shows "◆ awaiting approval" with no "[stop]" and Esc still defers the card
+    And an approval that arrives while a stop is in flight is declined with "stop: declined <tool> approval"
+
+  Scenario: Each backend has a stop path
+    Given a busy tab on muse, codex, grok, claude, agy or mock
+    When I stop it
+    Then muse and codex send turn/interrupt, grok sends session/cancel, claude sends an interrupt control request, agy gets SIGINT, and mock stops at once
+    And a codex turn with no known turn id says "turn not started yet — try again" instead of stopping
+
   Scenario: Idle paints nothing
     Given no tab is busy
     Then there is no turn-status row and the status bar shows [idle]

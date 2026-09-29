@@ -64,6 +64,33 @@ pub fn format_elapsed(d: Duration) -> String {
     }
 }
 
+/// Compact token count for the turn row: "999", "1.23k", "12.3k", "123k",
+/// "1.23m", "12.3m". The bucket is chosen AFTER rounding, so 9_999 reads
+/// "10.0k" (not "10.00k") and 999_999 reads "1.00m" (not "1000k").
+pub fn format_tokens_short(n: u64) -> String {
+    if n < 1_000 {
+        return n.to_string();
+    }
+    let k2 = (n + 5) / 10; // hundredths of a thousand
+    if k2 < 1_000 {
+        return format!("{}.{:02}k", k2 / 100, k2 % 100);
+    }
+    let k1 = (n + 50) / 100;
+    if k1 < 1_000 {
+        return format!("{}.{}k", k1 / 10, k1 % 10);
+    }
+    let k0 = (n + 500) / 1_000;
+    if k0 < 1_000 {
+        return format!("{k0}k");
+    }
+    let m2 = (n + 5_000) / 10_000;
+    if m2 < 1_000 {
+        return format!("{}.{:02}m", m2 / 100, m2 % 100);
+    }
+    let m1 = (n + 50_000) / 100_000;
+    format!("{}.{}m", m1 / 10, m1 % 10)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +137,26 @@ mod tests {
         assert_eq!(format_elapsed(s(60)), "1m 00s");
         assert_eq!(format_elapsed(s(65)), "1m 05s");
         assert_eq!(format_elapsed(s(3600 + 120)), "1h 02m");
+    }
+
+    #[test]
+    fn token_counts_round_then_bucket() {
+        let cases = [
+            (0, "0"),
+            (999, "999"),
+            (1_000, "1.00k"),
+            (1_234, "1.23k"),
+            (9_999, "10.0k"),
+            (10_049, "10.0k"),
+            (12_345, "12.3k"),
+            (99_999, "100k"),
+            (100_000, "100k"),
+            (999_999, "1.00m"),
+            (1_234_567, "1.23m"),
+            (12_345_678, "12.3m"),
+        ];
+        for (n, want) in cases {
+            assert_eq!(format_tokens_short(n), want, "n={n}");
+        }
     }
 }

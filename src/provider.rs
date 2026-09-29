@@ -119,7 +119,12 @@ fn friendly_start_error(e: &RpcError) -> String {
     format!("muse session/start failed: {e}")
 }
 
-pub async fn muse_submit(host: &Host, session_id: &str, prompt: &str) -> Result<(), RpcError> {
+/// Start a turn; returns the turn id when the result carries one.
+pub async fn muse_submit(
+    host: &Host,
+    session_id: &str,
+    prompt: &str,
+) -> Result<Option<String>, RpcError> {
     host.call(
         "turn/start",
         serde_json::json!({
@@ -129,7 +134,24 @@ pub async fn muse_submit(host: &Host, session_id: &str, prompt: &str) -> Result<
         }),
     )
     .await
-    .map(|_| ())
+    .map(|res| msp::turn_id_of(&res))
+}
+
+/// Ask muse to interrupt the running turn (admitted only; the turn ends
+/// via its normal `turn/completed`). `turn_id` is omitted when unknown.
+pub async fn muse_interrupt(
+    host: &Host,
+    session_id: &str,
+    turn_id: Option<&str>,
+) -> Result<(), RpcError> {
+    let mut params = serde_json::json!({
+        "commandId": msp::uuid7(),
+        "sessionId": session_id,
+    });
+    if let Some(t) = turn_id {
+        params["turnId"] = Value::String(t.to_string());
+    }
+    host.call("turn/interrupt", params).await.map(|_| ())
 }
 
 pub async fn muse_decide(host: &Host, session_id: &str, d: &OutboxDecide) -> Result<(), RpcError> {
@@ -241,6 +263,20 @@ pub fn apply_notif(app: &mut App, tab: usize, method: &str, params: &Value) -> b
             app.flash = format!("{tool} wants approval (y/n/a/q)");
             true // bell: a decision is waiting
         }
+        "turn/started" => {
+            let s = &mut app.sessions[tab];
+            if s.busy
+                && let Some(id) = msp::turn_id_of(params)
+            {
+                s.turn_id = Some(id);
+            }
+            false
+        }
+        "session/contextUsage" => {
+            let n = params.get("usedTokens").and_then(crate::app::take_u64);
+            app.sessions[tab].note_tokens(n);
+            false
+        }
         "turn/completed" | "turn/failed" => {
             let failed = method == "turn/failed";
             let s = &mut app.sessions[tab];
@@ -268,7 +304,7 @@ pub fn apply_notif(app: &mut App, tab: usize, method: &str, params: &Value) -> b
             let s = &mut app.sessions[tab];
             if !running && s.pending_diff.is_none() {
                 s.busy = false;
-            } else if running {
+            } else if running && !s.sealed {
                 s.busy = true;
             }
             false
@@ -545,5 +581,49 @@ mod tests {
         assert!(saw_text && done);
         host.shutdown().await;
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    fn muse_app() -> App {
+        let mut app = App::new();
+        app.active_mut().backend = crate::app::BackendKind::Muse;
+        app.active_mut().remote_id = Some("s1".into());
+        app
+    }
+
+    #[test]
+    fn context_usage_sets_tokens_and_zero_never_clobbers() {
+        let mut app = muse_app();
+        apply_notif(&mut app, 0, "session/contextUsage", &serde_json::json!({"usedTokens": 4321}));
+        assert_eq!(app.active().tokens, Some(4321));
+        apply_notif(&mut app, 0, "session/contextUsage", &serde_json::json!({"usedTokens": 0}));
+        apply_notif(&mut app, 0, "session/contextUsage", &serde_json::json!({"usedTokens": "x"}));
+        assert_eq!(app.active().tokens, Some(4321));
+    }
+
+    #[test]
+    fn turn_started_captures_turn_id_only_while_busy() {
+        let mut app = muse_app();
+        let p = serde_json::json!({"turnId": "t-9"});
+        apply_notif(&mut app, 0, "turn/started", &p);
+        assert!(app.active().turn_id.is_none());
+        app.active_mut().busy = true;
+        apply_notif(&mut app, 0, "turn/started", &p);
+        assert_eq!(app.active().turn_id.as_deref(), Some("t-9"));
+        apply_notif(&mut app, 0, "turn/started", &serde_json::json!({"turn": {"id": "t-10"}}));
+        assert_eq!(app.active().turn_id.as_deref(), Some("t-10"));
+    }
+
+    #[test]
+    fn sealed_tab_ignores_late_running_status() {
+        let mut app = muse_app();
+        app.active_mut().busy = true;
+        app.request_stop();
+        app.request_stop();
+        apply_notif(&mut app, 0, "session/statusChanged", &serde_json::json!({"status": "running"}));
+        assert!(!app.active().busy);
+        // A fresh submit unseals; status-driven busy works again.
+        app.active_mut().sealed = false;
+        apply_notif(&mut app, 0, "session/statusChanged", &serde_json::json!({"status": "running"}));
+        assert!(app.active().busy);
     }
 }

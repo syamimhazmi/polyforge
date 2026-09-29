@@ -69,8 +69,27 @@ From top to bottom:
    The marker is `[busy]` or `[idle]`.
    While a tab works, a **turn-status row** appears just above the status
    bar: `⠋ Thinking 3s` (or `Responding`, timed per phase) with the
-   whole turn's timer on the right; it disappears when the tab is idle.
-   A pending diff shows a static `◆ awaiting approval` there instead.
+   whole turn's timer on the right, then the session's context size
+   `⇣12.3k` (tokens, latest report from the backend; hidden until one
+   arrives) and a `[stop]` button; it disappears when the tab is idle.
+   On narrow terminals the tokens, then the timers, then the label give
+   way first. A pending diff shows a static `◆ awaiting approval`
+   there instead (no `[stop]`; answer the card first).
+   **Stopping a turn**: press `Esc` (Normal mode) or click `[stop]`. The
+   row shows `Stopping…` with its own timer and the transcript gets
+   `■ stopped` once the turn ends. If the backend never ends the turn,
+   press `Esc` / click again to force it: the tab goes idle with
+   `■ stopped (forced; late output may still arrive)` and stays idle
+   until your next prompt. An approval that arrives while stopping is
+   declined automatically (`stop: declined <tool> approval`). How each
+   backend stops: muse and codex `turn/interrupt` (codex needs its turn
+   id, so a stop pressed before the turn has started says "try again"),
+   grok `session/cancel`, claude an `interrupt` control request, agy
+   SIGINT to its child process, mock immediately. Token counts come
+   from muse `session/contextUsage`, codex `thread/tokenUsage/updated`
+   (last turn), grok `usage_update`, claude each assistant message's
+   prompt tokens (input + cache), and agy per-step usage; the mock has
+   none.
    While the agent thinks, the transcript ends with a live block: a
    `⠹ Thinking…` header plus the last three lines of thought text (when
    the provider streams any). It collapses to one `∴ Thought for 6s`
@@ -97,6 +116,7 @@ The mode badge tells you where keystrokes go.
 | digits, `Tab` | switch tabs (digits follow the live tab count) |
 | `P` | provider picker (switch backend = fresh session) |
 | `R` | respawn active tab with a FRESH session, same backend |
+| `Esc` | stop the running turn (press again to force) |
 | `m` | mouse capture on/off |
 | `q` | quit |
 

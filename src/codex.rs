@@ -94,13 +94,29 @@ pub async fn codex_resume_thread(host: &Host, thread_id: &str) -> Result<String,
     Ok(resumed.to_string())
 }
 
-pub async fn codex_submit(host: &Host, thread_id: &str, prompt: &str) -> Result<(), RpcError> {
+/// Start a turn; returns `result.turn.id` (needed to interrupt it).
+pub async fn codex_submit(
+    host: &Host,
+    thread_id: &str,
+    prompt: &str,
+) -> Result<Option<String>, RpcError> {
     host.call(
         "turn/start",
         serde_json::json!({
             "threadId": thread_id,
             "input": [{"type": "text", "text": prompt}],
         }),
+    )
+    .await
+    .map(|res| msp::turn_id_of(&res))
+}
+
+/// Interrupt a running turn (app-server v2; `turnId` is required). The
+/// turn ends via its normal `turn/completed`.
+pub async fn codex_interrupt(host: &Host, thread_id: &str, turn_id: &str) -> Result<(), RpcError> {
+    host.call(
+        "turn/interrupt",
+        serde_json::json!({"threadId": thread_id, "turnId": turn_id}),
     )
     .await
     .map(|_| ())
@@ -156,6 +172,22 @@ pub fn apply_codex_notif(app: &mut App, tab: usize, method: &str, params: &Value
             }
             false
         }
+        "turn/started" => {
+            let s = &mut app.sessions[tab];
+            if s.busy
+                && let Some(id) = msp::turn_id_of(params)
+            {
+                s.turn_id = Some(id);
+            }
+            false
+        }
+        "thread/tokenUsage/updated" => {
+            let n = params
+                .pointer("/tokenUsage/last/totalTokens")
+                .and_then(crate::app::take_u64);
+            app.sessions[tab].note_tokens(n);
+            false
+        }
         "turn/completed" => {
             let s = &mut app.sessions[tab];
             s.flush_thought();
@@ -194,7 +226,7 @@ pub fn apply_codex_notif(app: &mut App, tab: usize, method: &str, params: &Value
             let s = &mut app.sessions[tab];
             if !active && s.pending_diff.is_none() {
                 s.busy = false;
-            } else if active {
+            } else if active && !s.sealed {
                 s.busy = true;
             }
             false
@@ -688,5 +720,50 @@ mod tests {
             Err(e) => panic!("bringup failed for the wrong reason: {e}"),
         }
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    fn codex_app() -> App {
+        let mut app = App::new();
+        app.active_mut().backend = crate::app::BackendKind::Codex;
+        app.active_mut().remote_id = Some("th".into());
+        app
+    }
+
+    #[test]
+    fn token_usage_uses_last_turn_total_only() {
+        let mut app = codex_app();
+        let p = serde_json::json!({"tokenUsage": {
+            "last": {"totalTokens": 2500},
+            "total": {"totalTokens": 99000},
+        }});
+        apply_codex_notif(&mut app, 0, "thread/tokenUsage/updated", &p);
+        assert_eq!(app.active().tokens, Some(2500));
+        // No `last`: the cumulative total is not a context size.
+        let mut app = codex_app();
+        let p = serde_json::json!({"tokenUsage": {"total": {"totalTokens": 99000}}});
+        apply_codex_notif(&mut app, 0, "thread/tokenUsage/updated", &p);
+        assert_eq!(app.active().tokens, None);
+    }
+
+    #[test]
+    fn turn_started_captures_turn_id_so_stop_can_name_it() {
+        let mut app = codex_app();
+        app.active_mut().busy = true;
+        apply_codex_notif(&mut app, 0, "turn/started", &serde_json::json!({"turn": {"id": "tu-3"}}));
+        assert_eq!(app.active().turn_id.as_deref(), Some("tu-3"));
+        app.request_stop();
+        assert_eq!(app.outbox.stops[0].turn_id.as_deref(), Some("tu-3"));
+    }
+
+    #[test]
+    fn sealed_tab_ignores_late_active_status() {
+        let mut app = codex_app();
+        app.active_mut().busy = true;
+        app.active_mut().turn_id = Some("tu".into());
+        app.request_stop();
+        app.request_stop();
+        let active = serde_json::json!({"status": {"type": "active"}});
+        apply_codex_notif(&mut app, 0, "thread/status/changed", &active);
+        assert!(!app.active().busy);
     }
 }

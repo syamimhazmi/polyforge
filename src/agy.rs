@@ -31,6 +31,24 @@ impl AgyHandle {
     pub async fn shutdown(mut self) {
         let _ = self.child.kill().await;
     }
+
+    /// OS pid of the child (None once it has been reaped).
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    /// Stop the running turn: headless agy has no stdin interrupt, so send
+    /// SIGINT (the turn then ends with `result.status == "INTERRUPTED"`).
+    /// False when the child is gone or `kill` could not be run.
+    pub fn interrupt(&self) -> bool {
+        let Some(pid) = self.child.id() else {
+            return false;
+        };
+        std::process::Command::new("kill")
+            .args(["-INT", &pid.to_string()])
+            .status()
+            .is_ok_and(|s| s.success())
+    }
 }
 
 /// Spawn the child and its stdout/stderr pumps. Returns before `init`
@@ -48,6 +66,7 @@ pub async fn spawn_agy(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    let pid = child.id();
     let stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
@@ -111,6 +130,14 @@ pub async fn spawn_agy(
                 Err(_) => break,
             }
         }
+        // A dead child must not leave its tab busy forever. Routed by pid
+        // in the main loop (a replaced child's pid no longer matches).
+        let _ = stdout_tx
+            .send(ServerMsg::Notif {
+                method: "agy/exit".into(),
+                params: serde_json::json!({"pid": pid}),
+            })
+            .await;
     });
     // Stderr pump: permission soft-denials and diagnostics live here.
     // Same S1-F1 cap: stderr is equally child-controlled.
@@ -173,6 +200,9 @@ pub fn apply_agy_notif(app: &mut App, tab: usize, method: &str, params: &Value) 
             let s = &mut app.sessions[tab];
             s.pending_agy_init = false;
             if let Some(id) = params.get("conversation_id").and_then(|v| v.as_str()) {
+                if s.remote_id.as_deref() != Some(id) {
+                    s.tokens = None;
+                }
                 s.remote_id = Some(id.to_string());
                 let short: String = id.chars().take(8).collect();
                 s.push_line(format!("agy: session {short}"));
@@ -180,8 +210,22 @@ pub fn apply_agy_notif(app: &mut App, tab: usize, method: &str, params: &Value) 
             }
             false
         }
+        "agy/exit" => {
+            let s = &mut app.sessions[tab];
+            if s.busy {
+                s.busy = false;
+                s.push_line("agy: process exited".to_string());
+            }
+            false
+        }
         "agy/step_update" => {
             let su = params.get("step_update").unwrap_or(params);
+            // Per-step usage; `result.usage` is cumulative and ignored.
+            let used = su
+                .pointer("/usage/total_tokens")
+                .or_else(|| params.pointer("/usage/total_tokens"))
+                .and_then(crate::app::take_u64);
+            app.sessions[tab].note_tokens(used);
             let step_type = su.get("step_type").and_then(|v| v.as_str()).unwrap_or("");
             match step_type {
                 "agent_response" => {
@@ -459,5 +503,62 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let res = spawn_agy("/nonexistent/agy-xyz", &[], "/tmp", tx).await;
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn step_update_usage_sets_tokens_and_result_usage_is_ignored() {
+        let mut app = agy_app();
+        let step = serde_json::json!({"event": "step_update", "step_update": {
+            "step_type": "agent_response", "text_delta": "hi",
+            "usage": {"total_tokens": 1500},
+        }});
+        apply_agy_notif(&mut app, 0, "agy/step_update", &step);
+        assert_eq!(app.active().tokens, Some(1500));
+        let res = serde_json::json!({"event": "result", "result": {
+            "status": "SUCCESS", "usage": {"total_tokens": 900000},
+        }});
+        apply_agy_notif(&mut app, 0, "agy/result", &res);
+        assert_eq!(app.active().tokens, Some(1500));
+    }
+
+    #[test]
+    fn exit_clears_busy_once_and_stop_line_follows() {
+        let mut app = agy_app();
+        app.active_mut().busy = true;
+        app.active_mut().sync_activity();
+        app.request_stop();
+        apply_agy_notif(&mut app, 0, "agy/exit", &serde_json::json!({"pid": 1}));
+        assert!(!app.active().busy);
+        assert!(app.active().lines.iter().any(|l| l == "agy: process exited"));
+        app.active_mut().sync_activity();
+        assert_eq!(app.active().lines.last().map(String::as_str), Some("■ stopped"));
+        // Already idle: a second exit says nothing.
+        let n = app.active().lines.len();
+        apply_agy_notif(&mut app, 0, "agy/exit", &serde_json::json!({"pid": 1}));
+        assert_eq!(app.active().lines.len(), n);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dead_child_sends_exit_and_interrupt_signals_live_child() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        // `sleep` ignores stdin; SIGINT ends it, which closes stdout.
+        let h = spawn_agy("/bin/sh", &["-c".to_string(), "sleep 30".to_string()], "/tmp", tx)
+            .await
+            .unwrap();
+        let pid = h.pid().expect("live child has a pid");
+        assert!(h.interrupt());
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await.expect("channel open") {
+                    ServerMsg::Notif { method, params } if method == "agy/exit" => break params,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("exit event");
+        assert_eq!(msg["pid"].as_u64(), Some(u64::from(pid)));
+        h.shutdown().await;
     }
 }

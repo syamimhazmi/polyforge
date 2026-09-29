@@ -24,7 +24,7 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers, MouseEventKind},
+    event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind},
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -37,21 +37,22 @@ use agy::{
 };
 use app::{App, BackendKind, DecisionKind, Mode, OutboxDecide};
 use claude::{
-    ClaudeChildren, apply_claude_notif, claude_frame_matches, claude_send, claude_submit,
-    map_claude_decision, queue_claude_frame, spawn_claude,
+    ClaudeChildren, apply_claude_notif, claude_frame_matches, claude_interrupt, claude_send,
+    claude_submit, map_claude_decision, queue_claude_frame, spawn_claude,
 };
 use codex::{
-    apply_codex_approval, apply_codex_notif, codex_bringup, codex_respond, codex_resume_thread,
-    codex_start_thread, map_codex_decision,
+    apply_codex_approval, apply_codex_notif, codex_bringup, codex_interrupt, codex_respond,
+    codex_resume_thread, codex_start_thread, map_codex_decision,
 };
 use config::Config;
 use grok::{
-    apply_grok_notif, apply_grok_permission, grok_bringup, grok_close_session, grok_new_session,
-    grok_respond, grok_resume_session, grok_submit, map_grok_decision,
+    apply_grok_notif, apply_grok_permission, grok_bringup, grok_cancel, grok_close_session,
+    grok_new_session, grok_respond, grok_resume_session, grok_submit, map_grok_decision,
 };
 use msp::ServerMsg;
 use provider::{
-    map_decision, muse_bringup, muse_decide, muse_resume_session, muse_start_session, muse_submit,
+    map_decision, muse_bringup, muse_decide, muse_interrupt, muse_resume_session,
+    muse_start_session, muse_submit,
 };
 
 #[tokio::main]
@@ -347,8 +348,15 @@ async fn open_tab_session(
     let (backend, workspace) = (app.sessions[tab].backend, cfg.workspace_root());
     // Resume candidate from the store; cleared so a stale id never lingers.
     let resume = app.sessions[tab].remote_id.clone();
+    let prev_id = resume.clone();
     let s = &mut app.sessions[tab];
     s.remote_id = None;
+    s.reset_turn_state();
+    // Context size belongs to the session: only a resume of the same id
+    // keeps it.
+    if resume.is_none() {
+        s.tokens = None;
+    }
     s.tab_degraded = None;
     let tag = backend.label();
     let fail = |app: &mut App, reason: &str| {
@@ -360,6 +368,9 @@ async fn open_tab_session(
     // Record the outcome for the next boot.
     let opened = |app: &mut App, id: String, resumed: bool| {
         let s = &mut app.sessions[tab];
+        if prev_id.as_deref() != Some(id.as_str()) {
+            s.tokens = None;
+        }
         s.remote_id = Some(id);
         if resumed {
             s.push_line(format!("{tag}: resumed previous session"));
@@ -662,8 +673,14 @@ async fn run(
                             dirty = true;
                         }
                         // Drag-to-select in the transcript; release copies.
-                        MouseEventKind::Down(_) => {
-                            if app.mouse && app.sel_begin(m.column, m.row) {
+                        MouseEventKind::Down(btn) => {
+                            // The `[stop]` button wins over selection.
+                            if app.mouse
+                                && btn == MouseButton::Left
+                                && app.click_stop(m.column, m.row)
+                            {
+                                dirty = true;
+                            } else if app.mouse && app.sel_begin(m.column, m.row) {
                                 dirty = true;
                             }
                         }
@@ -719,9 +736,9 @@ async fn run(
             agy_msg = agy_rx.recv() => {
                 if let Some(msg) = agy_msg {
                     // Agy children share one channel; drain the burst.
-                    let mut bell = handle_server_msg(app, BackendKind::Agy, msg);
+                    let mut bell = handle_agy_msg(app, &backends, msg);
                     while let Ok(m) = agy_rx.try_recv() {
-                        bell |= handle_server_msg(app, BackendKind::Agy, m);
+                        bell |= handle_agy_msg(app, &backends, m);
                     }
                     if bell {
                         ring_bell();
@@ -908,6 +925,41 @@ fn claude_frame_current(backends: &Backends, msg: &ServerMsg) -> bool {
     claude_frame_matches(live, params["generation"].as_u64())
 }
 
+/// Agy frames, plus the pump's synthetic `agy/exit`: it names the dead
+/// child by pid, so only the tab whose live handle still owns that pid is
+/// touched (a replaced or closed child matches nothing).
+fn handle_agy_msg(app: &mut App, backends: &Backends, msg: ServerMsg) -> bool {
+    if let ServerMsg::Notif { method, params } = &msg
+        && method == "agy/exit"
+    {
+        let pid = params.get("pid").and_then(|v| v.as_u64());
+        let tab = backends.agy.iter().position(|h| {
+            pid.is_some() && h.as_ref().and_then(|h| h.pid()).map(u64::from) == pid
+        });
+        return tab.is_some_and(|t| apply_agy_notif(app, t, method, params));
+    }
+    handle_server_msg(app, BackendKind::Agy, msg)
+}
+
+/// A stop is in flight: an approval that arrives now is declined through
+/// the normal reject path instead of opening a card nobody is waiting on.
+fn decline_if_stopping(app: &mut App, tab: usize) {
+    let Some(s) = app.sessions.get(tab) else {
+        return;
+    };
+    if s.stopping.is_none() || s.backend == BackendKind::Mock {
+        return;
+    }
+    let Some(tool) = s.pending_diff.as_ref().map(|d| d.file.clone()) else {
+        return;
+    };
+    // decide_ui answers the ACTIVE tab; point it at `tab` for the call.
+    let prev = std::mem::replace(&mut app.active, tab);
+    decide_ui(app, DecisionKind::Reject, "rejected");
+    app.active = prev;
+    app.sessions[tab].push_line(format!("stop: declined {tool} approval"));
+}
+
 fn handle_server_msg(app: &mut App, kind: BackendKind, msg: ServerMsg) -> bool {
     let tag = kind.label();
     match msg {
@@ -953,19 +1005,25 @@ fn handle_server_msg(app: &mut App, kind: BackendKind, msg: ServerMsg) -> bool {
                 }
                 _ => tab_for_session(app, kind, &params).unwrap_or(app.active),
             };
-            match kind {
+            let bell = match kind {
                 BackendKind::Muse => provider::apply_notif(app, tab, &method, &params),
                 BackendKind::Codex => apply_codex_notif(app, tab, &method, &params),
                 BackendKind::Grok => apply_grok_notif(app, tab, &method, &params),
                 BackendKind::Agy => apply_agy_notif(app, tab, &method, &params),
                 BackendKind::Claude => apply_claude_notif(app, tab, &method, &params),
                 BackendKind::Mock => false,
-            }
+            };
+            decline_if_stopping(app, tab);
+            bell
         }
         ServerMsg::Request { id, method, params } => match kind {
             BackendKind::Codex => {
                 match tab_for_session(app, kind, &params) {
-                    Some(tab) => apply_codex_approval(app, tab, &method, id, &params),
+                    Some(tab) => {
+                        let bell = apply_codex_approval(app, tab, &method, id, &params);
+                        decline_if_stopping(app, tab);
+                        bell
+                    }
                     // S2-F1: an orphan approval must never bind its
                     // modal to the active tab. Fail closed: queue a
                     // host-level deny (no session needed to send it)
@@ -990,7 +1048,11 @@ fn handle_server_msg(app: &mut App, kind: BackendKind, msg: ServerMsg) -> bool {
                 }
             }
             BackendKind::Grok => match tab_for_session(app, kind, &params) {
-                Some(tab) => apply_grok_permission(app, tab, &method, id, &params),
+                Some(tab) => {
+                    let bell = apply_grok_permission(app, tab, &method, id, &params);
+                    decline_if_stopping(app, tab);
+                    bell
+                }
                 None => {
                     grok::queue_grok_cancelled(app, app.active, id);
                     app.active_mut()
@@ -1067,6 +1129,54 @@ async fn drain_outbox(
         }
         open_tab_session(backends, app, r.tab, cfg, agy_tx).await;
     }
+    // Stops go out before submits: a stop must not queue behind new work.
+    // Snapshots (ids taken at press time); nothing here awaits a reply.
+    for st in std::mem::take(&mut app.outbox.stops) {
+        did = true;
+        let tag = st.backend.label();
+        let unsent = format!("{tag}: stop not sent — press again to force");
+        match st.backend {
+            BackendKind::Mock => {}
+            BackendKind::Muse | BackendKind::Codex | BackendKind::Grok => {
+                let host = backends.get(st.backend).map(|c| c.host.clone());
+                let (Some(host), Some(id)) = (host, st.remote_id) else {
+                    app.flash = unsent;
+                    continue;
+                };
+                match st.backend {
+                    BackendKind::Muse => {
+                        tokio::spawn(async move {
+                            let _ = muse_interrupt(&host, &id, st.turn_id.as_deref()).await;
+                        });
+                    }
+                    BackendKind::Codex => {
+                        let Some(turn) = st.turn_id else {
+                            app.flash = unsent;
+                            continue;
+                        };
+                        tokio::spawn(async move {
+                            let _ = codex_interrupt(&host, &id, &turn).await;
+                        });
+                    }
+                    _ => {
+                        tokio::spawn(async move { grok_cancel(&host, &id).await });
+                    }
+                }
+            }
+            BackendKind::Claude => {
+                let handle = st.remote_id.as_ref().and_then(|id| backends.claude.get(id));
+                if handle.map(claude_interrupt).is_none_or(|r| r.is_err()) {
+                    app.flash = unsent;
+                }
+            }
+            BackendKind::Agy => {
+                let handle = backends.agy.get(st.tab).and_then(|o| o.as_ref());
+                if !handle.is_some_and(|h| h.interrupt()) {
+                    app.flash = unsent;
+                }
+            }
+        }
+    }
     while let Some(sub) = app.outbox.submits.pop() {
         did = true;
         let tag = sub.backend.label();
@@ -1139,12 +1249,15 @@ async fn drain_outbox(
                     BackendKind::Mock
                     | BackendKind::Agy
                     | BackendKind::Grok
-                    | BackendKind::Claude => Ok(()),
+                    | BackendKind::Claude => Ok(None),
                 };
-                if let Err(e) = res {
-                    let s = &mut app.sessions[sub.tab];
-                    s.busy = false;
-                    s.push_line(format!("{tag}: turn/start failed: {e}"));
+                match res {
+                    Ok(turn_id) => app.sessions[sub.tab].turn_id = turn_id,
+                    Err(e) => {
+                        let s = &mut app.sessions[sub.tab];
+                        s.busy = false;
+                        s.push_line(format!("{tag}: turn/start failed: {e}"));
+                    }
                 }
             }
             _ => {
@@ -1550,6 +1663,12 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             KeyCode::Char(' ') => {
                 clear_pending_g(app);
                 app.mode = Mode::Insert;
+            }
+            // Stop the running turn (a pending card was handled above:
+            // Esc defers it instead). Idle tabs: no-op.
+            KeyCode::Esc if no_mods => {
+                clear_pending_g(app);
+                app.request_stop();
             }
             KeyCode::Char('m') if no_mods => {
                 clear_pending_g(app);
@@ -2548,5 +2667,234 @@ mod tests {
         assert!(app.active().approval_risk.is_none());
         assert!(app.active().risk_spawned_gen.is_none());
         assert!(app.flash.contains("boom"));
+    }
+
+    fn busy_tab(backend: BackendKind) -> App {
+        let mut app = App::new();
+        let s = app.active_mut();
+        s.backend = backend;
+        s.remote_id = Some("sess-1".into());
+        s.busy = true;
+        s.sync_activity();
+        app
+    }
+
+    /// Esc in Normal mode stops a busy tab (one queued stop) and does
+    /// nothing on an idle one.
+    #[test]
+    fn esc_in_normal_mode_queues_a_stop_on_a_busy_tab() {
+        let mut app = busy_tab(BackendKind::Grok);
+        handle_key(&mut app, KeyCode::Esc, NONE);
+        assert_eq!(app.outbox.stops.len(), 1);
+        assert_eq!(app.outbox.stops[0].backend, BackendKind::Grok);
+        assert!(app.active().stopping.is_some());
+        let mut idle = App::new();
+        handle_key(&mut idle, KeyCode::Esc, NONE);
+        assert!(idle.outbox.stops.is_empty() && idle.active().stopping.is_none());
+    }
+
+    /// With a card open, Esc keeps deferring it and never stops the turn.
+    #[test]
+    fn esc_with_pending_card_still_defers_not_stops() {
+        let mut app = muse_modal_app();
+        app.active_mut().busy = true;
+        handle_key(&mut app, KeyCode::Esc, NONE);
+        assert!(app.outbox.stops.is_empty());
+        assert!(app.active().stopping.is_none());
+        assert!(app.flash.contains("no deny path"), "{}", app.flash);
+    }
+
+    /// An approval that arrives while a stop is in flight is rejected on
+    /// the wire instead of opening a card.
+    #[test]
+    fn approval_arriving_while_stopping_is_declined() {
+        let mut app = busy_tab(BackendKind::Muse);
+        app.request_stop();
+        handle_server_msg(
+            &mut app,
+            BackendKind::Muse,
+            ServerMsg::Notif {
+                method: "approval/requested".into(),
+                params: serde_json::json!({
+                    "sessionId": "sess-1",
+                    "toolName": "bash",
+                    "approvalId": "ap-1",
+                    "availableChoices": [
+                        {"choiceId": "c-allow", "decision": "approved", "scope": "once", "label": "Allow"},
+                        {"choiceId": "c-deny", "decision": "denied", "scope": "once", "label": "Deny"},
+                    ],
+                }),
+            },
+        );
+        let s = app.active();
+        assert!(s.pending_diff.is_none() && s.pending_approval.is_none());
+        assert_eq!(app.outbox.decides.len(), 1);
+        assert_eq!(app.outbox.decides[0].choice_id, "c-deny");
+        assert!(s.lines.iter().any(|l| l == "stop: declined bash approval"));
+        // Not stopping: the card opens as usual.
+        let mut calm = busy_tab(BackendKind::Muse);
+        handle_server_msg(
+            &mut calm,
+            BackendKind::Muse,
+            ServerMsg::Notif {
+                method: "approval/requested".into(),
+                params: serde_json::json!({
+                    "sessionId": "sess-1",
+                    "toolName": "bash",
+                    "availableChoices": [
+                        {"choiceId": "c-deny", "decision": "denied", "scope": "once", "label": "Deny"},
+                    ],
+                }),
+            },
+        );
+        assert!(calm.active().pending_diff.is_some());
+        assert!(calm.outbox.decides.is_empty());
+    }
+
+    /// The synthetic agy exit names a pid; with no live handle owning it
+    /// nothing is touched (replaced/closed children are ignored).
+    #[test]
+    fn agy_exit_for_unknown_pid_is_ignored() {
+        let mut app = busy_tab(BackendKind::Agy);
+        let backends = Backends::default();
+        let msg = ServerMsg::Notif {
+            method: "agy/exit".into(),
+            params: serde_json::json!({"pid": 4242}),
+        };
+        assert!(!handle_agy_msg(&mut app, &backends, msg));
+        assert!(app.active().busy);
+    }
+
+    /// Host that echoes every frame it receives back as a notification.
+    #[cfg(unix)]
+    async fn echo_backend() -> LiveBackend {
+        let (tx, rx) = mpsc::channel(8);
+        let host = msp::Host::spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                r#"while read -r l; do printf '{"method":"observed","params":%s}\n' "$l"; done"#,
+            ],
+            &[],
+            tx,
+        )
+        .await
+        .unwrap();
+        LiveBackend {
+            host: std::sync::Arc::new(host),
+            rx,
+        }
+    }
+
+    /// Stops reach the right wire method per backend from the snapshot ids
+    /// (codex: turn/interrupt with thread + turn; grok: session/cancel).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_sends_stop_frames_from_snapshot() {
+        let (agy_tx, _agy_rx) = mpsc::channel(1);
+        let mut backends = Backends {
+            codex: Some(echo_backend().await),
+            grok: Some(echo_backend().await),
+            muse: Some(echo_backend().await),
+            ..Default::default()
+        };
+        let mut app = App::new();
+        app.outbox.stops.push(app::OutboxStop {
+            tab: 0,
+            backend: BackendKind::Codex,
+            remote_id: Some("th-1".into()),
+            turn_id: Some("tu-1".into()),
+        });
+        app.outbox.stops.push(app::OutboxStop {
+            tab: 0,
+            backend: BackendKind::Grok,
+            remote_id: Some("acp-1".into()),
+            turn_id: None,
+        });
+        app.outbox.stops.push(app::OutboxStop {
+            tab: 0,
+            backend: BackendKind::Muse,
+            remote_id: Some("mu-1".into()),
+            turn_id: None,
+        });
+        // Codex without a turn id cannot be interrupted: says so.
+        app.outbox.stops.push(app::OutboxStop {
+            tab: 0,
+            backend: BackendKind::Codex,
+            remote_id: Some("th-1".into()),
+            turn_id: None,
+        });
+        let cfg = Config::default();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            assert!(drain_outbox(&mut app, &mut backends, &cfg, &agy_tx).await);
+            assert!(app.outbox.stops.is_empty());
+            assert!(app.flash.contains("stop not sent"), "{}", app.flash);
+            let next = async |slot: &mut Option<LiveBackend>| match slot
+                .as_mut()
+                .unwrap()
+                .rx
+                .recv()
+                .await
+                .unwrap()
+            {
+                ServerMsg::Notif { params, .. } => params,
+                other => panic!("unexpected {other:?}"),
+            };
+            let p = next(&mut backends.codex).await;
+            assert_eq!(p["method"], "turn/interrupt");
+            assert_eq!(p["params"]["threadId"], "th-1");
+            assert_eq!(p["params"]["turnId"], "tu-1");
+            let p = next(&mut backends.grok).await;
+            assert_eq!(p["method"], "session/cancel");
+            assert_eq!(p["params"]["sessionId"], "acp-1");
+            assert!(p.get("id").is_none(), "cancel is a notification");
+            let p = next(&mut backends.muse).await;
+            assert_eq!(p["method"], "turn/interrupt");
+            assert_eq!(p["params"]["sessionId"], "mu-1");
+            assert!(p["params"].get("turnId").is_none());
+        })
+        .await
+        .expect("drain timed out");
+    }
+
+    /// The awaited turn/start result supplies the codex turn id.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_submit_stores_turn_id_from_result() {
+        let (tx, rx) = mpsc::channel(4);
+        let host = msp::Host::spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                r#"read -r l; printf '{"jsonrpc":"2.0","id":1,"result":{"turn":{"id":"turn-7"}}}\n'; while read -r l; do :; done"#,
+            ],
+            &[],
+            tx,
+        )
+        .await
+        .unwrap();
+        let mut backends = Backends {
+            codex: Some(LiveBackend {
+                host: std::sync::Arc::new(host),
+                rx,
+            }),
+            ..Default::default()
+        };
+        let mut app = busy_tab(BackendKind::Codex);
+        app.outbox.submits.push(app::OutboxSubmit {
+            tab: 0,
+            backend: BackendKind::Codex,
+            prompt: "hi".into(),
+        });
+        let (agy_tx, _agy_rx) = mpsc::channel(1);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            drain_outbox(&mut app, &mut backends, &Config::default(), &agy_tx).await;
+        })
+        .await
+        .expect("drain timed out");
+        assert_eq!(app.active().turn_id.as_deref(), Some("turn-7"));
+        // Stop now snapshots that id.
+        app.request_stop();
+        assert_eq!(app.outbox.stops[0].turn_id.as_deref(), Some("turn-7"));
     }
 }

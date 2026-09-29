@@ -141,6 +141,13 @@ pub async fn grok_close_session(host: &Host, session_id: &str) {
         .await;
 }
 
+/// ACP `session/cancel` (a notification: the blocked `session/prompt`
+/// then answers with stopReason `cancelled`, ending the turn).
+pub async fn grok_cancel(host: &Host, session_id: &str) {
+    host.notify_params("session/cancel", serde_json::json!({"sessionId": session_id}))
+        .await;
+}
+
 /// Submit a prompt WITHOUT blocking the drain loop: `session/prompt`
 /// answers only at turn end, so the call runs spawned and completion
 /// re-enters through `done_tx` as `grok/prompt_completed`.
@@ -335,10 +342,17 @@ fn apply_session_update(app: &mut App, tab: usize, update: &Value) -> bool {
             } else {
                 s.push_line(format!("grok: ⚙ {title} [{k}]"));
             }
-            s.busy = true;
+            if !s.sealed {
+                s.busy = true;
+            }
             if tab == app.active {
                 app.stick_to_bottom();
             }
+            false
+        }
+        "usage_update" => {
+            let n = update.get("used").and_then(crate::app::take_u64);
+            app.sessions[tab].note_tokens(n);
             false
         }
         "tool_call_update" => {
@@ -1081,4 +1095,46 @@ fn truncate(s: &str, max: usize) -> String {
         end = i + c.len_utf8();
     }
     format!("{}…[truncated {} chars]", &s[..end], s.len() - end)
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+    use crate::app::{App, BackendKind};
+
+    fn grok_tab() -> App {
+        let mut app = App::new();
+        app.active_mut().backend = BackendKind::Grok;
+        app.active_mut().remote_id = Some("s".into());
+        app
+    }
+
+    #[test]
+    fn usage_update_sets_tokens() {
+        let mut app = grok_tab();
+        let p = serde_json::json!({"sessionId": "s", "update": {
+            "sessionUpdate": "usage_update", "used": 12345, "size": 200000,
+        }});
+        apply_grok_notif(&mut app, 0, "session/update", &p);
+        assert_eq!(app.active().tokens, Some(12345));
+        let junk = serde_json::json!({"update": {"sessionUpdate": "usage_update", "used": -3}});
+        apply_grok_notif(&mut app, 0, "session/update", &junk);
+        assert_eq!(app.active().tokens, Some(12345));
+    }
+
+    #[test]
+    fn sealed_tab_ignores_late_tool_call_busy() {
+        let mut app = grok_tab();
+        app.active_mut().busy = true;
+        app.request_stop();
+        app.request_stop();
+        assert!(!app.active().busy);
+        let p = serde_json::json!({"update": {"sessionUpdate": "tool_call", "title": "ls"}});
+        apply_grok_notif(&mut app, 0, "session/update", &p);
+        assert!(!app.active().busy);
+        // Without a seal the tool call still marks the tab busy.
+        app.active_mut().sealed = false;
+        apply_grok_notif(&mut app, 0, "session/update", &p);
+        assert!(app.active().busy);
+    }
 }

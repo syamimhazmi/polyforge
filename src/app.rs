@@ -340,11 +340,37 @@ pub struct OutboxRespawn {
     pub backend: BackendKind,
 }
 
+/// Stop request, snapshotted at press time so a later tab close / respawn
+/// cannot retarget it (the drain uses these ids, not the live session).
+#[derive(Debug, Default)]
+pub struct OutboxStop {
+    pub tab: usize,
+    pub backend: BackendKind,
+    pub remote_id: Option<String>,
+    pub turn_id: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct Outbox {
     pub submits: Vec<OutboxSubmit>,
     pub decides: Vec<OutboxDecide>,
     pub respawns: Vec<OutboxRespawn>,
+    pub stops: Vec<OutboxStop>,
+}
+
+/// Transcript line when a stop lands (turn ended after a stop request).
+pub const STOPPED_LINE: &str = "■ stopped";
+/// Second stop press: the backend never ended the turn, so give up locally.
+pub const FORCED_STOP_LINE: &str = "■ stopped (forced; late output may still arrive)";
+
+/// Non-negative integer from a JSON number or an integer-valued numeric
+/// string; fractions, negatives and everything else are None.
+pub fn take_u64(v: &serde_json::Value) -> Option<u64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    }
 }
 
 pub struct Session {
@@ -424,6 +450,16 @@ pub struct Session {
     /// `lines.len()` when the turn was detected; lines at or past this
     /// index belong to the live turn.
     pub turn_first_line: usize,
+    /// Set when the user asked to stop the running turn; cleared when the
+    /// turn ends. Drives the `Stopping…` label and the second-press force.
+    pub stopping: Option<std::time::Instant>,
+    /// Set by a forced stop: status-driven re-busy events are ignored until
+    /// the next user submit (the backend may still be emitting).
+    pub sealed: bool,
+    /// Backend id of the running turn (codex/muse) when known.
+    pub turn_id: Option<String>,
+    /// Latest context occupancy the backend reported (not a per-turn sum).
+    pub tokens: Option<u64>,
 }
 
 impl Session {
@@ -464,6 +500,25 @@ impl Session {
             phase_since: None,
             turn_since: None,
             turn_first_line: 0,
+            stopping: None,
+            sealed: false,
+            turn_id: None,
+            tokens: None,
+        }
+    }
+
+    /// Forget per-turn stop state (tab reset / session replace) so a stale
+    /// stop can never emit a line on the fresh transcript.
+    pub fn reset_turn_state(&mut self) {
+        self.stopping = None;
+        self.sealed = false;
+        self.turn_id = None;
+    }
+
+    /// Record a backend token report. Zero/absent never clobbers a good value.
+    pub fn note_tokens(&mut self, n: Option<u64>) {
+        if let Some(n) = n.filter(|&n| n > 0) {
+            self.tokens = Some(n);
         }
     }
 
@@ -482,6 +537,13 @@ impl Session {
             self.phase = None;
             self.phase_since = None;
             self.turn_since = None;
+        }
+        if !self.busy {
+            self.turn_id = None;
+            // A turn that ended after a stop request is a completed stop.
+            if self.stopping.take().is_some() {
+                self.push_line(STOPPED_LINE.to_string());
+            }
         }
     }
 
@@ -747,6 +809,8 @@ pub struct App {
     /// Inner transcript rect (x, y, w, h) from the last render, for mouse
     /// cell → text mapping. None before the first frame.
     pub text_area: Option<(u16, u16, u16, u16)>,
+    /// `[stop]` cells of the last frame (None when the row was not drawn).
+    pub stop_hit: Option<ratatui::layout::Rect>,
     /// Active mouse drag selection (highlight + copy source).
     pub sel: Option<Selection>,
 }
@@ -784,6 +848,7 @@ impl App {
             workspace: String::new(),
             onboarding: false,
             text_area: None,
+            stop_hit: None,
             sel: None,
         };
         // Fresh tabs open empty: no placeholder filler. Tests that need a
@@ -873,6 +938,8 @@ impl App {
         let sid = self.sessions[tab].remote_id.clone();
         let degraded = self.sessions[tab].tab_degraded.clone();
         let s = self.active_mut();
+        s.sealed = false;
+        s.turn_id = None;
         s.push_line(format!("> {prompt}"));
         match backend {
             BackendKind::Mock => crate::mock::start_job(s, &prompt),
@@ -906,6 +973,67 @@ impl App {
         }
         self.mode = Mode::Normal;
         self.stick_to_bottom();
+    }
+
+    /// Stop the active tab's running turn. First press asks the backend to
+    /// stop (queued in the outbox); a second press while it is still
+    /// stopping gives up locally and seals the tab against late re-busy.
+    pub fn request_stop(&mut self) {
+        let tab = self.active;
+        let s = &mut self.sessions[tab];
+        // A card must be answered first (Esc defers it instead).
+        if !s.busy || s.pending_diff.is_some() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if s.backend == BackendKind::Mock {
+            s.busy = false;
+            s.queue.clear();
+            s.diff_after = None;
+            s.stopping = Some(now);
+            self.flash = "stopping…".to_string();
+            return;
+        }
+        if s.stopping.is_some() {
+            s.busy = false;
+            s.stopping = None;
+            s.sealed = true;
+            s.turn_id = None;
+            s.push_line(FORCED_STOP_LINE.to_string());
+            self.flash = FORCED_STOP_LINE.to_string();
+            self.stick_to_bottom();
+            return;
+        }
+        // Codex interrupts by turn id; without one there is nothing to name.
+        if s.backend == BackendKind::Codex && s.turn_id.is_none() {
+            self.flash = "codex: turn not started yet — try again".to_string();
+            return;
+        }
+        s.stopping = Some(now);
+        self.outbox.stops.push(OutboxStop {
+            tab,
+            backend: s.backend,
+            remote_id: s.remote_id.clone(),
+            turn_id: s.turn_id.clone(),
+        });
+        self.flash = "stopping…".to_string();
+    }
+
+    /// Left click on the `[stop]` cells of the last frame. True when the
+    /// click was on the button and the tab could act on it.
+    pub fn click_stop(&mut self, col: u16, row: u16) -> bool {
+        let Some(r) = self.stop_hit else {
+            return false;
+        };
+        let s = self.active();
+        if !r.contains(ratatui::layout::Position::new(col, row))
+            || !s.busy
+            || s.pending_diff.is_some()
+        {
+            return false;
+        }
+        self.request_stop();
+        true
     }
 
     /// Indices into `SLASH_COMMANDS` matching the active tab's input as
@@ -1144,6 +1272,7 @@ impl App {
         self.outbox.submits.retain(|o| o.tab != tab);
         self.outbox.decides.retain(|o| o.tab != tab);
         self.outbox.respawns.retain(|o| o.tab != tab);
+        self.outbox.stops.retain(|o| o.tab != tab);
         self.agy_init_fifo.retain(|&t| t != tab);
         self.queue_claude_kill(tab);
         let backend = BackendKind::parse(&pick.backend).unwrap_or_default();
@@ -1157,9 +1286,13 @@ impl App {
         {
             let s = self.active_mut();
             s.backend = backend;
+            if s.remote_id != remote_id {
+                s.tokens = None;
+            }
             s.remote_id = remote_id;
             s.tab_degraded = None;
             s.busy = false;
+            s.reset_turn_state();
             s.pending_agy_init = false;
             s.queue.clear();
             s.diff_after = None;
@@ -1232,6 +1365,7 @@ impl App {
         self.outbox.submits.retain(|o| o.tab != tab);
         self.outbox.decides.retain(|o| o.tab != tab);
         self.outbox.respawns.retain(|o| o.tab != tab);
+        self.outbox.stops.retain(|o| o.tab != tab);
         self.agy_init_fifo.retain(|&t| t != tab);
         if backend == BackendKind::Agy {
             self.pending_agy_kill.push(tab);
@@ -1262,6 +1396,11 @@ impl App {
         for r in self.outbox.respawns.iter_mut() {
             if r.tab > tab {
                 r.tab -= 1;
+            }
+        }
+        for st in self.outbox.stops.iter_mut() {
+            if st.tab > tab {
+                st.tab -= 1;
             }
         }
         for t in self.agy_init_fifo.iter_mut() {
@@ -1297,7 +1436,7 @@ impl App {
             "  /tab close — close this tab, killing its session".to_string(),
             "  /theme [name] — switch theme, bare cycles (saved to config)".to_string(),
             "  /vim — toggle vim keymap (saved to config)".to_string(),
-            format!("keys (Normal mode): {move_keys} · P provider · R fresh · q quit"),
+            format!("keys (Normal mode): {move_keys} · P provider · R fresh · Esc stop turn · q quit"),
         ] {
             self.active_mut().push_line(l);
         }
@@ -1416,6 +1555,7 @@ impl App {
         self.outbox.submits.retain(|o| o.tab != tab);
         self.outbox.decides.retain(|o| o.tab != tab);
         self.outbox.respawns.retain(|o| o.tab != tab);
+        self.outbox.stops.retain(|o| o.tab != tab);
         self.agy_init_fifo.retain(|&t| t != tab);
         self.queue_claude_kill(tab);
         // Fresh session id on disk too (old files stay for `/sessions`).
@@ -1424,8 +1564,10 @@ impl App {
             let s = self.active_mut();
             s.backend = backend;
             s.remote_id = None;
+            s.tokens = None;
             s.tab_degraded = None;
             s.busy = false;
+            s.reset_turn_state();
             s.pending_agy_init = false;
             s.queue.clear();
             s.diff_after = None;
@@ -2869,5 +3011,188 @@ mod tests {
         let diff = s.pending_diff.as_ref().expect("staged");
         assert_eq!(diff.file, "tool");
         assert_eq!(diff.body, "do itnow");
+    }
+
+    fn busy_tab(backend: BackendKind) -> App {
+        let mut app = App::new();
+        let s = app.active_mut();
+        s.backend = backend;
+        s.remote_id = Some("r1".into());
+        s.busy = true;
+        s.sync_activity();
+        app
+    }
+
+    fn stopped_lines(s: &Session) -> usize {
+        s.lines.iter().filter(|l| l.starts_with("■ stopped")).count()
+    }
+
+    #[test]
+    fn stop_first_press_queues_one_snapshot_second_forces() {
+        let mut app = busy_tab(BackendKind::Muse);
+        app.active_mut().turn_id = Some("t1".into());
+        app.request_stop();
+        assert!(app.active().stopping.is_some());
+        assert_eq!(app.outbox.stops.len(), 1);
+        let st = &app.outbox.stops[0];
+        assert_eq!(st.tab, 0);
+        assert_eq!(st.backend, BackendKind::Muse);
+        assert_eq!(st.remote_id.as_deref(), Some("r1"));
+        assert_eq!(st.turn_id.as_deref(), Some("t1"));
+        assert!(app.active().busy);
+        app.request_stop();
+        assert_eq!(app.outbox.stops.len(), 1, "force sends nothing new");
+        let s = app.active();
+        assert!(!s.busy && s.stopping.is_none() && s.sealed && s.turn_id.is_none());
+        assert_eq!(s.lines.last().map(String::as_str), Some(FORCED_STOP_LINE));
+        // sync_activity must not add a second stop line.
+        app.active_mut().sync_activity();
+        assert_eq!(stopped_lines(app.active()), 1);
+    }
+
+    #[test]
+    fn stop_is_a_noop_when_idle_or_card_open() {
+        let mut app = App::new();
+        app.request_stop();
+        assert!(app.outbox.stops.is_empty() && app.active().stopping.is_none());
+        let mut app = busy_tab(BackendKind::Muse);
+        app.active_mut().stage_diff(PendingDiff {
+            file: "f".into(),
+            body: "b".into(),
+        });
+        app.request_stop();
+        assert!(app.outbox.stops.is_empty() && app.active().stopping.is_none());
+    }
+
+    #[test]
+    fn codex_stop_without_turn_id_does_not_enter_stopping() {
+        let mut app = busy_tab(BackendKind::Codex);
+        app.request_stop();
+        assert!(app.active().stopping.is_none());
+        assert!(app.outbox.stops.is_empty());
+        assert!(app.flash.contains("turn not started yet"));
+    }
+
+    #[test]
+    fn mock_stop_ends_immediately_with_one_line() {
+        let mut app = App::new();
+        app.active_mut().input = "go".into();
+        app.submit();
+        app.active_mut().sync_activity();
+        assert!(app.active().busy);
+        app.request_stop();
+        assert!(!app.active().busy && app.outbox.stops.is_empty());
+        app.active_mut().sync_activity();
+        assert_eq!(stopped_lines(app.active()), 1);
+        assert!(app.active().stopping.is_none() && app.active().queue.is_empty());
+    }
+
+    #[test]
+    fn natural_end_while_stopping_pushes_exactly_one_line() {
+        let mut app = busy_tab(BackendKind::Grok);
+        app.request_stop();
+        app.active_mut().busy = false; // backend ended the turn
+        app.active_mut().sync_activity();
+        app.active_mut().sync_activity();
+        let s = app.active();
+        assert_eq!(s.lines.last().map(String::as_str), Some(STOPPED_LINE));
+        assert_eq!(stopped_lines(s), 1);
+        assert!(s.stopping.is_none() && s.turn_id.is_none());
+        // A normal end without a stop adds nothing.
+        let mut calm = busy_tab(BackendKind::Grok);
+        calm.active_mut().busy = false;
+        calm.active_mut().sync_activity();
+        assert_eq!(stopped_lines(calm.active()), 0);
+    }
+
+    #[test]
+    fn reset_after_stop_pushes_no_stop_line() {
+        let mut app = busy_tab(BackendKind::Grok);
+        app.request_stop();
+        app.respawn_active(BackendKind::Grok);
+        app.active_mut().sync_activity();
+        assert_eq!(stopped_lines(app.active()), 0);
+        assert!(app.outbox.stops.is_empty(), "stale stop dropped");
+        assert!(!app.active().sealed && app.active().tokens.is_none());
+        let mut s = Session::new("x");
+        s.busy = true;
+        s.stopping = Some(std::time::Instant::now());
+        s.sealed = true;
+        s.turn_id = Some("t".into());
+        s.busy = false;
+        s.reset_turn_state();
+        s.sync_activity();
+        assert!(s.lines.is_empty() && !s.sealed && s.turn_id.is_none());
+    }
+
+    #[test]
+    fn closing_a_tab_drops_and_renumbers_stops() {
+        let mut app = App::new();
+        app.open_tab();
+        app.open_tab();
+        let stop = |tab| OutboxStop {
+            tab,
+            backend: BackendKind::Muse,
+            remote_id: None,
+            turn_id: None,
+        };
+        app.outbox.stops = vec![stop(0), stop(1), stop(2)];
+        app.active = 1;
+        app.close_active_tab().unwrap();
+        let tabs: Vec<usize> = app.outbox.stops.iter().map(|o| o.tab).collect();
+        assert_eq!(tabs, vec![0, 1]);
+    }
+
+    #[test]
+    fn submit_clears_seal_and_turn_id() {
+        let mut app = busy_tab(BackendKind::Muse);
+        app.request_stop();
+        app.request_stop();
+        assert!(app.active().sealed);
+        app.active_mut().turn_id = Some("old".into());
+        app.active_mut().input = "next".into();
+        app.submit();
+        assert!(!app.active().sealed && app.active().turn_id.is_none());
+    }
+
+    #[test]
+    fn click_stop_needs_the_button_and_an_actionable_tab() {
+        let mut app = busy_tab(BackendKind::Muse);
+        app.stop_hit = Some(ratatui::layout::Rect::new(10, 5, 6, 1));
+        assert!(!app.click_stop(9, 5));
+        assert!(!app.click_stop(16, 5));
+        assert!(!app.click_stop(10, 6));
+        assert!(app.outbox.stops.is_empty());
+        assert!(app.click_stop(12, 5));
+        assert_eq!(app.outbox.stops.len(), 1);
+        let mut idle = App::new();
+        idle.stop_hit = Some(ratatui::layout::Rect::new(10, 5, 6, 1));
+        assert!(!idle.click_stop(12, 5));
+        let mut card = busy_tab(BackendKind::Muse);
+        card.active_mut().stage_diff(PendingDiff {
+            file: "f".into(),
+            body: "b".into(),
+        });
+        card.stop_hit = Some(ratatui::layout::Rect::new(10, 5, 6, 1));
+        assert!(!card.click_stop(12, 5));
+    }
+
+    #[test]
+    fn take_u64_and_note_tokens() {
+        use serde_json::json;
+        assert_eq!(take_u64(&json!(12)), Some(12));
+        assert_eq!(take_u64(&json!("34")), Some(34));
+        assert_eq!(take_u64(&json!(-1)), None);
+        assert_eq!(take_u64(&json!(1.5)), None);
+        assert_eq!(take_u64(&json!("1.5")), None);
+        assert_eq!(take_u64(&json!("x")), None);
+        assert_eq!(take_u64(&json!(null)), None);
+        let mut s = Session::new("t");
+        s.note_tokens(Some(500));
+        s.note_tokens(Some(0));
+        s.note_tokens(None);
+        assert_eq!(s.tokens, Some(500));
+        s.note_tokens(Some(700));
+        assert_eq!(s.tokens, Some(700));
     }
 }
