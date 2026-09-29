@@ -88,7 +88,7 @@ provider = "muse"   # default backend: muse | codex | agy | grok | claude | mock
 
 Press `P` on any tab for the provider picker (`j/k` + `Enter`, `1-5`
 quick-pick, `Esc` cancels): the tab respawns under the chosen backend with
-a FRESH session — history never carries over. Tab bar shows each tab's
+a FRESH session — history never carries over. The header row shows each tab's
 backend (`s1:muse`).
 
 ## TypeSafe approval risk
@@ -149,7 +149,7 @@ cargo run            # first launch: pick a provider (2 = muse)
 # i → "reply with exactly: forge-ok" → Enter
 ```
 
-Expect a streamed reply, `muse: done ✓`, and a bell. Then try an edit and
+Expect a streamed reply, `Worked for …`, and a bell. Then try an edit and
 approve/deny from the modal. Zero-quota UI work: `provider = "mock"`.
 
 ## Known prototype deviations

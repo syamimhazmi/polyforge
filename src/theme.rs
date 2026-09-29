@@ -3,8 +3,10 @@
 //! Every widget color in [`crate::ui`] flows from one [`Theme`], selected
 //! by [`ThemeKind`]. Two dark palettes: [`ThemeKind::GrokNight`] (default,
 //! tokens from grok-build's `groknight.rs`) and [`ThemeKind::TokyoNight`].
-//! Only foregrounds, borders, and accents are themed — never background
-//! fills — so the UI stays readable on any terminal background.
+//! Foregrounds, borders, and accents are themed; the only background fills
+//! are the user-prompt block (`user_bg`) and code rows (`code_bg`). The
+//! whole-screen background is never painted, so the UI stays readable on
+//! any terminal background.
 //!
 //! Switch live with `/theme [name]` (bare `/theme` cycles); the choice
 //! persists to `[ui] theme` in the config file like `/vim`.
@@ -76,6 +78,11 @@ pub struct Theme {
     pub text_primary: Color,
     pub text_secondary: Color,
     pub muted: Color,
+    /// Dim `  │  ` separators (shortcuts row, header tabs).
+    pub sep: Color,
+    /// Input-box title: model/backend name and its ` · ` dot.
+    pub subtle: Color,
+    pub dot: Color,
     // -- transcript roles --
     pub user: Color,
     pub assistant: Color,
@@ -87,6 +94,14 @@ pub struct Theme {
     pub plan: Color,
     pub skill: Color,
     pub path: Color,
+    /// Inline `code` foreground (Markdown answers).
+    #[allow(dead_code)]
+    pub inline_code: Color,
+    // -- fills --
+    pub user_bg: Color,
+    /// Fenced-code row background (Markdown answers).
+    #[allow(dead_code)]
+    pub code_bg: Color,
     // -- chrome --
     pub tab_active: Color,
     pub tab_busy: Color,
@@ -111,11 +126,14 @@ impl Theme {
     /// grok-build GrokNight: gray ramp on #141414 + TokyoNight accents.
     pub fn groknight() -> Self {
         Self {
-            text_primary: rgb(225, 225, 225),   // #e1e1e1
-            text_secondary: rgb(200, 200, 200), // #c8c8c8
-            muted: rgb(108, 108, 108),          // #6c6c6c
+            text_primary: rgb(228, 228, 228),   // #e4e4e4
+            text_secondary: rgb(190, 190, 190), // #bebebe
+            muted: rgb(129, 134, 143),          // #81868f
+            sep: rgb(63, 67, 73),               // #3f4349
+            subtle: rgb(115, 115, 116),         // #737374
+            dot: rgb(94, 100, 108),             // #5e646c
 
-            user: rgb(125, 207, 255),      // cyan #7dcfff
+            user: rgb(196, 167, 231),      // lavender #c4a7e7
             assistant: rgb(187, 154, 247), // magenta #bb9af7
             running: rgb(125, 207, 255),   // cyan
             tool: rgb(120, 120, 120),      // bright gray #787878
@@ -125,11 +143,15 @@ impl Theme {
             plan: rgb(255, 219, 141),      // gold #FFDB8D
             skill: rgb(122, 162, 247),     // blue #7aa2f7
             path: rgb(255, 158, 100),      // orange #ff9e64
+            inline_code: rgb(125, 207, 223), // cyan #7dcfdf
 
-            tab_active: rgb(224, 175, 104), // gold
+            user_bg: rgb(15, 18, 22), // #0f1216
+            code_bg: rgb(38, 41, 47), // #26292f
+
+            tab_active: rgb(196, 167, 231), // lavender
             tab_busy: rgb(125, 207, 255),   // cyan
-            border: rgb(50, 50, 55),        // #323237 dim prompt chrome
-            border_active: rgb(80, 80, 88), // #505058 focused chrome
+            border: rgb(52, 48, 72),        // #343048 dim prompt chrome
+            border_active: rgb(90, 84, 122), // #5a547a focused chrome
 
             mode_normal: rgb(158, 206, 106),
             mode_insert: rgb(224, 175, 104),
@@ -145,8 +167,11 @@ impl Theme {
             text_primary: rgb(192, 202, 245),   // #c0caf5
             text_secondary: rgb(169, 177, 214), // #a9b1d6
             muted: rgb(86, 95, 137),            // #565f89
+            sep: rgb(52, 58, 84),
+            subtle: rgb(105, 114, 158),
+            dot: rgb(76, 84, 122),
 
-            user: rgb(125, 207, 255),
+            user: rgb(187, 154, 247),
             assistant: rgb(187, 154, 247),
             running: rgb(125, 207, 255),
             tool: rgb(154, 165, 206), // #9aa5ce
@@ -156,6 +181,10 @@ impl Theme {
             plan: rgb(255, 219, 141),
             skill: rgb(122, 162, 247),
             path: rgb(255, 158, 100),
+            inline_code: rgb(125, 207, 255),
+
+            user_bg: rgb(30, 32, 48),
+            code_bg: rgb(36, 40, 59),
 
             tab_active: rgb(224, 175, 104),
             tab_busy: rgb(125, 207, 255),

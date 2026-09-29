@@ -317,8 +317,6 @@ pub fn apply_claude_notif(app: &mut App, tab: usize, method: &str, params: &Valu
                 let line = truncate(&format!("claude: turn ended ({sub}) {why}"), 300);
                 s.push_line(line.clone());
                 app.flash = line;
-            } else {
-                s.push_line("claude: done ✓".to_string());
             }
             if tab == app.active {
                 app.stick_to_bottom();
@@ -582,7 +580,7 @@ mod tests {
         ]}});
         apply_claude_notif(&mut app, 0, "claude/assistant", &t);
         let lines = &app.active().lines;
-        assert!(lines.iter().any(|l| l.starts_with("∴ Thought for ")));
+        assert!(lines.iter().any(|l| l.starts_with("◆ Thought for ")));
         assert!(lines.iter().all(|l| !l.contains("idea")));
     }
 
@@ -639,7 +637,7 @@ mod tests {
         assert!(!app.active().busy);
         let lines = &app.active().lines;
         assert!(lines.iter().any(|l| l.starts_with("claude: denied Write")));
-        assert!(lines.iter().any(|l| l == "claude: done ✓"));
+        assert!(!lines.iter().any(|l| l.contains("done ✓")));
     }
 
     #[test]

@@ -193,7 +193,6 @@ pub fn apply_codex_notif(app: &mut App, tab: usize, method: &str, params: &Value
             s.flush_thought();
             if s.pending_diff.is_none() {
                 s.busy = false;
-                s.push_line("codex: done ✓".to_string());
             }
             if tab == app.active {
                 app.stick_to_bottom();
@@ -512,7 +511,7 @@ mod tests {
         let msg = serde_json::json!({"item": {"type": "agentMessage", "text": "answer"}});
         apply_codex_notif(&mut app, 0, "item/completed", &msg);
         let lines = &app.active().lines;
-        assert!(lines.iter().any(|l| l.starts_with("∴ Thought for ")));
+        assert!(lines.iter().any(|l| l.starts_with("◆ Thought for ")));
         assert!(lines.iter().any(|l| l == "answer"));
         assert!(app.active().thought.is_empty());
     }

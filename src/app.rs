@@ -428,7 +428,7 @@ pub struct Session {
     /// Set when an agy child is spawned; cleared when `agy/init` lands.
     pub pending_agy_init: bool,
     /// Live thought text (any provider). Bounded to its tail; collapsed to
-    /// one `∴ Thought for Ns` line on flush, never persisted verbatim.
+    /// one `◆ Thought for Ns` line on flush, never persisted verbatim.
     pub thought: String,
     /// True once the head of `thought` was dropped to stay bounded.
     pub thought_cut: bool,
@@ -534,9 +534,14 @@ impl Session {
         } else if !self.busy && self.phase.is_some() {
             // Catch-all for turn ends a provider did not flush itself.
             self.flush_thought();
+            let worked = self.turn_since.map(|t| t.elapsed());
             self.phase = None;
             self.phase_since = None;
             self.turn_since = None;
+            // A stopped turn (asked or forced) gets `■ stopped`, not this.
+            if let Some(d) = worked.filter(|_| self.stopping.is_none() && !self.sealed) {
+                self.push_line(format!("Worked for {}", crate::activity::format_secs(d)));
+            }
         }
         if !self.busy {
             self.turn_id = None;
@@ -587,7 +592,7 @@ impl Session {
         }
     }
 
-    /// End the current thought: commit ONE `∴ Thought for Ns` line when any
+    /// End the current thought: commit ONE `◆ Thought for Ns` line when any
     /// thought text arrived, nothing otherwise.
     pub fn flush_thought(&mut self) {
         let since = self.thought_since.take();
@@ -596,20 +601,19 @@ impl Session {
         self.thought_cut = false;
         if had {
             let d = since.map_or(std::time::Duration::ZERO, |t| t.elapsed());
-            self.push_line(format!("∴ Thought for {}", crate::activity::format_elapsed(d)));
+            self.push_line(format!("◆ Thought for {}", crate::activity::format_elapsed(d)));
         }
     }
 
-    /// Live thinking block (virtual, never persisted): spinner header, then
+    /// Live thinking block (virtual, never persisted): `◆ Thinking…` header, then
     /// `…` if older text was cut, then the last 3 thought lines. Empty
     /// unless the tab is busy, thinking and not waiting on a diff.
     pub fn thought_block(&self) -> Vec<String> {
-        use crate::activity::{spinner_frame, Phase};
+        use crate::activity::Phase;
         if !self.busy || self.phase != Some(Phase::Thinking) || self.pending_diff.is_some() {
             return Vec::new();
         }
-        let elapsed = self.turn_since.map_or(std::time::Duration::ZERO, |t| t.elapsed());
-        let mut out = vec![format!("{} {}", spinner_frame(elapsed), Phase::Thinking.label())];
+        let mut out = vec![format!("◆ {}", Phase::Thinking.label())];
         let lines: Vec<String> = self
             .thought
             .split('\n')
@@ -644,7 +648,7 @@ impl Session {
     pub fn draft_display_rows(&self, width: usize) -> usize {
         self.stream_draft_lines()
             .iter()
-            .map(|l| wrap_rows(l, width.max(1)))
+            .map(|l| crate::ui::line_rows(l, width.max(1)))
             .sum()
     }
 
@@ -655,7 +659,7 @@ impl Session {
             self.store_dirty = true;
         }
         let w = self.cache_width.unwrap_or(DEFAULT_WIDTH);
-        let rows = wrap_rows(&line, w);
+        let rows = crate::ui::line_rows(&line, w);
         self.lines.push(line);
         self.row_cache.push(rows);
         self.total_rows += rows;
@@ -687,7 +691,7 @@ impl Session {
         let mut row_cache = Vec::with_capacity(lines.len());
         let mut total_rows = 0usize;
         for l in &lines {
-            let rows = wrap_rows(l, w);
+            let rows = crate::ui::line_rows(l, w);
             row_cache.push(rows);
             total_rows += rows;
         }
@@ -705,7 +709,7 @@ impl Session {
         if self.cache_width == Some(width) {
             return;
         }
-        self.row_cache = self.lines.iter().map(|l| wrap_rows(l, width)).collect();
+        self.row_cache = self.lines.iter().map(|l| crate::ui::line_rows(l, width)).collect();
         self.total_rows = self.row_cache.iter().sum();
         self.cache_width = Some(width);
         self.scroll = self.scroll.min(self.total_rows);
@@ -1642,7 +1646,6 @@ impl App {
                     s.stage_diff(diff);
                 } else {
                     s.busy = false;
-                    s.push_line("mock: done ✓".to_string());
                     if pinned {
                         s.scroll = s.total_rows.saturating_sub(vh);
                     }
@@ -1668,7 +1671,6 @@ impl App {
             decision
         ));
         s.busy = false;
-        s.push_line("mock: done ✓".to_string());
         self.stick_to_bottom();
         true
     }
@@ -1724,15 +1726,17 @@ impl App {
         let line = s.lines.get(li)?;
         let row_in_line = target - consumed;
         // Chunk offset: char count of the chunks above this one. The render
-        // path wraps at viewport_width, so the mapping must use the same.
-        let width = self.viewport_width.max(1);
-        let chunks = Session::wrap_line(line, width);
+        // path wraps the DISPLAY text at viewport_width (less the row indent
+        // of prompt lines), so the mapping must use the same.
+        let d = crate::ui::display_line(line, crate::theme::Theme::groknight());
+        let width = self.viewport_width.max(1).saturating_sub(d.indent).max(1);
+        let chunks = Session::wrap_line(&d.text, width);
         let chunk = chunks.get(row_in_line)?;
         let mut coff = 0usize;
         for prev in chunks.iter().take(row_in_line) {
             coff += prev.chars().count();
         }
-        Some((li, coff + col_to_char(chunk, c)))
+        Some((li, coff + col_to_char(chunk, c.saturating_sub(d.indent))))
     }
 
     /// The selected text (lines joined with `\n`), or None when empty.
@@ -1748,9 +1752,11 @@ impl App {
             if li < a_line || li > f_line {
                 continue;
             }
-            let len = line.chars().count();
+            // Selection indexes the display text (what render shows).
+            let text = crate::ui::display_line(line, crate::theme::Theme::groknight()).text;
+            let len = text.chars().count();
             if let Some((cs, ce)) = sel.span_on_line(li, len) {
-                out.push(line.chars().skip(cs).take(ce - cs).collect::<String>());
+                out.push(text.chars().skip(cs).take(ce - cs).collect::<String>());
             }
         }
         if out.is_empty() {
@@ -1925,7 +1931,7 @@ mod tests {
         assert_eq!(s.lines, ["> hi"]);
         s.push_thought("hmm");
         s.flush_thought();
-        assert_eq!(s.lines, ["> hi", "∴ Thought for 0s"]);
+        assert_eq!(s.lines, ["> hi", "◆ Thought for 0s"]);
         assert!(s.thought.is_empty() && s.thought_since.is_none());
     }
 
@@ -1938,7 +1944,7 @@ mod tests {
         s.push_thought("hmm");
         s.busy = false;
         s.sync_activity();
-        assert!(s.lines.iter().any(|l| l.starts_with("∴ Thought for ")));
+        assert!(s.lines.iter().any(|l| l.starts_with("◆ Thought for ")));
         assert!(s.stream_draft_lines().is_empty());
     }
 
@@ -3085,6 +3091,38 @@ mod tests {
         app.active_mut().sync_activity();
         assert_eq!(stopped_lines(app.active()), 1);
         assert!(app.active().stopping.is_none() && app.active().queue.is_empty());
+    }
+
+    fn worked_lines(s: &Session) -> usize {
+        s.lines.iter().filter(|l| l.starts_with("Worked for ")).count()
+    }
+
+    #[test]
+    fn turn_end_commits_one_worked_for_line_but_not_after_a_stop() {
+        // Natural end: exactly one line, however often sync runs.
+        let mut app = busy_tab(BackendKind::Grok);
+        app.active_mut().busy = false;
+        app.active_mut().sync_activity();
+        app.active_mut().sync_activity();
+        let s = app.active();
+        assert_eq!(worked_lines(s), 1);
+        let last = s.lines.last().expect("line");
+        assert!(last.starts_with("Worked for 0.") && last.ends_with('s'), "{last}");
+        assert!(!s.lines.iter().any(|l| l.contains("done ✓")));
+        // A stop request: `■ stopped` only.
+        let mut app = busy_tab(BackendKind::Grok);
+        app.request_stop();
+        app.active_mut().busy = false;
+        app.active_mut().sync_activity();
+        assert_eq!(worked_lines(app.active()), 0);
+        assert_eq!(stopped_lines(app.active()), 1);
+        // A forced stop (second press): the forced line, no Worked-for.
+        let mut app = busy_tab(BackendKind::Grok);
+        app.request_stop();
+        app.request_stop();
+        app.active_mut().sync_activity();
+        assert_eq!(worked_lines(app.active()), 0);
+        assert_eq!(app.active().lines.last().map(String::as_str), Some(FORCED_STOP_LINE));
     }
 
     #[test]

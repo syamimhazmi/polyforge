@@ -4,13 +4,13 @@ Feature: Live activity while a tab is busy
 
   Scenario: Turn-status row while busy
     Given a tab that just became busy
-    Then a row above the status bar shows a braille spinner, "Thinking" and the seconds elapsed
-    And the turn timer is right-aligned on that row
-    And the status bar shows [busy] and no spinner
+    Then a row above the input box, starting at column 4, shows a braille spinner, "Thinking…" and the phase timer with one decimal (1.4s)
+    And the turn timer, the context tokens and [stop] are right-aligned on that row
+    And the shortcuts row shows [busy] and no spinner
 
   Scenario: Live thinking block for every provider
     Given a busy tab in the Thinking phase with no pending diff
-    Then the transcript ends with a "⠹ Thinking…" header
+    Then the transcript ends with a "◆ Thinking…" header
     And with no thought text the header is the only live row
 
   Scenario: Thought text streams under the header
@@ -21,9 +21,14 @@ Feature: Live activity while a tab is busy
   Scenario: The thinking block collapses when thinking ends
     Given a thinking block that received thought text
     When answer text, a tool call, or the end of the turn arrives
-    Then one transcript line "∴ Thought for 6s" is committed
+    Then one transcript line "◆ Thought for 6s" is committed
     And the thought text is not written to the transcript
     And with no thought text nothing is committed
+
+  Scenario: A finished turn commits one Worked-for line
+    Given a busy tab whose turn ends normally
+    Then one transcript line "Worked for 5.2s" is committed and no per-provider "done ✓" line is
+    And a turn ended by a stop request commits "■ stopped" and no Worked-for line
 
   Scenario: Codex reasoning is a thought, not an answer
     Given a codex reasoning item arrives
@@ -91,5 +96,5 @@ Feature: Live activity while a tab is busy
 
   Scenario: Idle paints nothing
     Given no tab is busy
-    Then there is no turn-status row and the status bar shows [idle]
+    Then there is no turn-status row and the shortcuts row shows [idle]
     And the event loop requests no animation frames

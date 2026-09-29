@@ -57,24 +57,31 @@ and everything runs offline.
 
 From top to bottom:
 
-1. **Tab bar** — hidden at startup while the single tab shows the
+1. **Header row** — hidden at startup while the single tab shows the
    welcome screen; it appears once the tab has content or a second tab
-   opens. One entry per tab: `○ s1:muse (1)`. `●` means the tab is
-   busy (an answer streams in even while you look at another tab); `○`
-   means idle. The active tab is highlighted, with its backend and number.
-2. **Transcript** — the active tab's conversation, oldest at top. Your
-   prompts show as `> …`. A bell rings whenever a tab's job finishes.
-3. **Status bar** — mode badge, `tab 1/2 s1`, busy/idle, scroll position,
-   mouse state, and the latest notice (`flash`).
-   The marker is `[busy]` or `[idle]`.
-   While a tab works, a **turn-status row** appears just above the status
-   bar: `⠋ Thinking 3s` (or `Responding`, timed per phase) with the
-   whole turn's timer on the right, then the session's context size
-   `⇣12.3k` (tokens, latest report from the backend; hidden until one
-   arrives) and a `[stop]` button; it disappears when the tab is idle.
-   On narrow terminals the tokens, then the timers, then the label give
-   way first. A pending diff shows a static `◆ awaiting approval`
-   there instead (no `[stop]`; answer the card first).
+   opens. Left: the workspace, Grok-style (`~/C/p/polyforge`: every
+   component but the last cut to its first character). Right: one entry
+   per tab, `○ s1:muse │ ● s2:grok`, then the active tab's context size
+   (`28k`) once the backend has reported one. `●` means the tab is busy
+   (an answer streams in even while you look at another tab); `○` means
+   idle. The active tab is bold. On narrow terminals inactive tabs
+   shorten to `○ 2`, then the count drops.
+2. **Transcript** — the active tab's conversation, oldest at top, with
+   no border: text starts at column 5 (column 2 is the rail column) and
+   keeps a 2-column right margin. Your prompts show as `❯ …` on a dark
+   block. A thought collapses to `◆ Thought for 6s` and every finished
+   turn ends with `Worked for 5.2s` (no line after a stopped turn). A
+   bell rings whenever a tab's job finishes.
+3. **Turn-status row** — while a tab works, a row appears just above the
+   input box: `    ⠋ Thinking… 3.2s` (or `Responding…`, timed per phase)
+   with the whole turn's timer on the right, then the session's context
+   size `⇣12.3k` (tokens, latest report from the backend; hidden until
+   one arrives) and a `[stop]` button; it disappears when the tab is
+   idle. Timers show one decimal under a minute (`5.2s`), then
+   `1m 05s`. On narrow terminals the tokens, then the timers, then the
+   label give way first. A pending diff shows a static
+   `◆ awaiting approval` there instead (no `[stop]`; answer the card
+   first).
    **Stopping a turn**: press `Esc` (Normal mode) or click `[stop]`. The
    row shows `Stopping…` with its own timer and the transcript gets
    `■ stopped` once the turn ends. If the backend never ends the turn,
@@ -91,13 +98,18 @@ From top to bottom:
    prompt tokens (input + cache), and agy per-step usage; the mock has
    none.
    While the agent thinks, the transcript ends with a live block: a
-   `⠹ Thinking…` header plus the last three lines of thought text (when
-   the provider streams any). It collapses to one `∴ Thought for 6s`
+   `◆ Thinking…` header plus the last three lines of thought text (when
+   the provider streams any). It collapses to one `◆ Thought for 6s`
    line once the answer or a tool call starts; the thought text itself
    is not kept. The current turn's transcript rows also get a pulsing
-   `┃` rail on the left border.
-4. **Input box** — its title always names the keys available in the
-   current mode.
+   `┃` rail in column 2.
+4. **Input box** — rounded box with a `❯` prompt. Its bottom-right
+   title names the backend and tab (`grok · s1 ─`).
+5. **Shortcuts row** — the mode badge, then the keys available in the
+   current mode (`i:insert  │  /:search  │  Esc:stop  │  …`; `Esc:stop`
+   shows only while the tab is busy). On the right: `[busy]`/`[idle]`,
+   scroll position, mouse state, and the latest notice (`flash`). On
+   narrow terminals the key hints give way first.
 
 ## 3. Modes and keys
 
@@ -125,7 +137,7 @@ The mode badge tells you where keystrokes go.
 to start typing — `Enter` stops entering insert mode. Type `/vim` again
 to switch back. The choice is saved to `vim = true/false` under
 `[polyforge]` in the config file, so it sticks across runs; the input
-box title shows `NORMAL·vim` while active. Everything else (`/`, `n/N`,
+mode badge and key hints show the vim keys while active. Everything else (`/`, `n/N`,
 arrows, `Home/End`, `PgUp/PgDn`, `P`, `R`, digits, `Tab`, `m`, `q`)
 works identically in both keymaps, and the picker/sessions lists always
 use `j/k`.
@@ -234,12 +246,12 @@ Think of it as: **a tab is a view, a session is history.**
 
 | backend | behavior |
 | ------- | -------- |
-| `mock` | Offline streaming fake + local diff card. Streams two lines per tick, then `mock: done ✓`. For UI practice and tests. |
+| `mock` | Offline streaming fake + local diff card. Streams two lines per tick, then the turn ends (`Worked for …`). For UI practice and tests. |
 | `muse` | Spawns `muse serve`, one MSP session per tab (`approvalMode: onRequest`). Streams `item/delta`, raises `approval/requested` as the y/n/a/q modal, rings on `turn/completed`. |
 | `codex` | Talks to `codex app-server` over stdio: thread per tab, `turn/start` on send, deltas to transcript, `turn/completed` to the bell. Approvals arrive as server→client requests, answered `approved` / `approved_for_session` / `denied` (`accept*` for file edits when offered). Mid-turn writes render as `codex: ~ path (already applied)` (`+` add, `-` delete) — **those writes already applied server-side and were never gated by y/n**; the y/n modal only covers requests the server actually routes through it. Guardian auto-reviews show as `codex: reviewing …` / `codex: guardian approved — … [already applied — no y/n modal]`. |
 | `agy` | One `agy` child per tab (`--input-format/--output-format stream-json`). Deltas stream, tool steps render with outcome, `result` ends the turn with a bell. **Visible but ungated**: headless agy has no interactive approval round-trip, so no modal can ever fire on agy tabs — workspace writes auto-allow and Ask-actions soft-deny, with notices in the transcript. Nothing is ever pre-granted in your settings. **Trust assumption**: opening an agy tab prints an `agy: WARNING — no y/n approval modal …` line (plus flash) — opening the session trusts the agent with workspace writes. |
-| `grok` | One shared `grok agent stdio` host, one ACP session per tab. Text streams line by line, thoughts show as one truncated `grok: ∴ …` line, tool calls as `grok: ⚙ title [kind]` with `✓`/`✗` outcomes, plans as `grok: plan (N steps)`. The prompt result rings the bell (`grok: done ✓`). Permission requests raise the y/n/a/q modal, mapped to ACP kinds (`allow_once` / `allow_always` / `reject_*`); `q` answers `cancelled`. Question-style requests (`ask_user_question`, `exit_plan_mode`, `mcp/elicit`) are not approvals — they respond `cancelled` with a transcript line. |
-| `claude` | One `claude -p` child per tab (`--input-format/--output-format stream-json --verbose`). polyforge picks the session id up front (`--session-id`) so every frame routes by `session_id`; resume passes `--resume <id>`. Assistant text streams per message, tool calls render as `claude <Tool>: key=value …`, failed tool results as `claude: tool FAILED …`; `result` ends the turn with a bell (`claude: done ✓`). **Approvals**: tools your own Claude settings don't pre-allow raise the y/n/a/q modal (via `--permission-prompt-tool stdio`). `y` allows once, `n` denies (the turn continues), `a` allows and applies Claude's suggested rule for this session (falls back to once if none is offered), `q`/`Esc` denies and interrupts the turn. `AskUserQuestion` forms are declined so claude asks in plain text. `[claude] permission_mode` (e.g. `acceptEdits`) pre-allows more — polyforge never edits your Claude settings files. |
+| `grok` | One shared `grok agent stdio` host, one ACP session per tab. Text streams line by line, thoughts show as one truncated `grok: ∴ …` line, tool calls as `grok: ⚙ title [kind]` with `✓`/`✗` outcomes, plans as `grok: plan (N steps)`. The prompt result rings the bell and ends the turn (`Worked for …`; a non-default stop reason such as `max_tokens` is named in a `grok: done (reason) ✓` line). Permission requests raise the y/n/a/q modal, mapped to ACP kinds (`allow_once` / `allow_always` / `reject_*`); `q` answers `cancelled`. Question-style requests (`ask_user_question`, `exit_plan_mode`, `mcp/elicit`) are not approvals — they respond `cancelled` with a transcript line. |
+| `claude` | One `claude -p` child per tab (`--input-format/--output-format stream-json --verbose`). polyforge picks the session id up front (`--session-id`) so every frame routes by `session_id`; resume passes `--resume <id>`. Assistant text streams per message, tool calls render as `claude <Tool>: key=value …`, failed tool results as `claude: tool FAILED …`; `result` ends the turn with a bell. **Approvals**: tools your own Claude settings don't pre-allow raise the y/n/a/q modal (via `--permission-prompt-tool stdio`). `y` allows once, `n` denies (the turn continues), `a` allows and applies Claude's suggested rule for this session (falls back to once if none is offered), `q`/`Esc` denies and interrupts the turn. `AskUserQuestion` forms are declined so claude asks in plain text. `[claude] permission_mode` (e.g. `acceptEdits`) pre-allows more — polyforge never edits your Claude settings files. |
 
 **No login?** The tab stays navigable and shows the exact fix, e.g.
 `muse: not logged in — run \`muse login\`` (or the `codex login`
@@ -315,7 +327,7 @@ cargo run            # first launch: pick a provider (2 = muse)
 # i → "reply with exactly: forge-ok" → Enter
 ```
 
-Expect a streamed reply, `muse: done ✓`, and a bell. Then try something
+Expect a streamed reply, `Worked for …`, and a bell. Then try something
 that edits a file and approve/deny from the modal. Quota-free
 alternative: `provider = "mock"` exercises tabs, search, picker,
 `/sessions`, and the diff card offline.

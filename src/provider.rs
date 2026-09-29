@@ -284,11 +284,9 @@ pub fn apply_notif(app: &mut App, tab: usize, method: &str, params: &Value) -> b
             // the user decides; otherwise the job is done.
             if s.pending_diff.is_none() {
                 s.busy = false;
-                s.push_line(if failed {
-                    "muse: turn failed".to_string()
-                } else {
-                    "muse: done ✓".to_string()
-                });
+                if failed {
+                    s.push_line("muse: turn failed".to_string());
+                }
             }
             if tab == app.active {
                 app.stick_to_bottom();

@@ -226,9 +226,7 @@ pub fn apply_grok_notif(app: &mut App, tab: usize, method: &str, params: &Value)
             let s = &mut app.sessions[tab];
             if s.pending_diff.is_none() {
                 s.busy = false;
-                if reason == "end_turn" {
-                    s.push_line("grok: done ✓".to_string());
-                } else {
+                if reason != "end_turn" {
                     s.push_line(format!("grok: done ({reason}) ✓"));
                 }
             }
@@ -663,7 +661,7 @@ mod tests {
         assert!(!apply_grok_notif(&mut app, 0, "session/update", &thought));
         // Live only — not committed until flush (tool / turn end).
         assert_eq!(app.active().thought, "hmm let me think");
-        assert!(!app.active().lines.iter().any(|l| l.starts_with("∴")));
+        assert!(!app.active().lines.iter().any(|l| l.starts_with("◆")));
         let tool = serde_json::json!({
             "sessionId": "s", "update": {
                 "sessionUpdate": "tool_call",
@@ -676,7 +674,7 @@ mod tests {
             app.active()
                 .lines
                 .iter()
-                .any(|l| l.starts_with("∴ Thought for "))
+                .any(|l| l.starts_with("◆ Thought for "))
         );
         assert!(!app.active().lines.iter().any(|l| l.contains("hmm let me")));
         assert!(
@@ -730,7 +728,7 @@ mod tests {
         assert!(draft[0].ends_with("Thinking…"));
         assert_eq!(draft[1], "  The user said hello");
         assert_eq!(draft[2], "  second line");
-        assert!(!app.active().lines.iter().any(|l| l.starts_with("∴")));
+        assert!(!app.active().lines.iter().any(|l| l.starts_with("◆")));
         assert!(apply_grok_notif(
             &mut app,
             0,
@@ -741,10 +739,10 @@ mod tests {
             .active()
             .lines
             .iter()
-            .filter(|l| l.starts_with("∴"))
+            .filter(|l| l.starts_with("◆"))
             .collect();
         assert_eq!(thought_lines.len(), 1);
-        assert!(thought_lines[0].starts_with("∴ Thought for "));
+        assert!(thought_lines[0].starts_with("◆ Thought for "));
         assert!(app.active().thought.is_empty());
         assert!(app.active().stream_draft_lines().is_empty());
     }
@@ -771,11 +769,10 @@ mod tests {
         ));
         assert!(app.active().lines.iter().any(|l| l == "Next"));
         assert!(app.active().draft_answer.is_empty());
-        // Done line lands after the flushed answer.
+        // No per-provider done line; the turn just ends after the answer.
         let lines = &app.active().lines;
-        let next_i = lines.iter().position(|l| l == "Next").unwrap();
-        let done_i = lines.iter().position(|l| l == "grok: done ✓").unwrap();
-        assert!(next_i < done_i);
+        assert_eq!(lines.last().map(String::as_str), Some("Next"));
+        assert!(!app.active().busy);
     }
 
     #[test]
@@ -790,7 +787,7 @@ mod tests {
             &done
         ));
         assert!(!app.active().busy);
-        assert!(app.active().lines.iter().any(|l| l == "grok: done ✓"));
+        assert!(!app.active().lines.iter().any(|l| l == "grok: done ✓"));
         // Non-default reasons are named, not hidden.
         app.active_mut().busy = true;
         let capped = serde_json::json!({"sessionId": "sess-1", "stopReason": "max_tokens"});

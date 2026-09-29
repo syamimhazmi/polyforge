@@ -264,7 +264,6 @@ pub fn apply_agy_notif(app: &mut App, tab: usize, method: &str, params: &Value) 
                         }
                     }
                 }
-                s.push_line("agy: done ✓".to_string());
             } else {
                 s.push_line(format!("agy: turn ended ({status})"));
                 app.flash = format!("agy: turn ended ({status})");
@@ -484,7 +483,8 @@ mod tests {
         });
         assert!(apply_agy_notif(&mut app, 0, "agy/result", &p));
         assert!(!app.active().busy);
-        assert!(app.active().lines.iter().any(|l| l == "agy: done ✓"));
+        assert!(app.active().lines.iter().any(|l| l == "apple"));
+        assert!(!app.active().lines.iter().any(|l| l.contains("done ✓")));
     }
 
     #[test]

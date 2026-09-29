@@ -64,6 +64,17 @@ pub fn format_elapsed(d: Duration) -> String {
     }
 }
 
+/// Turn/phase clock, grok-build style: "5.2s" under a minute (one decimal,
+/// truncated), else [`format_elapsed`].
+pub fn format_secs(d: Duration) -> String {
+    if d.as_secs() < 60 {
+        let t = d.as_millis() / 100;
+        format!("{}.{}s", t / 10, t % 10)
+    } else {
+        format_elapsed(d)
+    }
+}
+
 /// Compact token count for the turn row: "999", "1.23k", "12.3k", "123k",
 /// "1.23m", "12.3m". The bucket is chosen AFTER rounding, so 9_999 reads
 /// "10.0k" (not "10.00k") and 999_999 reads "1.00m" (not "1000k").
@@ -158,5 +169,14 @@ mod tests {
         for (n, want) in cases {
             assert_eq!(format_tokens_short(n), want, "n={n}");
         }
+    }
+
+    #[test]
+    fn format_secs_is_one_decimal_under_a_minute() {
+        assert_eq!(format_secs(ms(0)), "0.0s");
+        assert_eq!(format_secs(ms(1_460)), "1.4s");
+        assert_eq!(format_secs(ms(5_200)), "5.2s");
+        assert_eq!(format_secs(ms(59_999)), "59.9s");
+        assert_eq!(format_secs(ms(65_000)), "1m 05s");
     }
 }
