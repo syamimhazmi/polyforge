@@ -21,6 +21,7 @@ use ratatui::{
 };
 
 use crate::app::{App, Mode};
+use crate::markdown::{self, MdKind};
 use crate::theme::Theme;
 
 /// Transcript margins: the rail sits in column 2, text starts at column 5,
@@ -209,11 +210,40 @@ pub struct DisplayLine {
     pub indent: usize,
     pub lead: Option<Span<'static>>,
     pub fill: Option<Color>,
+    /// The fill starts at the text column (code rows) instead of the rail
+    /// column (prompt block).
+    pub fill_text: bool,
+    /// Horizontal rule: `text` is one `─` the renderer stretches.
+    pub rule: bool,
+}
+
+/// Markdown kind of a line about to be stored after one of kind `prev`:
+/// answer lines (plain text role) and anything inside an open fence get
+/// markdown, prefixed system lines never do.
+pub fn md_kind(line: &str, prev: Option<MdKind>) -> MdKind {
+    let in_fence = prev.is_some_and(MdKind::in_fence);
+    let th = Theme::groknight();
+    let system = line.starts_with('>')
+        || line.starts_with("◆ ")
+        || line.starts_with("Worked for ")
+        || line.starts_with("■ ")
+        || line.starts_with("--- ")
+        || ["mock: ", "muse: ", "codex: ", "agy: ", "grok: ", "claude: "]
+            .iter()
+            .any(|p| line.starts_with(p));
+    // Keyword-colored lines (approved/failed/...) are not answer prose,
+    // but inside a fence a code line may say "failed".
+    let plain = transcript_style(line, th) == Style::default().fg(th.text_primary);
+    if system || (!in_fence && !plain) {
+        MdKind::Plain
+    } else {
+        markdown::classify(line, in_fence)
+    }
 }
 
 /// THE raw-line → display mapping (sanitizes on the way, S3-F1). Height
 /// cache, render, selection highlight and copy all go through here.
-pub fn display_line(raw: &str, th: Theme) -> DisplayLine {
+pub fn display_line(raw: &str, kind: MdKind, th: Theme) -> DisplayLine {
     let line = crate::app::sanitize_text(raw);
     if let Some(body) = line.strip_prefix('>') {
         // User prompt: `❯ text` on the user block, continuation rows
@@ -226,6 +256,21 @@ pub fn display_line(raw: &str, th: Theme) -> DisplayLine {
             indent: 2,
             lead: Some(Span::styled("❯ ", bg.fg(th.user))),
             fill: Some(th.user_bg),
+            fill_text: false,
+            rule: false,
+        };
+    }
+    if kind != MdKind::Plain {
+        let (text, spans) = markdown::md_display(&line, kind, th);
+        let code = kind.is_code_row();
+        return DisplayLine {
+            text,
+            spans,
+            indent: 0,
+            lead: None,
+            fill: code.then_some(th.code_bg),
+            fill_text: code,
+            rule: kind == MdKind::Text && markdown::is_rule(&line),
         };
     }
     let style = transcript_style(&line, th);
@@ -243,6 +288,8 @@ pub fn display_line(raw: &str, th: Theme) -> DisplayLine {
         indent: 0,
         lead: None,
         fill: None,
+        fill_text: false,
+        rule: false,
     }
 }
 
@@ -260,8 +307,8 @@ fn thought_split(line: &str) -> Option<(String, String, String)> {
 }
 
 /// Wrapped-row count of `raw` at the transcript text `width`.
-pub fn line_rows(raw: &str, width: usize) -> usize {
-    let d = display_line(raw, Theme::groknight());
+pub fn line_rows(raw: &str, kind: MdKind, width: usize) -> usize {
+    let d = display_line(raw, kind, Theme::groknight());
     crate::app::wrap_rows(&d.text, width.saturating_sub(d.indent).max(1))
 }
 
@@ -337,7 +384,12 @@ fn render_transcript(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
     s.ensure_cache(width);
     // Committed lines + live stream drafts (thought / open answer).
     let drafts = s.stream_draft_lines();
-    let draft_rows: Vec<usize> = drafts.iter().map(|l| line_rows(l, width)).collect();
+    let draft_kinds = s.stream_draft_kinds();
+    let draft_rows: Vec<usize> = drafts
+        .iter()
+        .zip(&draft_kinds)
+        .map(|(l, k)| line_rows(l, *k, width))
+        .collect();
     let n_committed = s.lines.len();
     let n_view = n_committed + drafts.len();
     // Keep a bottom-pinned view pinned when the live block or the
@@ -371,7 +423,7 @@ fn render_transcript(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
     }
     let mut sub = s.scroll.saturating_sub(consumed);
     // (row line, background band) per visible row.
-    let mut items: Vec<(Line<'static>, Option<Color>)> = Vec::new();
+    let mut items: Vec<(Line<'static>, Option<Color>, bool)> = Vec::new();
     // Live-turn rows get the activity rail (only while animating).
     let rail = s
         .phase
@@ -380,12 +432,12 @@ fn render_transcript(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
         .map(|(p, t)| (p, t.elapsed(), s.scroll));
     let mut live_rows: Vec<usize> = Vec::new();
     while items.len() < vh && li < n_view {
-        let raw = if li < n_committed {
-            s.lines[li].as_str()
+        let (raw, kind) = if li < n_committed {
+            (s.lines[li].as_str(), s.kind_at(li))
         } else {
-            drafts[li - n_committed].as_str()
+            (drafts[li - n_committed].as_str(), draft_kinds[li - n_committed])
         };
-        let mut d = display_line(raw, th);
+        let mut d = display_line(raw, kind, th);
         // Live thought text under the header reads muted.
         if matches!(li.checked_sub(n_committed), Some(k) if k >= 1 && k < thought_n) {
             let m = Style::default().fg(th.muted);
@@ -404,17 +456,25 @@ fn render_transcript(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
             .take(sub)
             .map(|c| c.chars().count())
             .sum::<usize>();
-        let live = li >= n_committed || (li >= s.turn_first_line && d.fill.is_none());
+        let live = li >= n_committed
+            || (li >= s.turn_first_line && (d.fill.is_none() || d.fill_text));
         let pad_style = d.fill.map(|bg| Style::default().bg(bg)).unwrap_or_default();
         for (ci, chunk) in chunks.iter().enumerate().skip(sub) {
             if live {
                 live_rows.push(items.len());
             }
             let clen = chunk.chars().count();
-            let mut spans = slice_spans(&d.spans, coff, coff + clen);
+            let mut spans = if d.rule {
+                let style = d.spans.first().map(|s| s.style).unwrap_or_default();
+                vec![Span::styled("─".repeat(width), style)]
+            } else {
+                slice_spans(&d.spans, coff, coff + clen)
+            };
             if let Some((ss, se)) = span {
                 let (a, b) = (ss.saturating_sub(coff).min(clen), se.saturating_sub(coff).min(clen));
-                if a < b {
+                if d.rule {
+                    spans = reverse_range(spans, 0, width);
+                } else if a < b {
                     spans = reverse_range(spans, a, b);
                 }
             }
@@ -427,7 +487,7 @@ fn render_transcript(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
                     },
                 );
             }
-            items.push((Line::from(spans), d.fill));
+            items.push((Line::from(spans), d.fill, d.fill_text));
             if items.len() >= vh {
                 break;
             }
@@ -437,11 +497,15 @@ fn render_transcript(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
         sub = 0;
     }
     let buf_w = area.width.saturating_sub(RAIL_COL + RIGHT_MARGIN);
-    for (i, (line, fill)) in items.into_iter().enumerate() {
+    for (i, (line, fill, fill_text)) in items.into_iter().enumerate() {
         let y = area.y + i as u16;
         if let Some(bg) = fill {
-            f.buffer_mut()
-                .set_style(Rect::new(area.x + RAIL_COL, y, buf_w, 1), Style::default().bg(bg));
+            let (x, w) = if fill_text {
+                (text_x, text_w.min(area.x + area.width - text_x))
+            } else {
+                (area.x + RAIL_COL, buf_w)
+            };
+            f.buffer_mut().set_style(Rect::new(x, y, w, 1), Style::default().bg(bg));
         }
         f.render_widget(Paragraph::new(line), Rect::new(text_x, y, text_w.min(area.x + area.width - text_x), 1));
     }
@@ -1749,31 +1813,122 @@ mod tests {
         assert!(rows.last().expect("row").contains("Enter:send  │  Esc:normal"));
     }
 
+    fn push_answer(app: &mut App, lines: &[&str]) {
+        app.sessions[0].push_line("> q".to_string());
+        for l in lines {
+            app.sessions[0].push_line((*l).to_string());
+        }
+    }
+
+    #[test]
+    fn markdown_answer_renders_stripped_with_code_rows_on_code_bg() {
+        let th = Theme::get(ThemeKind::GrokNight);
+        let mut app = App::new();
+        push_answer(
+            &mut app,
+            &[
+                "## Title", "some **bold** and `code`", "- item one", "1. step one", "---",
+                "```rust", "let x = 1;", "```", "after",
+            ],
+        );
+        let rows = screen_rows(&mut app, 100, 30);
+        let buf = screen_buf(&mut app, 100, 30);
+        let at = |needle: &str| rows.iter().position(|r| r.contains(needle)).expect(needle);
+        assert!(rows[at("Title")].starts_with("     Title"), "{:?}", rows[at("Title")]);
+        assert!(rows.iter().all(|r| !r.contains("##") && !r.contains("**")));
+        assert!(rows[at("some bold and code")].starts_with("     some bold and code"));
+        assert!(rows[at("• item one")].starts_with("     • item one"));
+        assert!(rows[at("1. step one")].starts_with("     1. step one"));
+        assert!(rows[at("───")].contains(&"─".repeat(93)), "rule fills the text width");
+        let (code, blank_open, close) = (at("let x = 1;"), at("let x = 1;") - 1, at("let x = 1;") + 1);
+        for y in [code, blank_open, close] {
+            for x in 5..98 {
+                assert_eq!(buf[(x, y as u16)].bg, th.code_bg, "row {y} col {x}");
+            }
+            assert_ne!(buf[(98, y as u16)].bg, th.code_bg);
+        }
+        assert_ne!(buf[(10, at("after") as u16)].bg, th.code_bg);
+        assert_eq!(buf[(5, at("Title") as u16)].fg, th.user);
+        assert_eq!(buf[(15, at("some bold") as u16)].fg, th.text_primary);
+    }
+
+    #[test]
+    fn fence_state_survives_pushes_replace_and_cache_rebuild() {
+        let mut app = App::new();
+        push_answer(&mut app, &["```", "# raw", "```", "# head"]);
+        let s = &app.sessions[0];
+        let k = |i| s.kind_at(i);
+        assert_eq!(
+            [k(0), k(1), k(2), k(3), k(4)],
+            [MdKind::Plain, MdKind::FenceOpen, MdKind::Code, MdKind::FenceClose, MdKind::Text]
+        );
+        let lines = s.lines.clone();
+        let kinds = s.kinds.clone();
+        let mut s2 = crate::app::Session::new("x");
+        s2.replace_lines(lines, 30);
+        assert_eq!(s2.kinds, kinds);
+        assert_eq!(s2.kinds.len(), s2.lines.len());
+        // An open fence continues into the live answer draft.
+        s2.replace_lines(vec!["```".to_string()], 30);
+        s2.draft_answer = "# x".to_string();
+        assert_eq!(s2.stream_draft_kinds(), [MdKind::Code]);
+    }
+
+    #[test]
+    fn wrapped_markdown_line_height_and_copy_use_display_text() {
+        let mut app = App::new();
+        push_answer(&mut app, &["## aaaa bbbb cccc dddd eeee ffff", "x **bold word** y `code`"]);
+        let _ = screen_rows(&mut app, 20, 20);
+        let w = app.viewport_width;
+        let s = &app.sessions[0];
+        assert_eq!(s.row_cache[1], crate::app::wrap_rows("aaaa bbbb cccc dddd eeee ffff", w));
+        assert!(s.row_cache[1] > 1);
+        let (ax, ay, _, _) = app.text_area.expect("text area");
+        assert!(app.sel_begin(ax, ay));
+        app.sel_extend(ax + 12, ay + app.sessions[0].total_rows as u16 - 1);
+        let copied = app.take_selected_text().expect("selection");
+        assert!(copied.contains("aaaa bbbb cccc dddd eeee ffff"), "{copied:?}");
+        assert!(copied.contains("x bold word y code"), "{copied:?}");
+        assert!(!copied.contains("##") && !copied.contains("**") && !copied.contains('`'));
+    }
+
+    #[test]
+    fn search_matches_display_text() {
+        let mut app = App::new();
+        push_answer(&mut app, &["a **bold** move"]);
+        app.search_input = "a bold".to_string();
+        app.run_search();
+        assert_eq!(app.matches, vec![1]);
+        app.search_input = "**".to_string();
+        app.run_search();
+        assert!(app.matches.is_empty());
+    }
+
     #[test]
     fn thought_marker_is_muted_with_bold_word() {
         let th = Theme::get(ThemeKind::GrokNight);
-        let d = display_line("◆ Thought for 6s", th);
+        let d = display_line("◆ Thought for 6s", MdKind::Plain, th);
         assert_eq!(d.text, "◆ Thought for 6s");
         assert_eq!(d.spans[1].content, "Thought");
         assert!(d.spans[1].style.add_modifier.contains(Modifier::BOLD));
         assert!(d.spans.iter().all(|s| s.style.fg == Some(th.muted)));
-        let d = display_line("Worked for 5.2s", th);
+        let d = display_line("Worked for 5.2s", MdKind::Plain, th);
         assert_eq!(d.spans[0].style.fg, Some(th.muted));
     }
 
     #[test]
     fn display_line_seam_prompt_and_plain() {
         let th = Theme::get(ThemeKind::GrokNight);
-        let p = display_line("> hello", th);
+        let p = display_line("> hello", MdKind::Plain, th);
         assert_eq!((p.text.as_str(), p.indent), ("hello", 2));
         assert_eq!(p.fill, Some(th.user_bg));
-        let plain = display_line("hello \x1b[2Jworld", th);
+        let plain = display_line("hello \x1b[2Jworld", MdKind::Plain, th);
         assert_eq!(plain.text, "hello world");
         assert_eq!(plain.indent, 0);
         assert_eq!(
             slice_spans(&plain.spans, 6, 11).iter().map(|s| s.content.as_ref()).collect::<String>(),
             "world"
         );
-        assert_eq!(line_rows("> abcdefgh", 6), 2, "prompt wraps at width - indent");
+        assert_eq!(line_rows("> abcdefgh", MdKind::Plain, 6), 2, "prompt wraps at width - indent");
     }
 }

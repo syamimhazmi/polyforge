@@ -72,6 +72,10 @@ From top to bottom:
    block. A thought collapses to `◆ Thought for 6s` and every finished
    turn ends with `Worked for 5.2s` (no line after a stopped turn). A
    bell rings whenever a tab's job finishes.
+   Agent answers render as Markdown: headings, **bold**, *italic*,
+   `inline code`, `•` bullets, numbered lists, rules, links (text only)
+   and fenced code blocks on a darker band (no syntax colors). Copy and
+   search work on the rendered text, so markers like `**` are not copied.
 3. **Turn-status row** — while a tab works, a row appears just above the
    input box: `    ⠋ Thinking… 3.2s` (or `Responding…`, timed per phase)
    with the whole turn's timer on the right, then the session's context

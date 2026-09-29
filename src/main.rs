@@ -12,6 +12,7 @@ mod clipboard;
 mod codex;
 mod config;
 mod grok;
+mod markdown;
 mod mock;
 mod msp;
 mod provider;

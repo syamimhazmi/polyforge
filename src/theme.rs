@@ -95,12 +95,10 @@ pub struct Theme {
     pub skill: Color,
     pub path: Color,
     /// Inline `code` foreground (Markdown answers).
-    #[allow(dead_code)]
     pub inline_code: Color,
     // -- fills --
     pub user_bg: Color,
     /// Fenced-code row background (Markdown answers).
-    #[allow(dead_code)]
     pub code_bg: Color,
     // -- chrome --
     pub tab_active: Color,

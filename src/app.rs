@@ -2,6 +2,8 @@
 //! In-memory only. Everything here is throwaway; M2 replaces `mock` with a
 //! real provider and adds persistence.
 
+use crate::markdown::MdKind;
+
 /// In-memory scrollback cap per session (older lines spill nowhere in M1).
 pub const MAX_LINES: usize = 50_000;
 /// Assumed viewport width until the first render measures the real one.
@@ -377,6 +379,9 @@ pub struct Session {
     pub name: String,
     /// Transcript lines, oldest first. Capped at MAX_LINES.
     pub lines: Vec<String>,
+    /// Markdown kind per line, parallel to `lines` (carries the open-fence
+    /// state across lines). Missing entries read as `Plain`.
+    pub kinds: Vec<MdKind>,
     /// Wrapped-row counts parallel to `lines` (grok-build-style height
     /// cache); `total_rows` is their sum. Rebuilt when the viewport width
     /// changes; maintained incrementally on push/drain otherwise.
@@ -467,6 +472,7 @@ impl Session {
         Self {
             name: name.to_string(),
             lines: Vec::new(),
+            kinds: Vec::new(),
             scroll: 0,
             busy: false,
             queue: Vec::new(),
@@ -644,12 +650,32 @@ impl Session {
         out
     }
 
+    /// Markdown kinds of [`stream_draft_lines`]: the thought block is
+    /// plain, the open answer continues the committed fence state.
+    pub fn stream_draft_kinds(&self) -> Vec<MdKind> {
+        let mut out = vec![MdKind::Plain; self.thought_block().len()];
+        if !self.draft_answer.is_empty() {
+            out.push(crate::ui::md_kind(&self.draft_answer, self.last_kind()));
+        }
+        out
+    }
+
     /// Wrapped-row count of [`stream_draft_lines`] at `width`.
     pub fn draft_display_rows(&self, width: usize) -> usize {
         self.stream_draft_lines()
             .iter()
-            .map(|l| crate::ui::line_rows(l, width.max(1)))
+            .zip(self.stream_draft_kinds())
+            .map(|(l, k)| crate::ui::line_rows(l, k, width.max(1)))
             .sum()
+    }
+
+    /// Markdown kind of committed line `i` (`Plain` when untracked).
+    pub fn kind_at(&self, i: usize) -> MdKind {
+        self.kinds.get(i).copied().unwrap_or(MdKind::Plain)
+    }
+
+    fn last_kind(&self) -> Option<MdKind> {
+        self.lines.len().checked_sub(1).map(|i| self.kind_at(i))
     }
 
     pub fn push_line(&mut self, line: String) {
@@ -659,7 +685,10 @@ impl Session {
             self.store_dirty = true;
         }
         let w = self.cache_width.unwrap_or(DEFAULT_WIDTH);
-        let rows = crate::ui::line_rows(&line, w);
+        let kind = crate::ui::md_kind(&line, self.last_kind());
+        let rows = crate::ui::line_rows(&line, kind, w);
+        self.kinds.resize(self.lines.len(), MdKind::Plain);
+        self.kinds.push(kind);
         self.lines.push(line);
         self.row_cache.push(rows);
         self.total_rows += rows;
@@ -667,6 +696,7 @@ impl Session {
             let drop = self.lines.len() - MAX_LINES;
             let dropped_rows: usize = self.row_cache[..drop].iter().sum();
             self.lines.drain(..drop);
+            self.kinds.drain(..drop);
             self.row_cache.drain(..drop);
             self.total_rows -= dropped_rows;
             self.scroll = self.scroll.saturating_sub(dropped_rows);
@@ -689,13 +719,17 @@ impl Session {
             lines.drain(..lines.len() - MAX_LINES);
         }
         let mut row_cache = Vec::with_capacity(lines.len());
+        let mut kinds: Vec<MdKind> = Vec::with_capacity(lines.len());
         let mut total_rows = 0usize;
         for l in &lines {
-            let rows = crate::ui::line_rows(l, w);
+            let kind = crate::ui::md_kind(l, kinds.last().copied());
+            let rows = crate::ui::line_rows(l, kind, w);
+            kinds.push(kind);
             row_cache.push(rows);
             total_rows += rows;
         }
         self.lines = lines;
+        self.kinds = kinds;
         self.row_cache = row_cache;
         self.total_rows = total_rows;
         self.cache_width = Some(w);
@@ -709,7 +743,12 @@ impl Session {
         if self.cache_width == Some(width) {
             return;
         }
-        self.row_cache = self.lines.iter().map(|l| crate::ui::line_rows(l, width)).collect();
+        self.row_cache = self
+            .lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| crate::ui::line_rows(l, self.kind_at(i), width))
+            .collect();
         self.total_rows = self.row_cache.iter().sum();
         self.cache_width = Some(width);
         self.scroll = self.scroll.min(self.total_rows);
@@ -1578,6 +1617,7 @@ impl App {
             let _ = s.clear_diff();
             s.pending_approval = None;
             s.lines.clear();
+            s.kinds.clear();
             s.row_cache.clear();
             s.total_rows = 0;
             s.scroll = 0;
@@ -1728,7 +1768,7 @@ impl App {
         // Chunk offset: char count of the chunks above this one. The render
         // path wraps the DISPLAY text at viewport_width (less the row indent
         // of prompt lines), so the mapping must use the same.
-        let d = crate::ui::display_line(line, crate::theme::Theme::groknight());
+        let d = crate::ui::display_line(line, s.kind_at(li), crate::theme::Theme::groknight());
         let width = self.viewport_width.max(1).saturating_sub(d.indent).max(1);
         let chunks = Session::wrap_line(&d.text, width);
         let chunk = chunks.get(row_in_line)?;
@@ -1753,7 +1793,8 @@ impl App {
                 continue;
             }
             // Selection indexes the display text (what render shows).
-            let text = crate::ui::display_line(line, crate::theme::Theme::groknight()).text;
+            let text =
+                crate::ui::display_line(line, s.kind_at(li), crate::theme::Theme::groknight()).text;
             let len = text.chars().count();
             if let Some((cs, ce)) = sel.span_on_line(li, len) {
                 out.push(text.chars().skip(cs).take(ce - cs).collect::<String>());
@@ -1783,12 +1824,18 @@ impl App {
 
     pub fn run_search(&mut self) {
         self.last_query = self.search_input.clone();
-        self.matches = self
-            .active()
+        // Match on the display text so jumps agree with what is drawn.
+        let th = crate::theme::Theme::groknight();
+        let s = self.active();
+        self.matches = s
             .lines
             .iter()
             .enumerate()
-            .filter(|(_, l)| l.contains(&self.last_query))
+            .filter(|(i, l)| {
+                crate::ui::display_line(l, s.kind_at(*i), th)
+                    .text
+                    .contains(&self.last_query)
+            })
             .map(|(i, _)| i)
             .collect();
         if self.matches.is_empty() {
