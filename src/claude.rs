@@ -76,6 +76,9 @@ pub async fn spawn_claude(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // The handle owns the Child: dropping it (even on an unexpected exit)
+        // kills the process instead of leaking it.
+        .kill_on_drop(true)
         .spawn()?;
     let stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");

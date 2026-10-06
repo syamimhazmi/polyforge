@@ -2,7 +2,7 @@
 //! Shapes follow the offline `muse schema` export (stable surface v1).
 //! Unknown fields are ignored so additive server evolution can't break us.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -44,6 +44,14 @@ pub enum ServerMsg {
     /// Transport/parse failure or an id-less error frame.
     Transport(String),
 }
+
+/// Recent stderr lines of a server, newest last. Bounded: see [`STDERR_TAIL_LINES`].
+type StderrTail = Arc<Mutex<VecDeque<String>>>;
+
+/// Keep only this many stderr lines (each cut to [`STDERR_LINE_CHARS`]) so a
+/// chatty server cannot grow our memory; enough to explain a crash.
+const STDERR_TAIL_LINES: usize = 20;
+const STDERR_LINE_CHARS: usize = 200;
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, RpcError>>>>>;
 
@@ -150,6 +158,7 @@ pub struct Host {
     pending: Pending,
     /// Set by the pump once the server's stdout is gone (exit or crash).
     closed: Arc<AtomicBool>,
+    stderr_tail: StderrTail,
     child: Child,
 }
 
@@ -167,7 +176,7 @@ impl Host {
             .envs(extra_env.iter().cloned())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             // No Host may outlive its owner with a live child: the final
             // drop (after in-flight spawned calls release their Arcs)
             // kills the server instead of leaking it headless.
@@ -175,10 +184,38 @@ impl Host {
             .spawn()?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let pump_pending = pending.clone();
         let closed = Arc::new(AtomicBool::new(false));
         let pump_closed = closed.clone();
+        let stderr_tail: StderrTail = Arc::new(Mutex::new(VecDeque::new()));
+        // Always drain stderr, or a chatty server blocks on a full pipe.
+        // Ends on EOF with the process, so it never keeps it alive.
+        let drain_tail = stderr_tail.clone();
+        let drain = tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
+            let mut scratch = Vec::new();
+            // Oversize / non-UTF-8 lines are skipped; the tail is best effort.
+            while let Ok(l) = read_capped_line(&mut reader, &mut scratch).await {
+                match l {
+                    CappedLine::Line(line) => {
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        let mut tail = drain_tail.lock().unwrap();
+                        if tail.len() == STDERR_TAIL_LINES {
+                            tail.pop_front();
+                        }
+                        tail.push_back(line.chars().take(STDERR_LINE_CHARS).collect());
+                    }
+                    CappedLine::Eof => break,
+                    _ => {}
+                }
+            }
+        });
+        let pump_tail = stderr_tail.clone();
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
             let mut scratch = Vec::new();
@@ -217,15 +254,19 @@ impl Host {
                 }
             }
             // The server is gone: no reply can arrive, so fail every
-            // waiting call instead of leaving it to hang forever.
+            // waiting call instead of leaving it to hang forever. Give the
+            // stderr drain a moment to land its last lines first (a
+            // grandchild holding the pipe open must not stall us).
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(300), drain).await;
             pump_closed.store(true, Ordering::SeqCst);
-            fail_pending(&pump_pending);
+            fail_pending(&pump_pending, &pump_tail);
         });
         Ok(Self {
             next_id: AtomicU64::new(1),
             writer: Arc::new(tokio::sync::Mutex::new(stdin)),
             pending,
             closed,
+            stderr_tail,
             child,
         })
     }
@@ -238,7 +279,7 @@ impl Host {
         // missed this entry, so fail it here.
         if self.is_closed() {
             self.pending.lock().unwrap().remove(&id);
-            return Err(exited());
+            return Err(exited(&self.stderr_tail));
         }
         let frame =
             serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
@@ -261,6 +302,11 @@ impl Host {
     /// True once the server has exited; the host is dead and must be respawned.
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Last `n` stderr lines (oldest first): why the server died.
+    pub fn stderr_tail(&self, n: usize) -> Vec<String> {
+        tail_lines(&self.stderr_tail, n)
     }
 
     /// Answer a server→client request (Codex approvals).
@@ -305,16 +351,30 @@ impl Host {
     }
 }
 
-fn exited() -> RpcError {
+fn tail_lines(tail: &StderrTail, n: usize) -> Vec<String> {
+    let tail = tail.lock().unwrap();
+    tail.iter()
+        .skip(tail.len().saturating_sub(n))
+        .cloned()
+        .collect()
+}
+
+/// "server exited", plus the last stderr lines when it said anything.
+fn exited(tail: &StderrTail) -> RpcError {
+    let why = tail_lines(tail, 3).join(" | ");
     RpcError {
         code: -32000,
-        message: "server exited".into(),
+        message: if why.is_empty() {
+            "server exited".into()
+        } else {
+            format!("server exited: {why}")
+        },
     }
 }
 
-fn fail_pending(pending: &Pending) {
+fn fail_pending(pending: &Pending, tail: &StderrTail) {
     for (_, tx) in pending.lock().unwrap().drain() {
-        let _ = tx.send(Err(exited()));
+        let _ = tx.send(Err(exited(tail)));
     }
 }
 
@@ -389,18 +449,16 @@ pub fn uuid7() -> String {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let mut buf = [0u8; 16];
-    // Fill from OS randomness; fall back to time-mixed counter (still unique
-    // per process since ms advances). getrandom crate avoided for one call.
-    #[cfg(unix)]
-    {
-        use std::io::Read;
-        let _ = std::fs::File::open("/dev/urandom").map(|mut f| f.read_exact(&mut buf));
-    }
-    #[cfg(not(unix))]
-    {
-        let t = std::time::SystemTime::now();
-        let h = std::collections::hash_map::DefaultHasher::new();
-        let _ = (t, h);
+    // OS-seeded RandomState hashed with a process-wide counter: no extra
+    // crate, works on every platform, distinct even within one millisecond.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    use std::hash::{BuildHasher, Hasher};
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    for (i, chunk) in buf.chunks_mut(8).enumerate() {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(n);
+        h.write_u64(i as u64);
+        chunk.copy_from_slice(&h.finish().to_be_bytes());
     }
     buf[0..6].copy_from_slice(&ms.to_be_bytes()[2..8]);
     buf[6] = (buf[6] & 0x0f) | 0x70; // version 7
@@ -515,6 +573,27 @@ mod tests {
         assert!(host.call("session/start", Value::Null).await.is_err());
     }
 
+    /// What the server wrote to stderr before dying reaches the error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exit_error_carries_stderr_tail() {
+        let (tx, _events) = mpsc::channel(4);
+        let host = Host::spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                "read -r line; echo 'noise' >&2; echo 'fatal: bad token' >&2; exit 1",
+            ],
+            &[],
+            tx,
+        )
+        .await
+        .unwrap();
+        let err = host.call("initialize", Value::Null).await.unwrap_err();
+        assert_eq!(err.message, "server exited: noise | fatal: bad token");
+        assert_eq!(host.stderr_tail(1), ["fatal: bad token"]);
+    }
+
     #[test]
     fn uuid7_parses_and_sorts() {
         let a = uuid7();
@@ -531,6 +610,12 @@ mod tests {
         // timestamp prefix is non-decreasing.
         let ts = |id: &str| u64::from_str_radix(&id.replace('-', "")[..12], 16).unwrap();
         assert!(ts(&a) <= ts(&b), "v7 timestamp went backwards");
+    }
+
+    #[test]
+    fn uuid7_differs_within_same_millisecond() {
+        let ids: std::collections::HashSet<String> = (0..1000).map(|_| uuid7()).collect();
+        assert_eq!(ids.len(), 1000);
     }
 
     #[tokio::test]

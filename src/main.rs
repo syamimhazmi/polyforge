@@ -102,6 +102,13 @@ struct Backends {
     claude_tx: Option<mpsc::Sender<ServerMsg>>,
     /// Next spawn id. Default 0; each `spawn_claude` takes the next value.
     claude_generation: u64,
+    /// In-flight host/session bring-ups, run off the event loop. Dropping
+    /// the set aborts them, which drops (and so kills) any half-started host.
+    bringups: tokio::task::JoinSet<BringDone>,
+    /// Hosts with a bring-up in flight (one per kind).
+    starting: Vec<BackendKind>,
+    /// Last `Session::connecting` token handed out.
+    next_token: u64,
 }
 
 impl Backends {
@@ -208,6 +215,7 @@ fn grey_out(app: &mut App, kind: BackendKind, reason: &str) {
     let tag = kind.label();
     for s in &mut app.sessions {
         if s.backend == kind {
+            s.connecting = None;
             s.tab_degraded = Some(reason.to_string());
             s.push_line(format!("{tag}: {reason}"));
         }
@@ -216,9 +224,12 @@ fn grey_out(app: &mut App, kind: BackendKind, reason: &str) {
 }
 
 /// Upper bound on one backend bring-up (spawn + handshake, or opening a
-/// tab's session). The event loop awaits these inline, so a server that
-/// never answers would otherwise freeze the UI with no way to quit.
+/// tab's session). Bring-ups run in tasks, so a server that never answers
+/// only greys out its tabs; the UI stays live.
 const BRINGUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Tab status while its backend comes up off the event loop.
+const CONNECTING: &str = "connecting…";
 
 fn no_reply() -> String {
     format!(
@@ -227,85 +238,277 @@ fn no_reply() -> String {
     )
 }
 
-/// Bring up the serve/app-server host for `kind` if not running. On
-/// timeout the half-started host is dropped, which kills its child.
-async fn ensure_host(
-    backends: &mut Backends,
-    kind: BackendKind,
-    cfg: &Config,
-) -> Result<(), String> {
-    tokio::time::timeout(BRINGUP_TIMEOUT, start_host(backends, kind, cfg))
-        .await
-        .unwrap_or_else(|_| Err(no_reply()))
+/// A started host plus its event channel (and grok's completion sender).
+struct HostUp {
+    host: msp::Host,
+    rx: mpsc::Receiver<ServerMsg>,
+    grok_tx: Option<mpsc::Sender<ServerMsg>>,
 }
 
-async fn start_host(
-    backends: &mut Backends,
-    kind: BackendKind,
-    cfg: &Config,
-) -> Result<(), String> {
-    let present = match kind {
-        BackendKind::Muse => backends.muse.is_some(),
-        BackendKind::Codex => backends.codex.is_some(),
-        BackendKind::Grok => backends.grok.is_some(),
-        // Agy/claude children are per-tab (see open_tab_session).
-        BackendKind::Agy | BackendKind::Claude | BackendKind::Mock => true,
-    };
-    if present {
-        return Ok(());
-    }
+/// A session/thread opened on a live host, with the transcript notes the
+/// open produced (resume fallback, model override). `id: None` = a fresh
+/// muse tab whose session starts on the first submit.
+struct Opened {
+    id: Option<String>,
+    resumed: bool,
+    notes: Vec<String>,
+}
+
+/// Result of a bring-up task, applied by the event loop.
+enum BringDone {
+    Host {
+        kind: BackendKind,
+        res: Result<HostUp, String>,
+    },
+    Session {
+        token: u64,
+        prev_id: Option<String>,
+        res: Result<Opened, String>,
+    },
+}
+
+/// Start the serve/app-server host for `kind`. Runs in a task: dropping
+/// the future (timeout, abort, quit) drops the half-started host, which
+/// kills its child.
+async fn bring_host(kind: BackendKind, cfg: &Config) -> Result<HostUp, String> {
     let (tx, rx) = mpsc::channel(256);
     match kind {
         BackendKind::Muse => {
-            let (host, ids, degraded) = muse_bringup(
-                &cfg.muse_bin(),
-                0,
-                cfg.muse_provider_id(),
-                cfg.muse_cfg.model.clone(),
-                cfg.workspace_root(),
-                vec![],
-                tx,
-            )
-            .await?;
-            let _ = (ids, degraded);
-            backends.muse = Some(LiveBackend {
-                host: std::sync::Arc::new(host),
+            let host = muse_bringup(&cfg.muse_bin(), vec![], tx).await?;
+            Ok(HostUp {
+                host,
                 rx,
-            });
-            Ok(())
+                grok_tx: None,
+            })
         }
         BackendKind::Codex => {
-            let (host, ids, degraded) = codex_bringup(
-                &cfg.codex_bin(),
-                0,
-                cfg.codex_model(),
-                cfg.workspace_root(),
-                vec![],
-                tx,
-            )
-            .await?;
-            let _ = (ids, degraded);
-            backends.codex = Some(LiveBackend {
-                host: std::sync::Arc::new(host),
+            let host = codex_bringup(&cfg.codex_bin(), vec![], tx).await?;
+            Ok(HostUp {
+                host,
                 rx,
-            });
-            Ok(())
+                grok_tx: None,
+            })
         }
         BackendKind::Grok => {
-            let (host, prompt_tx, degraded) =
+            let (host, prompt_tx) =
                 grok_bringup(&cfg.grok_bin(), env!("CARGO_PKG_VERSION"), vec![], tx).await?;
-            let _ = degraded;
-            backends.grok = Some(LiveBackend {
-                host: std::sync::Arc::new(host),
-                rx,
-            });
             // Retained for spawned session/prompt completions (see drain).
-            backends.grok_tx = Some(prompt_tx);
-            Ok(())
+            Ok(HostUp {
+                host,
+                rx,
+                grok_tx: Some(prompt_tx),
+            })
         }
-        // Agy is unreachable here (the respawn drain routes it to
-        // open_tab_session first); keep the total match honest.
-        BackendKind::Agy | BackendKind::Claude | BackendKind::Mock => Ok(()),
+        // Agy/claude children are per-tab (see open_session).
+        BackendKind::Agy | BackendKind::Claude | BackendKind::Mock => {
+            Err("no shared host".to_string())
+        }
+    }
+}
+
+/// Open the tab's session on a live host: resume `resume` if given, falling
+/// back to a fresh one.
+async fn remote_open(
+    host: &msp::Host,
+    kind: BackendKind,
+    cfg: &Config,
+    resume: Option<String>,
+) -> Result<Opened, String> {
+    let workspace = cfg.workspace_root();
+    // A fresh id, plus a model-override note (grok, non-fatal).
+    let fresh = async || -> Result<(String, Option<String>), String> {
+        match kind {
+            BackendKind::Muse => muse_start_session(
+                host,
+                cfg.muse_provider_id(),
+                cfg.muse_cfg.model.clone(),
+                workspace.clone(),
+            )
+            .await
+            .map(|id| (id, None)),
+            BackendKind::Codex => codex_start_thread(host, cfg.codex_model(), workspace.clone())
+                .await
+                .map(|id| (id, None)),
+            _ => grok_new_session(host, cfg.grok_model(), workspace.clone()).await,
+        }
+    };
+    let Some(old) = resume else {
+        // A fresh muse tab starts its session on the first submit, so idle
+        // launches leave no empty sessions behind.
+        if kind == BackendKind::Muse {
+            return Ok(Opened {
+                id: None,
+                resumed: false,
+                notes: vec![],
+            });
+        }
+        let (id, note) = fresh().await?;
+        return Ok(Opened {
+            id: Some(id),
+            resumed: false,
+            notes: note.into_iter().collect(),
+        });
+    };
+    let resumed = match kind {
+        BackendKind::Muse => muse_resume_session(host, &old).await,
+        BackendKind::Codex => codex_resume_thread(host, &old).await,
+        _ => grok_resume_session(host, &old, workspace.clone()).await,
+    };
+    match resumed {
+        Ok(id) => Ok(Opened {
+            id: Some(id),
+            resumed: true,
+            notes: vec![],
+        }),
+        Err(rerr) => {
+            let (id, note) = fresh().await?;
+            let mut notes = vec![format!(
+                "{}: resume failed ({rerr}) — started fresh",
+                kind.label()
+            )];
+            notes.extend(note);
+            Ok(Opened {
+                id: Some(id),
+                resumed: false,
+                notes,
+            })
+        }
+    }
+}
+
+/// Open the tab's session in a task, if its host is up.
+fn spawn_open(
+    backends: &mut Backends,
+    kind: BackendKind,
+    token: u64,
+    resume: Option<String>,
+    cfg: &Config,
+) {
+    let Some(ctx) = backends.get(kind) else {
+        return;
+    };
+    let (host, cfg) = (ctx.host.clone(), cfg.clone());
+    backends.bringups.spawn(async move {
+        let res = tokio::time::timeout(
+            BRINGUP_TIMEOUT,
+            remote_open(&host, kind, &cfg, resume.clone()),
+        )
+        .await
+        .unwrap_or_else(|_| Err(no_reply()));
+        BringDone::Session {
+            token,
+            prev_id: resume,
+            res,
+        }
+    });
+}
+
+/// Start a muse/codex/grok tab's bring-up without blocking the event loop:
+/// the tab shows "connecting…" until [`finish_bringup`] lands the result.
+/// The host starts first (once per kind) if it isn't up yet.
+fn begin_remote_open(
+    backends: &mut Backends,
+    app: &mut App,
+    tab: usize,
+    cfg: &Config,
+    resume: Option<String>,
+) {
+    let kind = app.sessions[tab].backend;
+    backends.next_token += 1;
+    let token = backends.next_token;
+    let tag = kind.label();
+    let s = &mut app.sessions[tab];
+    s.connecting = Some((token, resume.clone()));
+    s.tab_degraded = Some(CONNECTING.to_string());
+    app.flash = format!("{tag}: {CONNECTING}");
+    if backends.get(kind).is_some() {
+        spawn_open(backends, kind, token, resume, cfg);
+    } else if !backends.starting.contains(&kind) {
+        backends.starting.push(kind);
+        let cfg = cfg.clone();
+        backends.bringups.spawn(async move {
+            let res = tokio::time::timeout(BRINGUP_TIMEOUT, bring_host(kind, &cfg))
+                .await
+                .unwrap_or_else(|_| Err(no_reply()));
+            BringDone::Host { kind, res }
+        });
+    }
+}
+
+/// Apply a finished bring-up task on the event loop.
+fn finish_bringup(app: &mut App, backends: &mut Backends, cfg: &Config, done: BringDone) {
+    match done {
+        BringDone::Host { kind, res } => {
+            backends.starting.retain(|k| *k != kind);
+            let up = match res {
+                Ok(up) => up,
+                Err(e) => return grey_out(app, kind, &e),
+            };
+            let live = LiveBackend {
+                host: std::sync::Arc::new(up.host),
+                rx: up.rx,
+            };
+            match kind {
+                BackendKind::Muse => backends.muse = Some(live),
+                BackendKind::Codex => backends.codex = Some(live),
+                _ => {
+                    backends.grok = Some(live);
+                    backends.grok_tx = up.grok_tx;
+                }
+            }
+            // Every connecting tab of this kind was waiting on the host.
+            let waiting: Vec<_> = app
+                .sessions
+                .iter()
+                .filter(|s| s.backend == kind)
+                .filter_map(|s| s.connecting.clone())
+                .collect();
+            for (token, resume) in waiting {
+                spawn_open(backends, kind, token, resume, cfg);
+            }
+        }
+        BringDone::Session {
+            token,
+            prev_id,
+            res,
+        } => {
+            // The tab may have been closed or re-opened meanwhile.
+            let Some(tab) = app
+                .sessions
+                .iter()
+                .position(|s| s.connecting.as_ref().is_some_and(|c| c.0 == token))
+            else {
+                return;
+            };
+            let tag = app.sessions[tab].backend.label();
+            let s = &mut app.sessions[tab];
+            s.connecting = None;
+            s.tab_degraded = None;
+            match res {
+                Ok(o) => {
+                    for n in o.notes {
+                        s.push_line(n);
+                    }
+                    let Some(id) = o.id else {
+                        s.session_deferred = true;
+                        return;
+                    };
+                    if prev_id.as_deref() != Some(id.as_str()) {
+                        s.tokens = None;
+                    }
+                    s.remote_id = Some(id);
+                    if o.resumed {
+                        s.push_line(format!("{tag}: resumed previous session"));
+                    }
+                    app.save_tab_meta(tab);
+                }
+                Err(reason) => {
+                    s.tab_degraded = Some(reason.clone());
+                    s.push_line(format!("{tag}: {reason}"));
+                    app.flash = format!("{tag}: {reason}");
+                }
+            }
+        }
     }
 }
 
@@ -382,6 +585,17 @@ async fn open_tab_session(
     }
 }
 
+/// Start a fresh muse session with the configured provider and model.
+async fn muse_start_fresh(host: &msp::Host, cfg: &Config) -> Result<String, String> {
+    muse_start_session(
+        host,
+        cfg.muse_provider_id(),
+        cfg.muse_cfg.model.clone(),
+        cfg.workspace_root(),
+    )
+    .await
+}
+
 /// Open (or re-open) the remote session for one tab. Mock tabs need nothing.
 /// A stored remote id resumes the previous session (Q10); a failed resume
 /// falls back to a fresh session and says so. Failures grey out just this
@@ -399,6 +613,7 @@ async fn open_session(
     let prev_id = resume.clone();
     let s = &mut app.sessions[tab];
     s.remote_id = None;
+    s.session_deferred = false;
     s.reset_turn_state();
     // Context size belongs to the session: only a resume of the same id
     // keeps it.
@@ -406,6 +621,7 @@ async fn open_session(
         s.tokens = None;
     }
     s.tab_degraded = None;
+    s.connecting = None;
     let tag = backend.label();
     let fail = |app: &mut App, reason: &str| {
         let s = &mut app.sessions[tab];
@@ -427,103 +643,10 @@ async fn open_session(
     };
     match backend {
         BackendKind::Mock => app.save_tab_meta(tab),
-        BackendKind::Muse => {
-            let Some(ctx) = backends.get(backend) else {
-                fail(app, "host not running — press P to respawn");
-                return;
-            };
-            let fresh = || {
-                muse_start_session(
-                    &ctx.host,
-                    cfg.muse_provider_id(),
-                    cfg.muse_cfg.model.clone(),
-                    workspace.clone(),
-                )
-            };
-            match resume {
-                Some(old) => match muse_resume_session(&ctx.host, &old).await {
-                    Ok(id) => opened(app, id, true),
-                    Err(rerr) => match fresh().await {
-                        Ok(id) => {
-                            let s = &mut app.sessions[tab];
-                            s.push_line(format!("{tag}: resume failed ({rerr}) — started fresh"));
-                            opened(app, id, false);
-                        }
-                        Err(e) => fail(app, &e),
-                    },
-                },
-                None => match fresh().await {
-                    Ok(id) => opened(app, id, false),
-                    Err(e) => fail(app, &e),
-                },
-            }
-        }
-        BackendKind::Codex => {
-            let Some(ctx) = backends.get(backend) else {
-                fail(app, "host not running — press P to respawn");
-                return;
-            };
-            match resume {
-                Some(old) => match codex_resume_thread(&ctx.host, &old).await {
-                    Ok(id) => opened(app, id, true),
-                    Err(rerr) => {
-                        match codex_start_thread(&ctx.host, cfg.codex_model(), workspace).await {
-                            Ok(id) => {
-                                let s = &mut app.sessions[tab];
-                                s.push_line(format!(
-                                    "{tag}: resume failed ({rerr}) — started fresh"
-                                ));
-                                opened(app, id, false);
-                            }
-                            Err(e) => fail(app, &e),
-                        }
-                    }
-                },
-                None => match codex_start_thread(&ctx.host, cfg.codex_model(), workspace).await {
-                    Ok(id) => opened(app, id, false),
-                    Err(e) => fail(app, &e),
-                },
-            }
-        }
-        BackendKind::Grok => {
-            let Some(ctx) = backends.get(backend) else {
-                fail(app, "host not running — press P to respawn");
-                return;
-            };
-            // A model-override note rides alongside a fresh id (non-fatal).
-            let fresh_note = |app: &mut App, note: Option<String>| {
-                if let Some(n) = note {
-                    app.sessions[tab].push_line(n);
-                }
-            };
-            match resume {
-                Some(old) => match grok_resume_session(&ctx.host, &old, workspace.clone()).await {
-                    Ok(id) => opened(app, id, true),
-                    Err(rerr) => {
-                        match grok_new_session(&ctx.host, cfg.grok_model(), workspace.clone()).await
-                        {
-                            Ok((id, note)) => {
-                                let s = &mut app.sessions[tab];
-                                s.push_line(format!(
-                                    "{tag}: resume failed ({rerr}) — started fresh"
-                                ));
-                                fresh_note(app, note);
-                                opened(app, id, false);
-                            }
-                            Err(e) => fail(app, &e),
-                        }
-                    }
-                },
-                None => {
-                    match grok_new_session(&ctx.host, cfg.grok_model(), workspace.clone()).await {
-                        Ok((id, note)) => {
-                            fresh_note(app, note);
-                            opened(app, id, false);
-                        }
-                        Err(e) => fail(app, &e),
-                    }
-                }
-            }
+        // Handshake and session RPCs run off the event loop; the result
+        // lands via `finish_bringup`.
+        BackendKind::Muse | BackendKind::Codex | BackendKind::Grok => {
+            begin_remote_open(backends, app, tab, cfg, resume);
         }
         BackendKind::Agy => {
             // A fresh child per switch: kill the old conversation first.
@@ -663,35 +786,17 @@ async fn run(
     // Likewise for claude tab children.
     let (claude_tx, mut claude_rx) = mpsc::channel::<ServerMsg>(256);
     backends.claude_tx = Some(claude_tx);
-    // Bring up every shared host actually needed (not just the configured
-    // default). Grey-out only the backends whose ensure fails. Onboarding
-    // skips this: nothing is chosen yet.
-    let boot_tabs = if app.onboarding {
-        0
-    } else {
-        app.sessions.len()
-    };
-    for kind in App::backends_needed(&app.sessions[..boot_tabs]) {
-        if matches!(
-            kind,
-            BackendKind::Muse | BackendKind::Codex | BackendKind::Grok
-        ) {
-            if let Err(e) = ensure_host(&mut backends, kind, cfg).await {
-                grey_out(app, kind, &e);
-            }
+    // Queue a bring-up for every tab (hosts start once per kind, off the
+    // loop, so keys and redraws work meanwhile). Onboarding skips this:
+    // nothing is chosen yet.
+    if !app.onboarding {
+        for tab in 0..app.sessions.len() {
+            let backend = app.sessions[tab].backend;
+            app.outbox
+                .respawns
+                .push(app::OutboxRespawn { tab, backend });
         }
-    }
-    for tab in 0..boot_tabs {
-        let kind = app.sessions[tab].backend;
-        // Host already greyed out: skip so we don't clobber the ensure error.
-        if matches!(
-            kind,
-            BackendKind::Muse | BackendKind::Codex | BackendKind::Grok
-        ) && backends.get(kind).is_none()
-        {
-            continue;
-        }
-        open_tab_session(&mut backends, app, tab, cfg, &agy_tx).await;
+        drain_outbox(app, &mut backends, cfg, &agy_tx).await;
     }
 
     // Render is the most expensive thing this loop does (full-screen redraw
@@ -757,6 +862,14 @@ async fn run(
                     _ => {}
                 }
                 apply_mouse_capture(app)?;
+            }
+            Some(done) = backends.bringups.join_next() => {
+                // A panicked task drops its result; the tab keeps showing
+                // "connecting…" until P retries.
+                if let Ok(done) = done {
+                    finish_bringup(app, &mut backends, cfg, done);
+                }
+                dirty = true;
             }
             muse_msg = backend_msg(&mut backends.muse) => {
                 let had = muse_msg.is_some();
@@ -894,6 +1007,9 @@ async fn run(
             break;
         }
     }
+    // Abort in-flight bring-ups first: dropping them kills any half-started
+    // host and releases their Arc clones.
+    backends.bringups.shutdown().await;
     // In-flight spawned grok prompts hold the last Arcs: try_unwrap then
     // misses, and the final drop kills the child (kill_on_drop) after
     // stdin EOF already asked it to exit. No headless leak either way.
@@ -967,11 +1083,24 @@ fn backend_frame(
 
 /// Drop a dead host and grey out its tabs; P respawns (and resumes).
 fn backend_down(app: &mut App, kind: BackendKind, slot: &mut Option<LiveBackend>) {
+    // Why it died: the server's last stderr lines (empty if it said nothing).
+    let why = slot.as_ref().map_or(vec![], |ctx| ctx.host.stderr_tail(3));
     *slot = None;
     for s in app.sessions.iter_mut().filter(|s| s.backend == kind) {
         s.busy = false;
     }
-    grey_out(app, kind, "server exited — press P to respawn");
+    // The flash/banner gets the last line; the transcripts get all three.
+    let last = why.last().map_or(String::new(), |l| format!(": {l}"));
+    grey_out(
+        app,
+        kind,
+        &format!("server exited{last} — press P to respawn"),
+    );
+    for s in app.sessions.iter_mut().filter(|s| s.backend == kind) {
+        for l in &why {
+            s.push_line(format!("  stderr: {l}"));
+        }
+    }
 }
 
 /// True when some tab other than `tab` already holds this Claude remote id.
@@ -1188,15 +1317,13 @@ async fn drain_outbox(
     }
     while let Some(r) = app.outbox.respawns.pop() {
         did = true;
-        if r.backend == BackendKind::Agy {
-            open_tab_session(backends, app, r.tab, cfg, agy_tx).await;
+        // A tab closed or switched since the request has nothing to open.
+        if app
+            .sessions
+            .get(r.tab)
+            .is_none_or(|s| s.backend != r.backend)
+        {
             continue;
-        }
-        if r.backend != BackendKind::Mock {
-            if let Err(e) = ensure_host(backends, r.backend, cfg).await {
-                grey_out(app, r.backend, &e);
-                continue;
-            }
         }
         open_tab_session(backends, app, r.tab, cfg, agy_tx).await;
     }
@@ -1304,6 +1431,29 @@ async fn drain_outbox(
                 }
             }
             continue;
+        }
+        if app.sessions[sub.tab].session_deferred {
+            let started = match backends.get(sub.backend) {
+                Some(ctx) => tokio::time::timeout(BRINGUP_TIMEOUT, muse_start_fresh(&ctx.host, cfg))
+                    .await
+                    .unwrap_or_else(|_| Err(no_reply())),
+                None => Err("host not running — press P to respawn".to_string()),
+            };
+            let s = &mut app.sessions[sub.tab];
+            s.session_deferred = false;
+            match started {
+                Ok(id) => {
+                    s.remote_id = Some(id);
+                    app.save_tab_meta(sub.tab);
+                }
+                Err(e) => {
+                    s.busy = false;
+                    s.tab_degraded = Some(e.clone());
+                    s.push_line(format!("{tag}: {e}"));
+                    app.flash = format!("{tag}: {e}");
+                    continue;
+                }
+            }
         }
         let sid = app.sessions[sub.tab].remote_id.clone();
         let host = backends.get(sub.backend).map(|c| &c.host);
@@ -2967,5 +3117,220 @@ mod tests {
         // Stop now snapshots that id.
         app.request_stop();
         assert_eq!(app.outbox.stops[0].turn_id.as_deref(), Some("turn-7"));
+    }
+
+    /// Fake muse host: replies to session/start (id 1), then view/subscribe
+    /// (id 2) and turn/start (id 3).
+    #[cfg(unix)]
+    async fn muse_backend(start_reply: &str) -> LiveBackend {
+        let (tx, rx) = mpsc::channel(4);
+        let script = format!(
+            "read -r l; echo '{start_reply}'; for id in 2 3; do read -r l; echo '{{\"jsonrpc\":\"2.0\",\"id\":'$id',\"result\":{{}}}}'; done; while read -r l; do :; done"
+        );
+        let host = msp::Host::spawn("/bin/sh", &["-c", &script], &[], tx)
+            .await
+            .unwrap();
+        LiveBackend {
+            host: std::sync::Arc::new(host),
+            rx,
+        }
+    }
+
+    /// A deferred muse tab with its first prompt submitted (queued in the outbox).
+    fn deferred_muse_app() -> App {
+        let mut app = App::new();
+        let s = app.active_mut();
+        s.backend = BackendKind::Muse;
+        s.session_deferred = true;
+        s.input = "hello".into();
+        app.submit();
+        assert_eq!(app.outbox.submits.len(), 1);
+        app
+    }
+
+    /// The first submit starts the session, records its id, then sends the turn.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_muse_session_starts_on_first_submit() {
+        let mut backends = Backends {
+            muse: Some(
+                muse_backend(
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"session":{"sessionId":"mu-9"}}}"#,
+                )
+                .await,
+            ),
+            ..Default::default()
+        };
+        let mut app = deferred_muse_app();
+        assert!(app.active().remote_id.is_none());
+        let (agy_tx, _agy_rx) = mpsc::channel(1);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            drain_outbox(&mut app, &mut backends, &Config::default(), &agy_tx).await;
+        })
+        .await
+        .expect("drain timed out");
+        let s = app.active();
+        assert_eq!(s.remote_id.as_deref(), Some("mu-9"));
+        assert!(!s.session_deferred);
+        assert!(s.tab_degraded.is_none());
+        assert!(s.busy);
+    }
+
+    /// A failed deferred start greys the tab out with the friendly error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_muse_start_failure_greys_out_tab() {
+        let mut backends = Backends {
+            muse: Some(
+                muse_backend(
+                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"no credentials"}}"#,
+                )
+                .await,
+            ),
+            ..Default::default()
+        };
+        let mut app = deferred_muse_app();
+        let (agy_tx, _agy_rx) = mpsc::channel(1);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            drain_outbox(&mut app, &mut backends, &Config::default(), &agy_tx).await;
+        })
+        .await
+        .expect("drain timed out");
+        let s = app.active();
+        assert!(s.remote_id.is_none());
+        assert!(!s.session_deferred);
+        assert!(!s.busy);
+        assert!(s.tab_degraded.as_deref().unwrap().contains("muse login"));
+    }
+
+    /// Bring-up runs in a task: drain returns at once with the tab
+    /// "connecting…", and aborting it (quit) kills the half-started host.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bringup_runs_off_loop_and_abort_kills_host() {
+        let dir = std::env::temp_dir().join(format!("polyforge-bringup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (bin, pidfile) = (dir.join("muse"), dir.join("pid"));
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\necho $$ > {}\nexec sleep 600\n",
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut cfg = Config::default();
+        cfg.muse_cfg.bin = Some(bin.display().to_string());
+        let mut app = App::new();
+        app.active_mut().backend = BackendKind::Muse;
+        app.outbox.respawns.push(app::OutboxRespawn {
+            tab: 0,
+            backend: BackendKind::Muse,
+        });
+        let mut backends = Backends::default();
+        let (agy_tx, _agy_rx) = mpsc::channel(1);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            drain_outbox(&mut app, &mut backends, &cfg, &agy_tx),
+        )
+        .await
+        .expect("drain blocked on bring-up");
+        assert_eq!(backends.starting, vec![BackendKind::Muse]);
+        assert!(app.active().connecting.is_some());
+        assert_eq!(app.active().tab_degraded.as_deref(), Some(CONNECTING));
+        // The fake server is running and never answers the handshake.
+        let pid = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(t) = std::fs::read_to_string(&pidfile) {
+                    if let Ok(pid) = t.trim().parse::<u32>() {
+                        break pid;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("fake server never started");
+        backends.bringups.shutdown().await;
+        let gone = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let out = std::process::Command::new("ps")
+                    .args(["-o", "stat=", "-p", &pid.to_string()])
+                    .output()
+                    .unwrap();
+                let stat = String::from_utf8_lossy(&out.stdout);
+                // Gone, or a zombie awaiting reap.
+                if stat.trim().is_empty() || stat.trim().starts_with('Z') {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(gone.is_ok(), "host child leaked after abort");
+    }
+
+    #[test]
+    fn finish_bringup_applies_matching_token_only() {
+        let mut app = App::new();
+        app.active_mut().backend = BackendKind::Muse;
+        app.active_mut().connecting = Some((7, None));
+        app.active_mut().tab_degraded = Some(CONNECTING.into());
+        let mut backends = Backends::default();
+        let cfg = Config::default();
+        let opened = |id: &str| Opened {
+            id: Some(id.into()),
+            resumed: false,
+            notes: vec![],
+        };
+        // A superseded bring-up changes nothing.
+        let stale = BringDone::Session {
+            token: 6,
+            prev_id: None,
+            res: Ok(opened("old")),
+        };
+        finish_bringup(&mut app, &mut backends, &cfg, stale);
+        assert!(app.active().remote_id.is_none());
+        assert!(app.active().connecting.is_some());
+        let done = BringDone::Session {
+            token: 7,
+            prev_id: None,
+            res: Ok(opened("sid")),
+        };
+        finish_bringup(&mut app, &mut backends, &cfg, done);
+        let s = app.active();
+        assert_eq!(s.remote_id.as_deref(), Some("sid"));
+        assert!(s.connecting.is_none() && s.tab_degraded.is_none());
+        // A failed bring-up greys out the tab with the reason.
+        app.active_mut().connecting = Some((8, None));
+        let failed = BringDone::Session {
+            token: 8,
+            prev_id: None,
+            res: Err(no_reply()),
+        };
+        finish_bringup(&mut app, &mut backends, &cfg, failed);
+        assert_eq!(
+            app.active().tab_degraded.as_deref(),
+            Some(no_reply().as_str())
+        );
+        // A fresh muse tab defers its session to the first submit.
+        app.active_mut().connecting = Some((9, None));
+        let deferred = BringDone::Session {
+            token: 9,
+            prev_id: None,
+            res: Ok(Opened {
+                id: None,
+                resumed: false,
+                notes: vec![],
+            }),
+        };
+        finish_bringup(&mut app, &mut backends, &cfg, deferred);
+        let s = app.active();
+        assert!(s.session_deferred && s.connecting.is_none() && s.tab_degraded.is_none());
     }
 }

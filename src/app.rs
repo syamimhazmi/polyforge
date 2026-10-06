@@ -409,8 +409,13 @@ pub struct Session {
     pub backend: BackendKind,
     /// Remote session/thread id for the backend above (None = unavailable).
     pub remote_id: Option<String>,
+    /// Host is up but the session starts on the first submit (muse, fresh tab).
+    pub session_deferred: bool,
     /// Grey-out reason when this tab's backend degraded (e.g. no login).
     pub tab_degraded: Option<String>,
+    /// Bring-up in flight (token, resume id), run off the event loop; the
+    /// result applies only while the token still matches.
+    pub connecting: Option<(u64, Option<String>)>,
     pub input: String,
     /// Char-index cursor inside `input` (insert mode).
     pub cursor: usize,
@@ -484,7 +489,9 @@ impl Session {
             risk_spawned_gen: None,
             backend: BackendKind::Mock,
             remote_id: None,
+            session_deferred: false,
             tab_degraded: None,
+            connecting: None,
             store_id: None,
             created_at: 0,
             updated_at: 0,
@@ -980,6 +987,7 @@ impl App {
         let backend = self.sessions[tab].backend;
         let sid = self.sessions[tab].remote_id.clone();
         let degraded = self.sessions[tab].tab_degraded.clone();
+        let deferred = self.sessions[tab].session_deferred;
         let s = self.active_mut();
         s.sealed = false;
         s.turn_id = None;
@@ -989,6 +997,15 @@ impl App {
             BackendKind::Muse | BackendKind::Codex | BackendKind::Grok | BackendKind::Claude => {
                 match sid {
                     Some(_) => {
+                        s.busy = true;
+                        self.outbox.submits.push(OutboxSubmit {
+                            tab,
+                            backend,
+                            prompt,
+                        });
+                    }
+                    // The drain starts the session before sending the turn.
+                    None if deferred => {
                         s.busy = true;
                         self.outbox.submits.push(OutboxSubmit {
                             tab,
@@ -1486,17 +1503,6 @@ impl App {
         self.active_mut().sink = sink;
     }
 
-    /// Unique backends present across tabs (boot order preserved).
-    pub fn backends_needed(sessions: &[Session]) -> Vec<BackendKind> {
-        let mut out = Vec::new();
-        for s in sessions {
-            if !out.contains(&s.backend) {
-                out.push(s.backend);
-            }
-        }
-        out
-    }
-
     /// Record a tab's stored session (backend + remote id + title) for
     /// `/sessions`, bumping UPDATED to now. No-op when storageless or the
     /// tab has no store id.
@@ -1607,6 +1613,7 @@ impl App {
             let s = self.active_mut();
             s.backend = backend;
             s.remote_id = None;
+            s.session_deferred = false;
             s.tokens = None;
             s.tab_degraded = None;
             s.busy = false;
@@ -2164,25 +2171,6 @@ mod tests {
         assert!(app.outbox.respawns.is_empty());
         assert_eq!(app.sessions[0].remote_id.as_deref(), Some("live-claude"));
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn backends_needed_unique_preserves_order() {
-        let mut sessions = vec![Session::new("a"), Session::new("b"), Session::new("c")];
-        sessions[0].backend = BackendKind::Mock;
-        sessions[1].backend = BackendKind::Codex;
-        sessions[2].backend = BackendKind::Muse;
-        assert_eq!(
-            App::backends_needed(&sessions),
-            vec![BackendKind::Mock, BackendKind::Codex, BackendKind::Muse]
-        );
-        sessions[0].backend = BackendKind::Codex;
-        sessions[1].backend = BackendKind::Muse;
-        sessions[2].backend = BackendKind::Codex;
-        assert_eq!(
-            App::backends_needed(&sessions),
-            vec![BackendKind::Codex, BackendKind::Muse]
-        );
     }
 
     #[test]

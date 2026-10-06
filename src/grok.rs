@@ -24,7 +24,7 @@ use crate::msp::{self, Host, RpcError, ServerMsg};
 
 /// Bring up the Grok backend: spawn `grok agent stdio` + ACP handshake.
 /// Credential-free (initialize needs no auth); session creation happens
-/// per tab via the outbox. Returns host + completion-tx + degradation.
+/// per tab via the outbox. Returns host + completion-tx.
 /// The completion-tx feeds spawned session/prompt calls back into the
 /// main loop (the pump owns the original sender).
 pub async fn grok_bringup(
@@ -32,7 +32,7 @@ pub async fn grok_bringup(
     client_version: &str,
     extra_env: Vec<(String, String)>,
     events_tx: Sender<ServerMsg>,
-) -> Result<(Host, Sender<ServerMsg>, Option<String>), String> {
+) -> Result<(Host, Sender<ServerMsg>), String> {
     let host = Host::spawn(bin, &["agent", "stdio"], &extra_env, events_tx.clone())
         .await
         .map_err(|e| format!("could not spawn `{bin} agent stdio`: {e}"))?;
@@ -47,7 +47,7 @@ pub async fn grok_bringup(
     .await
     .map_err(|e| friendly_handshake_error(&e))?;
     // ACP has no initialized notification; notifications/initialized is MCP.
-    Ok((host, events_tx, None))
+    Ok((host, events_tx))
 }
 
 fn friendly_handshake_error(e: &RpcError) -> String {
@@ -1069,7 +1069,7 @@ mod tests {
         let bin = std::env::var("GROK_BIN").unwrap_or_else(|_| "grok".to_string());
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         match grok_bringup(&bin, "test", vec![], tx).await {
-            Ok((host, _, _)) => {
+            Ok((host, _)) => {
                 host.shutdown().await;
             }
             Err(e) if e.contains("could not spawn") => {

@@ -9,16 +9,13 @@ use serde_json::Value;
 use crate::app::{App, ApprovalChoice, DecisionKind, PendingApproval, PendingDiff};
 use crate::msp::{self, Host, RpcError, ServerMsg};
 
-/// Bring up the Codex backend: spawn app-server, handshake, open one thread
-/// per tab. Returns host, per-tab thread ids, and the first degradation.
+/// Bring up the Codex backend: spawn app-server and handshake. Threads
+/// are opened per tab afterwards via [`codex_start_thread`].
 pub async fn codex_bringup(
     bin: &str,
-    tabs: usize,
-    model: Option<String>,
-    workspace: String,
     extra_env: Vec<(String, String)>,
     events_tx: tokio::sync::mpsc::Sender<ServerMsg>,
-) -> Result<(Host, Vec<Option<String>>, Option<String>), String> {
+) -> Result<Host, String> {
     let host = Host::spawn(bin, &["app-server"], &extra_env, events_tx)
         .await
         .map_err(|e| format!("could not spawn `{bin} app-server`: {e}"))?;
@@ -27,21 +24,7 @@ pub async fn codex_bringup(
         .map_err(|e| format!("codex handshake failed: {e}"))?;
     // NOTE: codex has no `initialized` acknowledgement in the probed build;
     // calls proceed once `initialize` resolves.
-    let mut threads = Vec::new();
-    let mut degraded = None;
-    for _ in 0..tabs {
-        match codex_start_thread(&host, model.clone(), workspace.clone()).await {
-            Ok(id) => threads.push(Some(id)),
-            Err(e) => {
-                degraded = Some(e);
-                threads.push(None);
-            }
-        }
-        if degraded.is_some() {
-            break;
-        }
-    }
-    Ok((host, threads, degraded))
+    Ok(host)
 }
 
 /// Open one codex thread (also used when the picker respawns a tab).
@@ -697,9 +680,6 @@ mod tests {
         let _ = std::fs::create_dir_all(&home);
         let res = codex_bringup(
             &bin,
-            1,
-            Some("gpt-5.6".to_string()),
-            "/tmp".to_string(),
             vec![(
                 "CODEX_HOME".to_string(),
                 home.to_string_lossy().into_owned(),
@@ -708,9 +688,10 @@ mod tests {
         )
         .await;
         match res {
-            Ok((host, ids, _)) => {
-                assert_eq!(ids.len(), 1);
-                assert!(ids[0].is_some(), "thread should open without auth");
+            Ok(host) => {
+                let id = codex_start_thread(&host, Some("gpt-5.6".to_string()), "/tmp".to_string())
+                    .await;
+                assert!(id.is_ok(), "thread should open without auth");
                 host.shutdown().await;
             }
             Err(e) if e.contains("could not spawn") => {

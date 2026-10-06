@@ -661,7 +661,7 @@ fn render_welcome(f: &mut Frame, app: &App, th: Theme, area: Rect) {
         ("○", "choose a provider to start", th.warn)
     } else if s.backend == BackendKind::Mock {
         ("●", "ready (offline)", th.ok)
-    } else if s.remote_id.is_some() {
+    } else if s.remote_id.is_some() || s.session_deferred {
         ("●", "ready", th.ok)
     } else {
         ("○", "connecting…", th.running)

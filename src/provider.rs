@@ -8,49 +8,21 @@ use serde_json::Value;
 use crate::app::{App, ApprovalChoice, DecisionKind, OutboxDecide, PendingApproval, PendingDiff};
 use crate::msp::{self, Host, RpcError, ServerMsg};
 
-/// Bring up the muse backend: spawn serve, handshake, start one session per
-/// tab, subscribe to each. Errors degrade (never crash the TUI): the reason
-/// is shown on the tabs so the user sees the exact fix (`muse login`).
-/// Bring up the muse backend: spawn serve, handshake, start one session per
-/// tab. Returns the host, the per-tab session ids (None = failed to start;
-/// that tab is greyed out), and the first degradation reason, if any.
+/// Bring up the muse backend: spawn serve and handshake. Errors are
+/// returned as the reason string (e.g. the exact fix, `muse login`);
+/// sessions are started per tab afterwards via [`muse_start_session`].
 pub async fn muse_bringup(
     bin: &str,
-    tabs: usize,
-    provider_id: Option<String>,
-    model: Option<String>,
-    workspace: String,
     extra_env: Vec<(String, String)>,
     events_tx: tokio::sync::mpsc::Sender<ServerMsg>,
-) -> Result<(Host, Vec<Option<String>>, Option<String>), String> {
+) -> Result<Host, String> {
     let host = Host::spawn(bin, &["serve"], &extra_env, events_tx)
         .await
         .map_err(|e| format!("could not spawn `{bin} serve`: {e}"))?;
     host.handshake("polyforge", env!("CARGO_PKG_VERSION"))
         .await
         .map_err(|e| format!("msp handshake failed: {e}"))?;
-    let mut session_ids = Vec::new();
-    let mut degraded = None;
-    for _ in 0..tabs {
-        match muse_start_session(&host, provider_id.clone(), model.clone(), workspace.clone()).await
-        {
-            Ok(id) => {
-                // Best-effort live subscription; events arrive anyway.
-                let _ = host
-                    .call("view/subscribe", serde_json::json!({"sessionId": id}))
-                    .await;
-                session_ids.push(Some(id));
-            }
-            Err(e) => {
-                degraded = Some(e);
-                session_ids.push(None);
-            }
-        }
-        if degraded.is_some() {
-            break;
-        }
-    }
-    Ok((host, session_ids, degraded))
+    Ok(host)
 }
 
 /// Open one muse session (also used when the picker respawns a tab).
@@ -77,11 +49,17 @@ pub async fn muse_start_session(
         .call("session/start", params)
         .await
         .map_err(|e| friendly_start_error(&e))?;
-    res.get("session")
+    let id = res
+        .get("session")
         .and_then(|s| s.get("sessionId"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| "session/start: no sessionId in result".to_string())
+        .ok_or_else(|| "session/start: no sessionId in result".to_string())?;
+    // Best-effort live subscription; events arrive anyway.
+    let _ = host
+        .call("view/subscribe", serde_json::json!({"sessionId": id}))
+        .await;
+    Ok(id)
 }
 
 /// Re-attach a session from a previous run (Q10 resume). The server
@@ -505,6 +483,46 @@ mod tests {
         assert!(out.contains("truncated"));
         // Must not panic on a mid-char cut.
         let _ = truncate("你好世界", 3);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn muse_start_session_subscribes() {
+        let (tx, mut events) = tokio::sync::mpsc::channel(4);
+        // Fake server: answer session/start, then report the next frame.
+        let host = Host::spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                r#"
+            read -r start
+            printf '%s\n' '{"id":1,"result":{"session":{"sessionId":"s1"}}}'
+            read -r sub
+            printf '{"method":"observed","params":%s}\n' "$sub"
+            printf '%s\n' '{"id":2,"result":{}}'
+        "#,
+            ],
+            &[],
+            tx,
+        )
+        .await
+        .unwrap();
+        let id = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            muse_start_session(&host, None, None, "/tmp".into()),
+        )
+        .await
+        .expect("start hung")
+        .unwrap();
+        assert_eq!(id, "s1");
+        match events.recv().await.unwrap() {
+            ServerMsg::Notif { params, .. } => {
+                assert_eq!(params["method"], "view/subscribe");
+                assert_eq!(params["params"]["sessionId"], "s1");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        host.shutdown().await;
     }
 
     /// Live echo roundtrip against a real `muse serve`. Needs the binary
