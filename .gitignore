@@ -3,3 +3,5 @@ docs/*.json
 # cargo-mutants working output (regenerated locally)
 /mutants.out/
 /mutants.out.old/
+# Claude Code agent worktrees (local only)
+/.claude/worktrees/
