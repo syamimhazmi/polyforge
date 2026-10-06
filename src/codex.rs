@@ -21,7 +21,7 @@ pub async fn codex_bringup(
         .map_err(|e| format!("could not spawn `{bin} app-server`: {e}"))?;
     host.handshake("polyforge", env!("CARGO_PKG_VERSION"))
         .await
-        .map_err(|e| format!("codex handshake failed: {e}"))?;
+        .map_err(|e| format!("handshake failed: {e}"))?;
     // NOTE: codex has no `initialized` acknowledgement in the probed build;
     // calls proceed once `initialize` resolves.
     Ok(host)
@@ -57,9 +57,9 @@ pub async fn codex_start_thread(
 fn friendly_start_error(e: &RpcError) -> String {
     let m = e.message.to_lowercase();
     if m.contains("login") || m.contains("auth") || m.contains("credential") {
-        return format!("codex: not logged in — run `codex login` ({e})");
+        return format!("not logged in — run `codex login` ({e})");
     }
-    format!("codex thread/start failed: {e}")
+    format!("thread/start failed: {e}")
 }
 
 /// Re-attach a thread from a previous run (Q10 resume). History stays in
@@ -68,7 +68,7 @@ pub async fn codex_resume_thread(host: &Host, thread_id: &str) -> Result<String,
     let res = host
         .call("thread/resume", serde_json::json!({"threadId": thread_id}))
         .await
-        .map_err(|e| format!("codex thread/resume failed: {e}"))?;
+        .map_err(|e| format!("thread/resume failed: {e}"))?;
     let resumed = res
         .get("thread")
         .and_then(|t| t.get("id"))

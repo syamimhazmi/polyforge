@@ -53,9 +53,9 @@ pub async fn grok_bringup(
 fn friendly_handshake_error(e: &RpcError) -> String {
     let m = e.message.to_lowercase();
     if m.contains("login") || m.contains("auth") || m.contains("credential") {
-        return format!("grok: not logged in — run `grok` and sign in ({e})");
+        return format!("not logged in — run `grok` and sign in ({e})");
     }
-    format!("grok handshake failed: {e}")
+    format!("handshake failed: {e}")
 }
 
 /// Open one ACP session (also used when the picker respawns a tab).
@@ -100,12 +100,12 @@ pub async fn grok_new_session(
 fn friendly_session_error(e: &RpcError) -> String {
     let m = e.message.to_lowercase();
     if m.contains("login") || m.contains("auth") || m.contains("credential") {
-        return format!("grok: not logged in — run `grok` and sign in ({e})");
+        return format!("not logged in — run `grok` and sign in ({e})");
     }
     if m.contains("permission denied") || m.contains("os error 1") {
-        return format!("grok: sandbox denied session setup ({e})");
+        return format!("sandbox denied session setup ({e})");
     }
-    format!("grok session/new failed: {e}")
+    format!("session/new failed: {e}")
 }
 
 /// Re-attach a session from a previous run (/sessions resume). History
@@ -121,7 +121,7 @@ pub async fn grok_resume_session(
             serde_json::json!({"sessionId": session_id, "cwd": workspace}),
         )
         .await
-        .map_err(|e| format!("grok session/resume failed: {e}"))?;
+        .map_err(|e| format!("session/resume failed: {e}"))?;
     Ok(res
         .get("sessionId")
         .and_then(|v| v.as_str())

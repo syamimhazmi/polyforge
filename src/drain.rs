@@ -634,6 +634,12 @@ mod tests {
         assert!(!s.session_deferred);
         assert!(!s.busy);
         assert!(s.tab_degraded.as_deref().unwrap().contains("muse login"));
+        // The caller adds the backend tag; the reason must not repeat it.
+        assert!(
+            app.flash.starts_with("muse: not logged in"),
+            "{}",
+            app.flash
+        );
     }
 
     /// A failed deferred start sends nothing more: no `turn/start` reaches

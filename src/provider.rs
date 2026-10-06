@@ -72,7 +72,7 @@ pub async fn muse_resume_session(host: &Host, session_id: &str) -> Result<String
             serde_json::json!({"commandId": msp::uuid7(), "sessionId": session_id}),
         )
         .await
-        .map_err(|e| format!("muse session/resume failed: {e}"))?;
+        .map_err(|e| format!("session/resume failed: {e}"))?;
     // Best-effort live subscription; events arrive anyway.
     let _ = host
         .call(
@@ -92,9 +92,9 @@ pub async fn muse_resume_session(host: &Host, session_id: &str) -> Result<String
 fn friendly_start_error(e: &RpcError) -> String {
     let m = e.message.to_lowercase();
     if m.contains("credential") || m.contains("login") || m.contains("auth") {
-        return format!("muse: not logged in — run `muse login` ({e})");
+        return format!("not logged in — run `muse login` ({e})");
     }
-    format!("muse session/start failed: {e}")
+    format!("session/start failed: {e}")
 }
 
 /// Start a turn; returns the turn id when the result carries one.
