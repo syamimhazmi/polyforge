@@ -1,9 +1,11 @@
 # polyforge
 
-Vim-modal multi-tab TUI for coding agents.
+One terminal UI for several coding agents: vim-modal, one tab per agent session.
+
+<!-- SCREENSHOT PLACEHOLDER: docs/screenshot.png (TUI with tabs and a streamed reply) -->
 
 One tab = one agent session. Built with Rust (`ratatui` + `crossterm` +
-`tokio`). Fronts five stdio backends:
+`tokio`). Fronts five stdio backends plus an offline mock:
 
 | backend | wire |
 | ------- | ---- |
@@ -19,10 +21,41 @@ One tab = one agent session. Built with Rust (`ratatui` + `crossterm` +
 
 Full operator guide: [`docs/USER-MANUAL.md`](docs/USER-MANUAL.md).
 
-## Run
+## Install
 
 ```sh
-cargo run
+cargo install --git https://github.com/syamimhazmi/polyforge
+```
+
+Then install and log in to the agent CLIs you want (`muse`, `codex`,
+`agy`, `grok`, `claude`). The `mock` backend needs none.
+
+## Usage
+
+**Start a session in a project.** polyforge works in the directory you
+launch it from. On first launch it asks for a provider and saves it.
+
+```sh
+cd ~/Code/my-project
+polyforge
+# Enter → type a prompt → Enter; when the agent wants to write: y/n/a/q on the diff
+```
+
+**Try it offline, no quota.** Set the mock backend in
+`~/.config/polyforge/config.toml`:
+
+```toml
+[polyforge]
+provider = "mock"
+```
+
+**Run two agents side by side, then pick up later.**
+
+```text
+Enter, /tab new, Enter   open a second tab (same backend)
+Esc, P                   switch this tab's backend, e.g. to claude
+1 / 2 or Tab             jump between tabs
+Enter, /sessions, Enter  next time: this workspace's sessions; Enter continues one
 ```
 
 Empty tabs open on a welcome dashboard (logo, backend status, workspace,
@@ -91,20 +124,6 @@ quick-pick, `Esc` cancels): the tab respawns under the chosen backend with
 a FRESH session — history never carries over. The header row shows each tab's
 backend (`s1:muse`).
 
-## TypeSafe approval risk
-
-When a DIFF approval opens, polyforge asks TypeSafe (Jev) three judgments
-in one call: risk Score, secrets Noul, destructive Noul. Code composes a
-LOW/MED/HIGH band and shows it on the modal. y/n/a/q stay under user
-control.
-
-Key load order:
-
-1. `TYPESAFE_API_KEY` environment variable
-2. `~/.config/typesafe/env` (or `$XDG_CONFIG_HOME/typesafe/env`)
-
-Missing key: approvals work unscored.
-
 ## What each backend does
 
 | provider | behavior |
@@ -140,19 +159,9 @@ Session management follows the grok CLI shape:
 
 The last tab cannot be closed — `R` starts it fresh instead.
 
-## Live smoke
+## Docs
 
-Needs Muse login + quota (or switch provider):
-
-```sh
-cargo run            # first launch: pick a provider (2 = muse)
-# i → "reply with exactly: forge-ok" → Enter
-```
-
-Expect a streamed reply, `Worked for …`, and a bell. Then try an edit and
-approve/deny from the modal. Zero-quota UI work: `provider = "mock"`.
-
-## Known prototype deviations
-
-- Single `g` jumps to top (real `gg` arrives with the key engine).
-- Long lines wrap (greedy, wide-char aware); scroll offsets are display rows.
+- [User manual](docs/USER-MANUAL.md), including a [first-run smoke test](docs/USER-MANUAL.md#9-first-run-smoke-test)
+- [TypeSafe approval risk](docs/approval-risk.md): LOW/MED/HIGH risk band on the diff modal
+- [Known prototype deviations](docs/known-deviations.md)
+- [Security findings](docs/security-findings.md)

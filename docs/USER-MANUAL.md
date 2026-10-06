@@ -328,7 +328,7 @@ Needs a Muse login + quota:
 
 ```sh
 cargo run            # first launch: pick a provider (2 = muse)
-# i → "reply with exactly: forge-ok" → Enter
+# Enter → "reply with exactly: forge-ok" → Enter
 ```
 
 Expect a streamed reply, `Worked for …`, and a bell. Then try something
