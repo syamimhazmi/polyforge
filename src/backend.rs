@@ -494,6 +494,11 @@ async fn open_session(
         }
         app.save_tab_meta(tab);
     };
+    // Any agy child on this tab belongs to the old session: kill it, also
+    // when the tab switched to another backend (it would run until close).
+    if let Some(old) = backends.agy.get_mut(tab).and_then(Option::take) {
+        old.shutdown().await;
+    }
     match backend {
         BackendKind::Mock => app.save_tab_meta(tab),
         // Handshake and session RPCs run off the event loop; the result
@@ -502,13 +507,8 @@ async fn open_session(
             begin_remote_open(backends, app, tab, cfg, resume);
         }
         BackendKind::Agy => {
-            // A fresh child per switch: kill the old conversation first.
+            // A fresh child per switch (the old one is killed above).
             // A stored conversation id is passed through for continuation.
-            if backends.agy.len() > tab
-                && let Some(old) = backends.agy[tab].take()
-            {
-                old.shutdown().await;
-            }
             // Keep the resume id; `agy/init` confirms (or replaces) it.
             if let Some(ref id) = resume {
                 app.sessions[tab].remote_id = Some(id.clone());
@@ -575,6 +575,34 @@ mod tests {
     use super::*;
     use crate::app;
     use crate::drain::drain_outbox;
+
+    /// A tab leaving agy kills its old child on the next open instead of
+    /// leaving it running until the tab returns to agy or closes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn switching_away_from_agy_kills_the_old_child() {
+        let (tx, _rx) = mpsc::channel(16);
+        let sleep = ["-c".to_string(), "sleep 30".to_string()];
+        let child = crate::agy::spawn_agy("/bin/sh", &sleep, "/tmp", tx.clone())
+            .await
+            .unwrap();
+        let pid = child.pid().unwrap().to_string();
+        let mut backends = Backends {
+            agy: vec![Some(child)],
+            ..Default::default()
+        };
+        let mut app = App::new();
+        app.active_mut().backend = BackendKind::Mock;
+        open_tab_session(&mut backends, &mut app, 0, &Config::default(), &tx).await;
+        assert!(backends.agy[0].is_none());
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "old agy child {pid} still running");
+    }
 
     /// Bring-up runs in a task: drain returns at once with the tab
     /// "connecting…", and aborting it (quit) kills the half-started host.
