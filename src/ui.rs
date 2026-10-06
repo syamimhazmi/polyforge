@@ -13,11 +13,11 @@
 //! cannot drift apart.
 
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap},
-    Frame,
 };
 
 use crate::app::{App, Mode};
@@ -150,7 +150,10 @@ fn render_header(f: &mut Frame, app: &App, th: Theme, area: Rect) {
         }
         if let (true, Some(t)) = (with_tokens, tokens.as_ref()) {
             spans.push(sep.clone());
-            spans.push(Span::styled(t.to_lowercase(), Style::default().fg(th.muted)));
+            spans.push(Span::styled(
+                t.to_lowercase(),
+                Style::default().fg(th.muted),
+            ));
         }
         spans
     };
@@ -191,7 +194,12 @@ fn render_header(f: &mut Frame, app: &App, th: Theme, area: Rect) {
     let rw = right_w as u16;
     f.render_widget(
         Paragraph::new(Line::from(right)),
-        Rect::new(area.x + area.width - rw.min(area.width), area.y, rw.min(area.width), 1),
+        Rect::new(
+            area.x + area.width - rw.min(area.width),
+            area.y,
+            rw.min(area.width),
+            1,
+        ),
     );
 }
 
@@ -362,13 +370,20 @@ fn render_transcript(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
     // Text column: rail at col 2, text from col 5, 2-col right margin. The
     // wrap width, height cache, scroll math and mouse mapping all use it.
     let text_x = area.x + TEXT_COL.min(area.width.saturating_sub(1));
-    let text_w = (area.x + area.width).saturating_sub(text_x + RIGHT_MARGIN).max(1);
+    let text_w = (area.x + area.width)
+        .saturating_sub(text_x + RIGHT_MARGIN)
+        .max(1);
     let width = text_w as usize;
     app.viewport_height = area.height.max(1) as usize;
     app.viewport_width = width;
     // Origin for mouse cell → text mapping (recorded every frame).
     app.text_area = if area.height > 0 && text_x < area.x + area.width {
-        Some((text_x, area.y, text_w.min(area.x + area.width - text_x), area.height))
+        Some((
+            text_x,
+            area.y,
+            text_w.min(area.x + area.width - text_x),
+            area.height,
+        ))
     } else {
         None
     };
@@ -435,7 +450,10 @@ fn render_transcript(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
         let (raw, kind) = if li < n_committed {
             (s.lines[li].as_str(), s.kind_at(li))
         } else {
-            (drafts[li - n_committed].as_str(), draft_kinds[li - n_committed])
+            (
+                drafts[li - n_committed].as_str(),
+                draft_kinds[li - n_committed],
+            )
         };
         let mut d = display_line(raw, kind, th);
         // Live thought text under the header reads muted.
@@ -456,8 +474,8 @@ fn render_transcript(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
             .take(sub)
             .map(|c| c.chars().count())
             .sum::<usize>();
-        let live = li >= n_committed
-            || (li >= s.turn_first_line && (d.fill.is_none() || d.fill_text));
+        let live =
+            li >= n_committed || (li >= s.turn_first_line && (d.fill.is_none() || d.fill_text));
         let pad_style = d.fill.map(|bg| Style::default().bg(bg)).unwrap_or_default();
         for (ci, chunk) in chunks.iter().enumerate().skip(sub) {
             if live {
@@ -471,7 +489,10 @@ fn render_transcript(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
                 slice_spans(&d.spans, coff, coff + clen)
             };
             if let Some((ss, se)) = span {
-                let (a, b) = (ss.saturating_sub(coff).min(clen), se.saturating_sub(coff).min(clen));
+                let (a, b) = (
+                    ss.saturating_sub(coff).min(clen),
+                    se.saturating_sub(coff).min(clen),
+                );
                 if d.rule {
                     spans = reverse_range(spans, 0, width);
                 } else if a < b {
@@ -505,12 +526,16 @@ fn render_transcript(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
             } else {
                 (area.x + RAIL_COL, buf_w)
             };
-            f.buffer_mut().set_style(Rect::new(x, y, w, 1), Style::default().bg(bg));
+            f.buffer_mut()
+                .set_style(Rect::new(x, y, w, 1), Style::default().bg(bg));
         }
-        f.render_widget(Paragraph::new(line), Rect::new(text_x, y, text_w.min(area.x + area.width - text_x), 1));
+        f.render_widget(
+            Paragraph::new(line),
+            Rect::new(text_x, y, text_w.min(area.x + area.width - text_x), 1),
+        );
     }
     if let Some((phase, elapsed, scroll)) = rail {
-        use crate::activity::{blend, wave_brightness, Phase};
+        use crate::activity::{Phase, blend, wave_brightness};
         let accent = if phase == Phase::Thinking {
             th.assistant
         } else {
@@ -879,16 +904,18 @@ fn render_shortcuts(f: &mut Frame, app: &App, th: Theme, area: Rect) {
         ("[idle]".to_string(), Style::default().fg(th.muted))
     });
     right.push((
-        format!("{}/{}", s.scroll.min(total.saturating_sub(1)) + 1, total.max(1)),
+        format!(
+            "{}/{}",
+            s.scroll.min(total.saturating_sub(1)) + 1,
+            total.max(1)
+        ),
         Style::default().fg(th.muted),
     ));
     right.push((
         format!("mouse:{}", if app.mouse { "on" } else { "off" }),
         Style::default().fg(th.muted),
     ));
-    let right_w = |r: &[(String, Style)]| {
-        r.iter().map(|(t, _)| n(t) + 2).sum::<usize>()
-    };
+    let right_w = |r: &[(String, Style)]| r.iter().map(|(t, _)| n(t) + 2).sum::<usize>();
     let has_flash = !app.flash.is_empty();
     while right.len() > 1 && n(&badge) + right_w(&right) > width {
         right.pop();
@@ -920,7 +947,10 @@ fn render_shortcuts(f: &mut Frame, app: &App, th: Theme, area: Rect) {
                 .fg(th.text_secondary)
                 .add_modifier(Modifier::BOLD),
         ));
-        left.push(Span::styled(format!(":{desc}"), Style::default().fg(th.muted)));
+        left.push(Span::styled(
+            format!(":{desc}"),
+            Style::default().fg(th.muted),
+        ));
     }
     f.render_widget(Paragraph::new(Line::from(left)), area);
     let mut spans = Vec::new();
@@ -943,7 +973,7 @@ fn render_shortcuts(f: &mut Frame, app: &App, th: Theme, area: Rect) {
 /// Zero-height (skipped) when the tab is idle. Records the button cells in
 /// `app.stop_hit` for mouse clicks (None whenever it is not drawn).
 fn render_turn_status(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
-    use crate::activity::{format_secs, format_tokens_short, spinner_frame, Phase};
+    use crate::activity::{Phase, format_secs, format_tokens_short, spinner_frame};
     use std::time::Duration;
     app.stop_hit = None;
     let s = app.active();
@@ -995,12 +1025,19 @@ fn render_turn_status(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
         return;
     };
     // pre (muted) + [stop] + the right margin, right-aligned.
-    let pre_w = if pre.is_empty() { 0 } else { pre.chars().count() as u16 + 1 };
+    let pre_w = if pre.is_empty() {
+        0
+    } else {
+        pre.chars().count() as u16 + 1
+    };
     let w = pre_w + STOP_LABEL.len() as u16 + RIGHT_MARGIN;
     let x = area.x + area.width - w;
     let mut spans = Vec::new();
     if !pre.is_empty() {
-        spans.push(Span::styled(format!("{pre} "), Style::default().fg(th.muted)));
+        spans.push(Span::styled(
+            format!("{pre} "),
+            Style::default().fg(th.muted),
+        ));
     }
     spans.push(Span::styled(
         STOP_LABEL,
@@ -1010,12 +1047,7 @@ fn render_turn_status(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
         Paragraph::new(Line::from(spans)),
         Rect::new(x, area.y, w, 1),
     );
-    app.stop_hit = Some(Rect::new(
-        x + pre_w,
-        area.y,
-        STOP_LABEL.len() as u16,
-        1,
-    ));
+    app.stop_hit = Some(Rect::new(x + pre_w, area.y, STOP_LABEL.len() as u16, 1));
 }
 
 const STOP_LABEL: &str = "[stop]";
@@ -1079,7 +1111,10 @@ fn plan_turn_row(
         (label.to_string(), Some(phase_t.to_string()))
     } else if avail >= 1 + 3 + 1 + n(phase_t) {
         // Label gives way first, keeping at least 3 columns of it.
-        (clip(label, avail - 1 - 1 - n(phase_t)), Some(phase_t.to_string()))
+        (
+            clip(label, avail - 1 - 1 - n(phase_t)),
+            Some(phase_t.to_string()),
+        )
     } else {
         (clip(label, avail.saturating_sub(1)), None)
     };
@@ -1105,7 +1140,10 @@ fn render_input(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
         Span::styled(s.backend.label(), Style::default().fg(th.subtle)),
         Span::styled(" · ", Style::default().fg(th.dot)),
         Span::styled(s.name.clone(), Style::default().fg(th.muted)),
-        Span::styled(" ─", Style::default().fg(if focused { th.border_active } else { th.border })),
+        Span::styled(
+            " ─",
+            Style::default().fg(if focused { th.border_active } else { th.border }),
+        ),
     ]);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1133,7 +1171,10 @@ fn render_input(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
                 )
             }
         };
-        f.set_cursor_position((inner.x + INPUT_PROMPT.chars().count() as u16 + col as u16, inner.y));
+        f.set_cursor_position((
+            inner.x + INPUT_PROMPT.chars().count() as u16 + col as u16,
+            inner.y,
+        ));
     }
 }
 
@@ -1403,7 +1444,7 @@ mod tests {
     use super::*;
     use crate::app::App;
     use crate::theme::ThemeKind;
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{Terminal, backend::TestBackend};
 
     fn screen_rows(app: &mut App, w: u16, h: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
@@ -1425,13 +1466,22 @@ mod tests {
         app.sessions[0].sync_activity();
         let rows = screen_rows(&mut app, 80, 24);
         // Turn-status row sits above the input box; the shortcuts row is last.
-        let status = rows.iter().position(|r| r.contains("[busy]")).expect("busy");
+        let status = rows
+            .iter()
+            .position(|r| r.contains("[busy]"))
+            .expect("busy");
         assert_eq!(status, rows.len() - 1);
         assert!(rows.iter().all(|r| !r.contains("[idle]")));
-        let turn = rows.iter().position(|r| r.contains("[stop]")).expect("turn row");
+        let turn = rows
+            .iter()
+            .position(|r| r.contains("[stop]"))
+            .expect("turn row");
         assert_eq!(turn, rows.len() - 5, "turn row, 3-row box, shortcuts");
         assert!(rows[turn].starts_with("    "), "{:?}", rows[turn]);
-        assert_eq!(rows[turn].chars().nth(4).map(|c| c.is_alphanumeric()), Some(false));
+        assert_eq!(
+            rows[turn].chars().nth(4).map(|c| c.is_alphanumeric()),
+            Some(false)
+        );
         assert!(rows[turn].contains("Thinking… 0."), "{:?}", rows[turn]);
         // The right side is the turn timer, then the stop button + margin.
         assert!(rows[turn].ends_with("s [stop]  "), "{:?}", rows[turn]);
@@ -1617,7 +1667,11 @@ mod tests {
         assert!(row.ends_with("⇣1.23k [stop]  "), "{row:?}");
         assert!(row.contains("Thinking"));
         let hit = app.stop_hit.expect("button recorded");
-        let cells: String = row.chars().skip(hit.x as usize).take(hit.width as usize).collect();
+        let cells: String = row
+            .chars()
+            .skip(hit.x as usize)
+            .take(hit.width as usize)
+            .collect();
         assert_eq!(cells, "[stop]");
         // No tokens known: no arrow, button still there.
         let mut app = busy_app();
@@ -1672,7 +1726,11 @@ mod tests {
             let right = r.right.as_ref().map_or(0, |p| {
                 (if p.is_empty() { 0 } else { n(p) + 1 }) + STOP_LABEL.len() + 2
             });
-            assert!(left + right <= w, "w={w} left={left} right={right} {:?}", r.label);
+            assert!(
+                left + right <= w,
+                "w={w} left={left} right={right} {:?}",
+                r.label
+            );
         }
         // Shedding order: tokens go before the turn timer, timer before label.
         let r = plan_turn_row(40, "Responding", "12s", "1m 05s", Some("⇣12.3k"));
@@ -1694,7 +1752,10 @@ mod tests {
 
     #[test]
     fn short_cwd_abbreviates_all_but_the_last_component() {
-        assert_eq!(short_cwd("/private/tmp/claude/scratchpad/grokui"), "/p/t/c/s/grokui");
+        assert_eq!(
+            short_cwd("/private/tmp/claude/scratchpad/grokui"),
+            "/p/t/c/s/grokui"
+        );
         assert_eq!(short_cwd("/tmp/w"), "/t/w");
         assert_eq!(short_cwd(""), "");
         if let Ok(home) = std::env::var("HOME").map(|h| h.trim_end_matches('/').to_string())
@@ -1718,7 +1779,11 @@ mod tests {
         app.sessions[1].busy = true;
         let rows = screen_rows(&mut app, 100, 30);
         assert!(rows[0].starts_with("  /t/w/proj"), "{:?}", rows[0]);
-        assert!(rows[0].contains("○ s1:mock │ ● s2:mock │ 28k"), "{:?}", rows[0]);
+        assert!(
+            rows[0].contains("○ s1:mock │ ● s2:mock │ 28k"),
+            "{:?}",
+            rows[0]
+        );
         // Tight row: inactive tabs shorten to their index, never overflow.
         let rows = screen_rows(&mut app, 30, 12);
         assert!(rows[0].contains("○ s1:mock │ ● 2"), "{:?}", rows[0]);
@@ -1735,8 +1800,24 @@ mod tests {
         let row = |y: u16| (0..60).map(|x| buf[(x, y)].symbol()).collect::<String>();
         // Header is row 0; the prompt is row 1, the answer row 2.
         assert_eq!(&row(1)[..2], "  ");
-        assert!(row(1).chars().skip(5).collect::<String>().starts_with("❯ hi there"), "{:?}", row(1));
-        assert!(row(2).chars().skip(5).collect::<String>().starts_with("answer text"), "{:?}", row(2));
+        assert!(
+            row(1)
+                .chars()
+                .skip(5)
+                .collect::<String>()
+                .starts_with("❯ hi there"),
+            "{:?}",
+            row(1)
+        );
+        assert!(
+            row(2)
+                .chars()
+                .skip(5)
+                .collect::<String>()
+                .starts_with("answer text"),
+            "{:?}",
+            row(2)
+        );
         assert_eq!(buf[(5, 1)].fg, th.user);
         // Fill spans col 2 to the right margin; nothing outside it.
         for x in 2..58 {
@@ -1752,15 +1833,23 @@ mod tests {
         let mut app = App::new();
         let prompt = "aaaa bbbb cccc dddd eeee ffff gggg hhhh";
         app.sessions[0].push_line(format!("> {prompt}"));
-        app.sessions[0].push_line("plain answer that also wraps around the narrow view".to_string());
+        app.sessions[0]
+            .push_line("plain answer that also wraps around the narrow view".to_string());
         // 20 cols: text width 13 (col 5 .. 18-... margin), prompt text 11.
         let rows = screen_rows(&mut app, 20, 20);
         assert!(rows[1].contains("❯ aaaa bbbb"), "{:?}", rows[1]);
-        assert!(rows[2].starts_with("       "), "continuation aligns after ❯: {:?}", rows[2]);
+        assert!(
+            rows[2].starts_with("       "),
+            "continuation aligns after ❯: {:?}",
+            rows[2]
+        );
         assert_eq!(app.viewport_width, 20 - 5 - 2);
         // Height cache matches what was drawn.
         let s = &app.sessions[0];
-        assert_eq!(s.row_cache[0], crate::app::wrap_rows(prompt, app.viewport_width - 2));
+        assert_eq!(
+            s.row_cache[0],
+            crate::app::wrap_rows(prompt, app.viewport_width - 2)
+        );
         // Drag over the whole transcript copies the original text.
         let (ax, ay, _, _) = app.text_area.expect("text area");
         assert!(app.sel_begin(ax, ay));
@@ -1779,15 +1868,25 @@ mod tests {
         app.sessions[0].input = "abc".to_string();
         app.sessions[0].cursor = 3;
         let rows = screen_rows(&mut app, 100, 30);
-        let top = rows.iter().position(|r| r.contains('╭') && r.contains('╮')).expect("box top");
+        let top = rows
+            .iter()
+            .position(|r| r.contains('╭') && r.contains('╮'))
+            .expect("box top");
         assert!(rows[top].starts_with("  ╭") && rows[top].trim_end().ends_with('╮'));
-        assert!(rows[top + 1].starts_with("  │ ❯ abc"), "{:?}", rows[top + 1]);
+        assert!(
+            rows[top + 1].starts_with("  │ ❯ abc"),
+            "{:?}",
+            rows[top + 1]
+        );
         assert!(
             rows[top + 2].trim_end().ends_with("mock · s1 ─╯"),
             "{:?}",
             rows[top + 2]
         );
-        assert!(rows.iter().all(|r| !r.contains("input —")), "keys left the title");
+        assert!(
+            rows.iter().all(|r| !r.contains("input —")),
+            "keys left the title"
+        );
     }
 
     #[test]
@@ -1799,21 +1898,34 @@ mod tests {
         let last = rows.last().expect("row");
         assert!(last.contains(" NORMAL "), "{last:?}");
         assert!(last.contains("j/k:move  │  Space/i/a:type"), "{last:?}");
-        assert!(last.contains("[idle]") && last.contains("mouse:"), "{last:?}");
+        assert!(
+            last.contains("[idle]") && last.contains("mouse:"),
+            "{last:?}"
+        );
         assert!(!last.contains("Esc:stop"), "{last:?}");
         app.sessions[0].busy = true;
         app.sessions[0].sync_activity();
         let rows = screen_rows(&mut app, 100, 30);
         let last = rows.last().expect("row");
-        assert!(last.contains("Esc:stop") && last.contains("[busy]"), "{last:?}");
+        assert!(
+            last.contains("Esc:stop") && last.contains("[busy]"),
+            "{last:?}"
+        );
         // Narrow: hints give way first, the right side stays.
         let rows = screen_rows(&mut app, 40, 12);
         let last = rows.last().expect("row");
-        assert!(last.contains("[busy]") && last.chars().count() == 40, "{last:?}");
+        assert!(
+            last.contains("[busy]") && last.chars().count() == 40,
+            "{last:?}"
+        );
         // INSERT hints.
         app.mode = Mode::Insert;
         let rows = screen_rows(&mut app, 100, 30);
-        assert!(rows.last().expect("row").contains("Enter:send  │  Esc:normal"));
+        assert!(
+            rows.last()
+                .expect("row")
+                .contains("Enter:send  │  Esc:normal")
+        );
     }
 
     fn push_answer(app: &mut App, lines: &[&str]) {
@@ -1830,20 +1942,35 @@ mod tests {
         push_answer(
             &mut app,
             &[
-                "## Title", "some **bold** and `code`", "- item one", "1. step one", "---",
-                "```rust", "let x = 1;", "```", "after",
+                "## Title",
+                "some **bold** and `code`",
+                "- item one",
+                "1. step one",
+                "---",
+                "```rust",
+                "let x = 1;",
+                "```",
+                "after",
             ],
         );
         let rows = screen_rows(&mut app, 100, 30);
         let buf = screen_buf(&mut app, 100, 30);
         let at = |needle: &str| rows.iter().position(|r| r.contains(needle)).expect(needle);
-        assert!(rows[at("Title")].starts_with("     Title"), "{:?}", rows[at("Title")]);
+        assert!(
+            rows[at("Title")].starts_with("     Title"),
+            "{:?}",
+            rows[at("Title")]
+        );
         assert!(rows.iter().all(|r| !r.contains("##") && !r.contains("**")));
         assert!(rows[at("some bold and code")].starts_with("     some bold and code"));
         assert!(rows[at("• item one")].starts_with("     • item one"));
         assert!(rows[at("1. step one")].starts_with("     1. step one"));
-        assert!(rows[at("───")].contains(&"─".repeat(93)), "rule fills the text width");
-        let (code, blank_open, close) = (at("let x = 1;"), at("let x = 1;") - 1, at("let x = 1;") + 1);
+        assert!(
+            rows[at("───")].contains(&"─".repeat(93)),
+            "rule fills the text width"
+        );
+        let (code, blank_open, close) =
+            (at("let x = 1;"), at("let x = 1;") - 1, at("let x = 1;") + 1);
         for y in [code, blank_open, close] {
             for x in 5..98 {
                 assert_eq!(buf[(x, y as u16)].bg, th.code_bg, "row {y} col {x}");
@@ -1863,7 +1990,13 @@ mod tests {
         let k = |i| s.kind_at(i);
         assert_eq!(
             [k(0), k(1), k(2), k(3), k(4)],
-            [MdKind::Plain, MdKind::FenceOpen, MdKind::Code, MdKind::FenceClose, MdKind::Text]
+            [
+                MdKind::Plain,
+                MdKind::FenceOpen,
+                MdKind::Code,
+                MdKind::FenceClose,
+                MdKind::Text
+            ]
         );
         let lines = s.lines.clone();
         let kinds = s.kinds.clone();
@@ -1880,17 +2013,29 @@ mod tests {
     #[test]
     fn wrapped_markdown_line_height_and_copy_use_display_text() {
         let mut app = App::new();
-        push_answer(&mut app, &["## aaaa bbbb cccc dddd eeee ffff", "x **bold word** y `code`"]);
+        push_answer(
+            &mut app,
+            &[
+                "## aaaa bbbb cccc dddd eeee ffff",
+                "x **bold word** y `code`",
+            ],
+        );
         let _ = screen_rows(&mut app, 20, 20);
         let w = app.viewport_width;
         let s = &app.sessions[0];
-        assert_eq!(s.row_cache[1], crate::app::wrap_rows("aaaa bbbb cccc dddd eeee ffff", w));
+        assert_eq!(
+            s.row_cache[1],
+            crate::app::wrap_rows("aaaa bbbb cccc dddd eeee ffff", w)
+        );
         assert!(s.row_cache[1] > 1);
         let (ax, ay, _, _) = app.text_area.expect("text area");
         assert!(app.sel_begin(ax, ay));
         app.sel_extend(ax + 12, ay + app.sessions[0].total_rows as u16 - 1);
         let copied = app.take_selected_text().expect("selection");
-        assert!(copied.contains("aaaa bbbb cccc dddd eeee ffff"), "{copied:?}");
+        assert!(
+            copied.contains("aaaa bbbb cccc dddd eeee ffff"),
+            "{copied:?}"
+        );
         assert!(copied.contains("x bold word y code"), "{copied:?}");
         assert!(!copied.contains("##") && !copied.contains("**") && !copied.contains('`'));
     }
@@ -1929,9 +2074,16 @@ mod tests {
         assert_eq!(plain.text, "hello world");
         assert_eq!(plain.indent, 0);
         assert_eq!(
-            slice_spans(&plain.spans, 6, 11).iter().map(|s| s.content.as_ref()).collect::<String>(),
+            slice_spans(&plain.spans, 6, 11)
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
             "world"
         );
-        assert_eq!(line_rows("> abcdefgh", MdKind::Plain, 6), 2, "prompt wraps at width - indent");
+        assert_eq!(
+            line_rows("> abcdefgh", MdKind::Plain, 6),
+            2,
+            "prompt wraps at width - indent"
+        );
     }
 }

@@ -143,8 +143,11 @@ pub async fn grok_close_session(host: &Host, session_id: &str) {
 /// ACP `session/cancel` (a notification: the blocked `session/prompt`
 /// then answers with stopReason `cancelled`, ending the turn).
 pub async fn grok_cancel(host: &Host, session_id: &str) {
-    host.notify_params("session/cancel", serde_json::json!({"sessionId": session_id}))
-        .await;
+    host.notify_params(
+        "session/cancel",
+        serde_json::json!({"sessionId": session_id}),
+    )
+    .await;
 }
 
 /// Submit a prompt WITHOUT blocking the drain loop: `session/prompt`

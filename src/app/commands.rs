@@ -174,7 +174,9 @@ impl App {
             "  /tab close — close this tab, killing its session".to_string(),
             "  /theme [name] — switch theme, bare cycles (saved to config)".to_string(),
             "  /vim — toggle vim keymap (saved to config)".to_string(),
-            format!("keys (Normal mode): {move_keys} · P provider · R fresh · Esc stop turn · q quit"),
+            format!(
+                "keys (Normal mode): {move_keys} · P provider · R fresh · Esc stop turn · q quit"
+            ),
         ] {
             self.active_mut().push_line(l);
         }

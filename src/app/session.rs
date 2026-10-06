@@ -240,7 +240,8 @@ impl Session {
             return;
         }
         self.set_phase(crate::activity::Phase::Thinking);
-        self.thought_since.get_or_insert_with(std::time::Instant::now);
+        self.thought_since
+            .get_or_insert_with(std::time::Instant::now);
         self.thought.push_str(&text);
         if self.thought.len() > THOUGHT_CAP {
             let mut cut = self.thought.len() - THOUGHT_CAP;
@@ -261,7 +262,10 @@ impl Session {
         self.thought_cut = false;
         if had {
             let d = since.map_or(std::time::Duration::ZERO, |t| t.elapsed());
-            self.push_line(format!("◆ Thought for {}", crate::activity::format_elapsed(d)));
+            self.push_line(format!(
+                "◆ Thought for {}",
+                crate::activity::format_elapsed(d)
+            ));
         }
     }
 

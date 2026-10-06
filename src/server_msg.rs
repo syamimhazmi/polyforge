@@ -105,9 +105,10 @@ pub(crate) fn handle_agy_msg(app: &mut App, backends: &Backends, msg: ServerMsg)
         && method == "agy/exit"
     {
         let pid = params.get("pid").and_then(|v| v.as_u64());
-        let tab = backends.agy.iter().position(|h| {
-            pid.is_some() && h.as_ref().and_then(|h| h.pid()).map(u64::from) == pid
-        });
+        let tab = backends
+            .agy
+            .iter()
+            .position(|h| pid.is_some() && h.as_ref().and_then(|h| h.pid()).map(u64::from) == pid);
         return tab.is_some_and(|t| apply_agy_notif(app, t, method, params));
     }
     handle_server_msg(app, BackendKind::Agy, msg)

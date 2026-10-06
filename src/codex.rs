@@ -729,7 +729,12 @@ mod tests {
     fn turn_started_captures_turn_id_so_stop_can_name_it() {
         let mut app = codex_app();
         app.active_mut().busy = true;
-        apply_codex_notif(&mut app, 0, "turn/started", &serde_json::json!({"turn": {"id": "tu-3"}}));
+        apply_codex_notif(
+            &mut app,
+            0,
+            "turn/started",
+            &serde_json::json!({"turn": {"id": "tu-3"}}),
+        );
         assert_eq!(app.active().turn_id.as_deref(), Some("tu-3"));
         app.request_stop();
         assert_eq!(app.outbox.stops[0].turn_id.as_deref(), Some("tu-3"));

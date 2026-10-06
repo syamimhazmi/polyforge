@@ -149,9 +149,11 @@ pub(crate) async fn drain_outbox(
         }
         if app.sessions[sub.tab].session_deferred {
             let started = match backends.get(sub.backend) {
-                Some(ctx) => tokio::time::timeout(BRINGUP_TIMEOUT, muse_start_fresh(&ctx.host, cfg))
-                    .await
-                    .unwrap_or_else(|_| Err(no_reply())),
+                Some(ctx) => {
+                    tokio::time::timeout(BRINGUP_TIMEOUT, muse_start_fresh(&ctx.host, cfg))
+                        .await
+                        .unwrap_or_else(|_| Err(no_reply()))
+                }
                 None => Err("host not running — press P to respawn".to_string()),
             };
             let s = &mut app.sessions[sub.tab];

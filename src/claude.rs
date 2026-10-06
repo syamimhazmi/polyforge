@@ -848,7 +848,8 @@ mod tests {
         // No usage fields: previous value kept. Cumulative result.usage ignored.
         let bare = json!({"type": "assistant", "session_id": "sid-1", "message": {"content": []}});
         apply_claude_notif(&mut app, 0, "claude/assistant", &bare);
-        let r = json!({"type": "result", "session_id": "sid-1", "usage": {"input_tokens": 1_000_000}});
+        let r =
+            json!({"type": "result", "session_id": "sid-1", "usage": {"input_tokens": 1_000_000}});
         apply_claude_notif(&mut app, 0, "claude/result", &r);
         assert_eq!(app.active().tokens, Some(3210));
     }
@@ -859,7 +860,12 @@ mod tests {
         let before = app.active().lines.len();
         let ok = json!({"type": "control_response", "session_id": "sid-1",
             "response": {"subtype": "success", "request_id": "r"}});
-        assert!(!apply_claude_notif(&mut app, 0, "claude/control_response", &ok));
+        assert!(!apply_claude_notif(
+            &mut app,
+            0,
+            "claude/control_response",
+            &ok
+        ));
         assert_eq!(app.active().lines.len(), before);
         assert!(app.flash.is_empty());
     }
@@ -868,7 +874,11 @@ mod tests {
     async fn interrupt_reports_a_full_or_closed_channel() {
         let (frame_tx, mut frame_rx) = mpsc::channel::<Value>(1);
         let child = Command::new("true").spawn().unwrap();
-        let h = ClaudeHandle { frame_tx, child, generation: 1 };
+        let h = ClaudeHandle {
+            frame_tx,
+            child,
+            generation: 1,
+        };
         assert!(claude_interrupt(&h).is_ok());
         let sent = frame_rx.try_recv().unwrap();
         assert_eq!(sent["type"], "control_request");

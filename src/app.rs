@@ -558,7 +558,10 @@ mod tests {
     }
 
     fn stopped_lines(s: &Session) -> usize {
-        s.lines.iter().filter(|l| l.starts_with("■ stopped")).count()
+        s.lines
+            .iter()
+            .filter(|l| l.starts_with("■ stopped"))
+            .count()
     }
 
     #[test]
@@ -622,7 +625,10 @@ mod tests {
     }
 
     fn worked_lines(s: &Session) -> usize {
-        s.lines.iter().filter(|l| l.starts_with("Worked for ")).count()
+        s.lines
+            .iter()
+            .filter(|l| l.starts_with("Worked for "))
+            .count()
     }
 
     #[test]
@@ -635,7 +641,10 @@ mod tests {
         let s = app.active();
         assert_eq!(worked_lines(s), 1);
         let last = s.lines.last().expect("line");
-        assert!(last.starts_with("Worked for 0.") && last.ends_with('s'), "{last}");
+        assert!(
+            last.starts_with("Worked for 0.") && last.ends_with('s'),
+            "{last}"
+        );
         assert!(!s.lines.iter().any(|l| l.contains("done ✓")));
         // A stop request: `■ stopped` only.
         let mut app = busy_tab(BackendKind::Grok);
@@ -650,7 +659,10 @@ mod tests {
         app.request_stop();
         app.active_mut().sync_activity();
         assert_eq!(worked_lines(app.active()), 0);
-        assert_eq!(app.active().lines.last().map(String::as_str), Some(FORCED_STOP_LINE));
+        assert_eq!(
+            app.active().lines.last().map(String::as_str),
+            Some(FORCED_STOP_LINE)
+        );
     }
 
     #[test]

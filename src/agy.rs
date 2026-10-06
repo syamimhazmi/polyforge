@@ -532,9 +532,17 @@ mod tests {
         app.request_stop();
         apply_agy_notif(&mut app, 0, "agy/exit", &serde_json::json!({"pid": 1}));
         assert!(!app.active().busy);
-        assert!(app.active().lines.iter().any(|l| l == "agy: process exited"));
+        assert!(
+            app.active()
+                .lines
+                .iter()
+                .any(|l| l == "agy: process exited")
+        );
         app.active_mut().sync_activity();
-        assert_eq!(app.active().lines.last().map(String::as_str), Some("■ stopped"));
+        assert_eq!(
+            app.active().lines.last().map(String::as_str),
+            Some("■ stopped")
+        );
         // Already idle: a second exit says nothing.
         let n = app.active().lines.len();
         apply_agy_notif(&mut app, 0, "agy/exit", &serde_json::json!({"pid": 1}));
@@ -546,9 +554,14 @@ mod tests {
     async fn dead_child_sends_exit_and_interrupt_signals_live_child() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         // `sleep` ignores stdin; SIGINT ends it, which closes stdout.
-        let h = spawn_agy("/bin/sh", &["-c".to_string(), "sleep 30".to_string()], "/tmp", tx)
-            .await
-            .unwrap();
+        let h = spawn_agy(
+            "/bin/sh",
+            &["-c".to_string(), "sleep 30".to_string()],
+            "/tmp",
+            tx,
+        )
+        .await
+        .unwrap();
         let pid = h.pid().expect("live child has a pid");
         assert!(h.interrupt());
         let msg = tokio::time::timeout(std::time::Duration::from_secs(5), async {

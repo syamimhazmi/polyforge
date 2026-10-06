@@ -75,7 +75,10 @@ pub fn md_display(raw: &str, kind: MdKind, th: Theme) -> (String, Vec<Span<'stat
     let code = Style::default().fg(th.text_secondary).bg(th.code_bg);
     let mut spans: Vec<Span<'static>> = Vec::new();
     match kind {
-        MdKind::Plain => spans.push(Span::styled(raw.to_string(), Style::default().fg(th.text_primary))),
+        MdKind::Plain => spans.push(Span::styled(
+            raw.to_string(),
+            Style::default().fg(th.text_primary),
+        )),
         MdKind::Code => spans.push(Span::styled(raw.to_string(), code)),
         MdKind::FenceClose => {}
         MdKind::FenceOpen => {
@@ -102,7 +105,8 @@ fn text_line(raw: &str, th: Theme, out: &mut Vec<Span<'static>>) {
     let mut cx = Ctx { th, pipes: false };
     // Heading: `#`..`######` then a space (or nothing).
     let hashes = trimmed.chars().take_while(|&c| c == '#').count();
-    if (1..=6).contains(&hashes) && (trimmed.len() == hashes || trimmed[hashes..].starts_with(' ')) {
+    if (1..=6).contains(&hashes) && (trimmed.len() == hashes || trimmed[hashes..].starts_with(' '))
+    {
         let mut style = base.fg(th.user).add_modifier(Modifier::BOLD);
         if hashes == 1 {
             style = style.add_modifier(Modifier::UNDERLINED);
@@ -114,7 +118,10 @@ fn text_line(raw: &str, th: Theme, out: &mut Vec<Span<'static>>) {
         out.push(Span::styled(indent.to_string(), base));
     }
     // Bullet: `- ` / `* ` / `+ `.
-    if let Some(rest) = ["- ", "* ", "+ "].iter().find_map(|m| trimmed.strip_prefix(m)) {
+    if let Some(rest) = ["- ", "* ", "+ "]
+        .iter()
+        .find_map(|m| trimmed.strip_prefix(m))
+    {
         out.push(Span::styled("• ", muted));
         inline(&chars(rest), base, &cx, out);
         return;
@@ -172,10 +179,16 @@ fn inline(cs: &[char], base: Style, cx: &Ctx, out: &mut Vec<Span<'static>>) {
                 let close = (!(word && alnum_before))
                     .then(|| find(cs, i + 2, &[c, c]))
                     .flatten()
-                    .filter(|&j| j > i + 2 && !(word && cs.get(j + 2).is_some_and(|x| x.is_alphanumeric())));
+                    .filter(|&j| {
+                        j > i + 2 && !(word && cs.get(j + 2).is_some_and(|x| x.is_alphanumeric()))
+                    });
                 if let Some(j) = close {
                     flush(&mut cur, base, out);
-                    let m = if c == '~' { Modifier::CROSSED_OUT } else { Modifier::BOLD };
+                    let m = if c == '~' {
+                        Modifier::CROSSED_OUT
+                    } else {
+                        Modifier::BOLD
+                    };
                     inline(&cs[i + 2..j], base.add_modifier(m), cx, out);
                     i = j + 2;
                     continue;
@@ -203,7 +216,12 @@ fn inline(cs: &[char], base: Style, cx: &Ctx, out: &mut Vec<Span<'static>>) {
                     .and_then(|j| find(cs, j + 2, &[')']).map(|e| (j, e)));
                 if let Some((j, e)) = link {
                     flush(&mut cur, base, out);
-                    inline(&cs[i + 1..j], base.add_modifier(Modifier::UNDERLINED), cx, out);
+                    inline(
+                        &cs[i + 1..j],
+                        base.add_modifier(Modifier::UNDERLINED),
+                        cx,
+                        out,
+                    );
                     i = e + 1;
                     continue;
                 }
@@ -268,7 +286,11 @@ mod tests {
         assert_eq!(text("~~gone~~"), "gone");
         assert!(spans("~~gone~~")[0].2.contains(Modifier::CROSSED_OUT));
         assert_eq!(text("see [docs](https://x.y/z) ok"), "see docs ok");
-        assert!(spans("see [docs](https://x.y/z) ok")[1].2.contains(Modifier::UNDERLINED));
+        assert!(
+            spans("see [docs](https://x.y/z) ok")[1]
+                .2
+                .contains(Modifier::UNDERLINED)
+        );
         assert_eq!(text("**a `b` c**"), "a b c", "nesting");
     }
 
@@ -285,7 +307,11 @@ mod tests {
     #[test]
     fn snake_case_untouched() {
         assert_eq!(text("call my_var_name and _x_"), "call my_var_name and _x_");
-        assert_eq!(text("__init__ here"), "init here", "double underscore is bold");
+        assert_eq!(
+            text("__init__ here"),
+            "init here",
+            "double underscore is bold"
+        );
         assert_eq!(text("a__b__c"), "a__b__c");
     }
 
@@ -297,7 +323,10 @@ mod tests {
         assert_eq!(text("    - nested **x**"), "    • nested x");
         assert_eq!(spans("- item")[0].1, Some(th().muted));
         assert_eq!(text("1. step"), "1. step");
-        assert_eq!(spans("12. step")[0], ("12. ".to_string(), Some(th().muted), Modifier::empty()));
+        assert_eq!(
+            spans("12. step")[0],
+            ("12. ".to_string(), Some(th().muted), Modifier::empty())
+        );
         assert_eq!(text("*emph* first"), "emph first", "not a bullet");
         assert_eq!(text("-not a bullet"), "-not a bullet");
     }
@@ -319,7 +348,18 @@ mod tests {
     fn fence_state_machine() {
         let mut prev: Option<MdKind> = None;
         let mut kinds = Vec::new();
-        for l in ["hi", "```rust", "let x = 1;", "# not a heading", "```", "after", "~~~", "x", "y", "~~~"] {
+        for l in [
+            "hi",
+            "```rust",
+            "let x = 1;",
+            "# not a heading",
+            "```",
+            "after",
+            "~~~",
+            "x",
+            "y",
+            "~~~",
+        ] {
             let k = classify(l, prev.is_some_and(MdKind::in_fence));
             kinds.push(k);
             prev = Some(k);
@@ -327,7 +367,9 @@ mod tests {
         use MdKind::*;
         assert_eq!(
             kinds,
-            [Text, FenceOpen, Code, Code, FenceClose, Text, FenceOpen, Code, Code, FenceClose]
+            [
+                Text, FenceOpen, Code, Code, FenceClose, Text, FenceOpen, Code, Code, FenceClose
+            ]
         );
     }
 

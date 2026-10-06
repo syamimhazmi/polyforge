@@ -131,24 +131,24 @@ impl Theme {
             subtle: rgb(115, 115, 116),         // #737374
             dot: rgb(94, 100, 108),             // #5e646c
 
-            user: rgb(196, 167, 231),      // lavender #c4a7e7
-            assistant: rgb(187, 154, 247), // magenta #bb9af7
-            running: rgb(125, 207, 255),   // cyan
-            tool: rgb(120, 120, 120),      // bright gray #787878
-            ok: rgb(158, 206, 106),        // green #9ece6a
-            err: rgb(247, 118, 142),       // red #f7768e
-            warn: rgb(224, 175, 104),      // yellow #e0af68
-            plan: rgb(255, 219, 141),      // gold #FFDB8D
-            skill: rgb(122, 162, 247),     // blue #7aa2f7
-            path: rgb(255, 158, 100),      // orange #ff9e64
+            user: rgb(196, 167, 231),        // lavender #c4a7e7
+            assistant: rgb(187, 154, 247),   // magenta #bb9af7
+            running: rgb(125, 207, 255),     // cyan
+            tool: rgb(120, 120, 120),        // bright gray #787878
+            ok: rgb(158, 206, 106),          // green #9ece6a
+            err: rgb(247, 118, 142),         // red #f7768e
+            warn: rgb(224, 175, 104),        // yellow #e0af68
+            plan: rgb(255, 219, 141),        // gold #FFDB8D
+            skill: rgb(122, 162, 247),       // blue #7aa2f7
+            path: rgb(255, 158, 100),        // orange #ff9e64
             inline_code: rgb(125, 207, 223), // cyan #7dcfdf
 
             user_bg: rgb(15, 18, 22), // #0f1216
             code_bg: rgb(38, 41, 47), // #26292f
 
-            tab_active: rgb(196, 167, 231), // lavender
-            tab_busy: rgb(125, 207, 255),   // cyan
-            border: rgb(52, 48, 72),        // #343048 dim prompt chrome
+            tab_active: rgb(196, 167, 231),  // lavender
+            tab_busy: rgb(125, 207, 255),    // cyan
+            border: rgb(52, 48, 72),         // #343048 dim prompt chrome
             border_active: rgb(90, 84, 122), // #5a547a focused chrome
 
             mode_normal: rgb(158, 206, 106),

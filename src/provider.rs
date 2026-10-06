@@ -607,10 +607,25 @@ mod tests {
     #[test]
     fn context_usage_sets_tokens_and_zero_never_clobbers() {
         let mut app = muse_app();
-        apply_notif(&mut app, 0, "session/contextUsage", &serde_json::json!({"usedTokens": 4321}));
+        apply_notif(
+            &mut app,
+            0,
+            "session/contextUsage",
+            &serde_json::json!({"usedTokens": 4321}),
+        );
         assert_eq!(app.active().tokens, Some(4321));
-        apply_notif(&mut app, 0, "session/contextUsage", &serde_json::json!({"usedTokens": 0}));
-        apply_notif(&mut app, 0, "session/contextUsage", &serde_json::json!({"usedTokens": "x"}));
+        apply_notif(
+            &mut app,
+            0,
+            "session/contextUsage",
+            &serde_json::json!({"usedTokens": 0}),
+        );
+        apply_notif(
+            &mut app,
+            0,
+            "session/contextUsage",
+            &serde_json::json!({"usedTokens": "x"}),
+        );
         assert_eq!(app.active().tokens, Some(4321));
     }
 
@@ -623,7 +638,12 @@ mod tests {
         app.active_mut().busy = true;
         apply_notif(&mut app, 0, "turn/started", &p);
         assert_eq!(app.active().turn_id.as_deref(), Some("t-9"));
-        apply_notif(&mut app, 0, "turn/started", &serde_json::json!({"turn": {"id": "t-10"}}));
+        apply_notif(
+            &mut app,
+            0,
+            "turn/started",
+            &serde_json::json!({"turn": {"id": "t-10"}}),
+        );
         assert_eq!(app.active().turn_id.as_deref(), Some("t-10"));
     }
 
@@ -633,11 +653,21 @@ mod tests {
         app.active_mut().busy = true;
         app.request_stop();
         app.request_stop();
-        apply_notif(&mut app, 0, "session/statusChanged", &serde_json::json!({"status": "running"}));
+        apply_notif(
+            &mut app,
+            0,
+            "session/statusChanged",
+            &serde_json::json!({"status": "running"}),
+        );
         assert!(!app.active().busy);
         // A fresh submit unseals; status-driven busy works again.
         app.active_mut().sealed = false;
-        apply_notif(&mut app, 0, "session/statusChanged", &serde_json::json!({"status": "running"}));
+        apply_notif(
+            &mut app,
+            0,
+            "session/statusChanged",
+            &serde_json::json!({"status": "running"}),
+        );
         assert!(app.active().busy);
     }
 }
