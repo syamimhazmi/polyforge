@@ -495,14 +495,12 @@ fn redact_token_patterns(text: &str) -> String {
             // and copy one char.
         }
         let boundary = i == 0 || (!b[i - 1].is_ascii_alphanumeric() && b[i - 1] != b'_');
-        if boundary {
-            if let Some(total) = bearer_token_at(rest) {
-                out.push_str(&text[i..i + 6]);
-                out.push(' ');
-                out.push_str(REDACTED);
-                i += total;
-                continue;
-            }
+        if boundary && let Some(total) = bearer_token_at(rest) {
+            out.push_str(&text[i..i + 6]);
+            out.push(' ');
+            out.push_str(REDACTED);
+            i += total;
+            continue;
         }
         let ch = rest.chars().next().expect("non-empty");
         out.push(ch);
@@ -823,7 +821,7 @@ mod tests {
             let first = read_http_headers(&mut conn);
             let has_auth = first.lines().any(|l| {
                 l.eq_ignore_ascii_case("authorization: Bearer super-secret-token")
-                    || l.to_ascii_lowercase() == "authorization: bearer super-secret-token"
+                    || l.eq_ignore_ascii_case("authorization: bearer super-secret-token")
             });
             if !has_auth {
                 let _ = tx.send("missing-auth-on-first-hop".to_string());
@@ -1001,23 +999,22 @@ mod tests {
                     Ok(n) => buf.extend_from_slice(&chunk[..n]),
                     Err(_) => break,
                 }
-                if content_len.is_none() {
-                    if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let headers = String::from_utf8_lossy(&buf[..end]);
-                        content_len = headers.lines().find_map(|l| {
-                            let lower = l.to_ascii_lowercase();
-                            lower
-                                .strip_prefix("content-length:")
-                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
-                        });
-                    }
+                if content_len.is_none()
+                    && let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    let headers = String::from_utf8_lossy(&buf[..end]);
+                    content_len = headers.lines().find_map(|l| {
+                        let lower = l.to_ascii_lowercase();
+                        lower
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                    });
                 }
-                if let Some(cl) = content_len {
-                    if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                        if buf.len() >= end + 4 + cl {
-                            break;
-                        }
-                    }
+                if let Some(cl) = content_len
+                    && let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                    && buf.len() >= end + 4 + cl
+                {
+                    break;
                 }
                 if buf.len() > 64 * 1024 {
                     break;

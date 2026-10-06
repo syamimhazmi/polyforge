@@ -8,7 +8,7 @@
 pub fn wrap_rows(line: &str, width: usize) -> usize {
     let w = width.max(1);
     if line.is_ascii() {
-        return ((line.len() + w - 1) / w).max(1);
+        return line.len().div_ceil(w).max(1);
     }
     wrap_chunks(line, w).len().max(1)
 }
@@ -82,10 +82,8 @@ fn consume_until_st(it: &mut std::iter::Peekable<std::str::Chars>) {
     while let Some(c) = it.next() {
         match c {
             '\x07' | '\u{9c}' => break,
-            '\x1b' => {
-                if it.next() == Some('\\') {
-                    break;
-                }
+            '\x1b' if it.next() == Some('\\') => {
+                break;
             }
             _ => {}
         }

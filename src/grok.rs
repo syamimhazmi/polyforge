@@ -80,8 +80,8 @@ pub async fn grok_new_session(
         .map(|s| s.to_string())
         .ok_or_else(|| "session/new: no sessionId in result".to_string())?;
     let mut note = None;
-    if let Some(m) = model {
-        if let Err(e) = host
+    if let Some(m) = model
+        && let Err(e) = host
             .call(
                 "session/set_config_option",
                 serde_json::json!({
@@ -91,9 +91,8 @@ pub async fn grok_new_session(
                 }),
             )
             .await
-        {
-            note = Some(format!("grok: model override ignored ({e})"));
-        }
+    {
+        note = Some(format!("grok: model override ignored ({e})"));
     }
     Ok((id, note))
 }
@@ -273,11 +272,11 @@ pub fn apply_grok_notif(app: &mut App, tab: usize, method: &str, params: &Value)
                     );
                 } else if !resolved.is_empty() {
                     let s = &mut app.sessions[tab];
-                    if let Some(a) = s.pending_approval.as_ref() {
-                        if a.approval_id.ends_with(resolved) {
-                            s.pending_approval.take();
-                            let _ = s.clear_diff();
-                        }
+                    if let Some(a) = s.pending_approval.as_ref()
+                        && a.approval_id.ends_with(resolved)
+                    {
+                        s.pending_approval.take();
+                        let _ = s.clear_diff();
                     }
                 }
                 if tab == app.active {

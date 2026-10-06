@@ -584,11 +584,9 @@ mod tests {
                 msg = rx.recv() => {
                     let msg = msg.expect("host alive");
                     if let ServerMsg::Notif { method, params } = msg {
-                        if method == "item/delta" || method == "item/completed" {
-                            if let Some(t) = msp::extract_text(&params) {
-                                if t.contains("probe-ok") { saw_text = true; }
-                            }
-                        }
+                        if (method == "item/delta" || method == "item/completed")
+                            && let Some(t) = msp::extract_text(&params)
+                                && t.contains("probe-ok") { saw_text = true; }
                         if method == "turn/completed" { done = true; }
                     }
                 }

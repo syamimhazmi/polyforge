@@ -483,10 +483,10 @@ pub fn extract_text(params: &Value) -> Option<String> {
             Value::Array(a) => a.iter().find_map(walk),
             Value::Object(m) => {
                 for key in ["text", "delta"] {
-                    if let Some(Value::String(s)) = m.get(key) {
-                        if !s.is_empty() {
-                            return Some(s.clone());
-                        }
+                    if let Some(Value::String(s)) = m.get(key)
+                        && !s.is_empty()
+                    {
+                        return Some(s.clone());
                     }
                 }
                 m.values().find_map(walk)
@@ -731,7 +731,7 @@ mod tests {
     async fn capped_line_multi_mib_tail_resyncs_without_growing_scratch() {
         let mut data = vec![b'y'; MAX_NDJSON_LINE_BYTES + 1];
         // ~4 MiB more without newline, then newline + next frame.
-        data.extend(std::iter::repeat(b'z').take(4 * 1024 * 1024));
+        data.extend(std::iter::repeat_n(b'z', 4 * 1024 * 1024));
         data.push(b'\n');
         data.extend_from_slice(b"{\"ok\":true}\n");
         let mut reader = BufReader::new(&data[..]);

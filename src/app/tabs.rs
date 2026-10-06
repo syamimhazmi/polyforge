@@ -203,10 +203,10 @@ impl App {
         if backend == BackendKind::Agy {
             self.pending_agy_kill.push(tab);
         }
-        if backend == BackendKind::Grok {
-            if let Some(id) = self.sessions[tab].remote_id.clone() {
-                self.pending_grok_close.push(id);
-            }
+        if backend == BackendKind::Grok
+            && let Some(id) = self.sessions[tab].remote_id.clone()
+        {
+            self.pending_grok_close.push(id);
         }
         self.queue_claude_kill(tab);
         // Flush before dropping the sink so the transcript keeps its tail.
@@ -279,10 +279,10 @@ impl App {
     /// being closed or replaced.
     fn queue_claude_kill(&mut self, tab: usize) {
         let s = &self.sessions[tab];
-        if s.backend == BackendKind::Claude {
-            if let Some(id) = s.remote_id.clone() {
-                self.pending_claude_kill.push(id);
-            }
+        if s.backend == BackendKind::Claude
+            && let Some(id) = s.remote_id.clone()
+        {
+            self.pending_claude_kill.push(id);
         }
     }
 

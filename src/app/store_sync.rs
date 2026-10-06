@@ -11,20 +11,20 @@ impl App {
         if let Some(s) = self.sessions.get_mut(tab) {
             s.updated_at = now;
         }
-        if let (Some(store), Some(s)) = (self.store.as_ref(), self.sessions.get(tab)) {
-            if let Some(id) = s.store_id.as_deref() {
-                store.save_meta(
-                    id,
-                    &crate::store::SessionMeta {
-                        backend: s.backend.label().to_string(),
-                        remote_id: s.remote_id.clone(),
-                        created_at: s.created_at,
-                        updated_at: s.updated_at,
-                        title: s.title.clone(),
-                        workspace: self.workspace.clone(),
-                    },
-                );
-            }
+        if let (Some(store), Some(s)) = (self.store.as_ref(), self.sessions.get(tab))
+            && let Some(id) = s.store_id.as_deref()
+        {
+            store.save_meta(
+                id,
+                &crate::store::SessionMeta {
+                    backend: s.backend.label().to_string(),
+                    remote_id: s.remote_id.clone(),
+                    created_at: s.created_at,
+                    updated_at: s.updated_at,
+                    title: s.title.clone(),
+                    workspace: self.workspace.clone(),
+                },
+            );
         }
     }
 

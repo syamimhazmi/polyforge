@@ -171,7 +171,7 @@ impl CopyDelivery {
     }
 }
 
-fn abbreviate(path: &PathBuf) -> String {
+fn abbreviate(path: &std::path::Path) -> String {
     let s = path.to_string_lossy();
     if let Some(home) = std::env::var_os("HOME") {
         let h = home.to_string_lossy();

@@ -286,10 +286,10 @@ pub fn apply_codex_notif(app: &mut App, tab: usize, method: &str, params: &Value
                 "codex: guardian {status} — {}",
                 summarize_guardian_action(params.get("action").unwrap_or(&Value::Null))
             );
-            if let Some(r) = review.get("rationale").and_then(|v| v.as_str()) {
-                if !r.is_empty() {
-                    line.push_str(&format!(" ({})", truncate(r, 200)));
-                }
+            if let Some(r) = review.get("rationale").and_then(|v| v.as_str())
+                && !r.is_empty()
+            {
+                line.push_str(&format!(" ({})", truncate(r, 200)));
             }
             // S7-F2: an approved guardian review applies the side effect
             // without ever raising the y/n modal — say so on the line.

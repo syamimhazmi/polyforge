@@ -151,7 +151,7 @@ impl Store {
         };
         let mut tail: VecDeque<String> = VecDeque::new();
         let mut total = 0usize;
-        for line in BufReader::new(file).lines().filter_map(|l| l.ok()) {
+        for line in readable_lines(BufReader::new(file)) {
             total += 1;
             if tail.len() == MAX_LINES {
                 tail.pop_front();
@@ -324,6 +324,22 @@ pub fn append_line(sink: &mut BufWriter<File>, line: &str) {
     let _ = writeln!(sink, "{encoded}");
 }
 
+/// Lines of `r`, skipping ones that fail UTF-8 decoding (`InvalidData`;
+/// the bad line is already consumed) but stopping at any other I/O error,
+/// which would otherwise repeat forever.
+fn readable_lines<R: BufRead>(r: R) -> impl Iterator<Item = String> {
+    let mut lines = r.lines();
+    std::iter::from_fn(move || {
+        loop {
+            match lines.next()? {
+                Ok(l) => return Some(l),
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {}
+                Err(_) => return None,
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,6 +358,25 @@ mod tests {
             Store::open_in(dir.clone()).expect("open_in"),
             TempGuard(dir),
         )
+    }
+
+    #[test]
+    fn readable_lines_skips_bad_utf8_and_stops_on_io_error() {
+        let data: &[u8] = b"a\n\xff\xfe\nb\n";
+        assert_eq!(readable_lines(data).collect::<Vec<_>>(), ["a", "b"]);
+
+        struct Failing(bool);
+        impl std::io::Read for Failing {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if std::mem::replace(&mut self.0, true) {
+                    return Err(std::io::Error::other("boom"));
+                }
+                buf[..2].copy_from_slice(b"x\n");
+                Ok(2)
+            }
+        }
+        let r = BufReader::new(Failing(false));
+        assert_eq!(readable_lines(r).collect::<Vec<_>>(), ["x"]);
     }
 
     struct TempGuard(PathBuf);

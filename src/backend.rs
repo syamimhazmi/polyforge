@@ -504,10 +504,10 @@ async fn open_session(
         BackendKind::Agy => {
             // A fresh child per switch: kill the old conversation first.
             // A stored conversation id is passed through for continuation.
-            if backends.agy.len() > tab {
-                if let Some(old) = backends.agy[tab].take() {
-                    old.shutdown().await;
-                }
+            if backends.agy.len() > tab
+                && let Some(old) = backends.agy[tab].take()
+            {
+                old.shutdown().await;
             }
             app.sessions[tab].pending_agy_init = false;
             // Keep expected resume id so init can match by conversation_id.
@@ -540,11 +540,11 @@ async fn open_session(
             // Another tab already holding this resume id must keep its
             // child: removing the map entry would kill that tab.
             let resumed = resume.is_some();
-            if let Some(ref resume_id) = resume {
-                if claude_id_open_elsewhere(app, tab, resume_id) {
-                    fail(app, "session is open in another tab — /tab close it first");
-                    return;
-                }
+            if let Some(ref resume_id) = resume
+                && claude_id_open_elsewhere(app, tab, resume_id)
+            {
+                fail(app, "session is open in another tab — /tab close it first");
+                return;
             }
             let id = resume.unwrap_or_else(msp::uuid7);
             if let Some(old) = backends.claude.remove(&id) {
@@ -625,10 +625,10 @@ mod tests {
         // The fake server is running and never answers the handshake.
         let pid = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                if let Ok(t) = std::fs::read_to_string(&pidfile) {
-                    if let Ok(pid) = t.trim().parse::<u32>() {
-                        break pid;
-                    }
+                if let Ok(t) = std::fs::read_to_string(&pidfile)
+                    && let Ok(pid) = t.trim().parse::<u32>()
+                {
+                    break pid;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }

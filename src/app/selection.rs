@@ -69,11 +69,11 @@ impl App {
     /// Extend the active drag to terminal cell (col, row). Clamps to the
     /// viewport: drags outside keep the last in-bounds focus.
     pub fn sel_extend(&mut self, col: u16, row: u16) {
-        if let Some((line, ch)) = self.cell_to_text(col, row) {
-            if let Some(sel) = self.sel.as_mut() {
-                sel.focus_line = line;
-                sel.focus_char = ch;
-            }
+        if let Some((line, ch)) = self.cell_to_text(col, row)
+            && let Some(sel) = self.sel.as_mut()
+        {
+            sel.focus_line = line;
+            sel.focus_char = ch;
         }
     }
 
@@ -167,15 +167,15 @@ mod tests {
         app.text_area = Some((1, 1, 10, 10));
         app.active_mut().scroll = 0;
         // Drag from line 0 char 4 to line 1 char 4.
-        assert!(app.sel_begin(1 + 4, 1 + 0));
+        assert!(app.sel_begin(1 + 4, 1));
         app.sel_extend(1 + 4, 1 + 1);
         assert_eq!(app.selected_text().as_deref(), Some("bbbbcc\ndddd"));
         // Reversed drag normalizes the same way.
         assert!(app.sel_begin(1 + 4, 1 + 1));
-        app.sel_extend(1 + 4, 1 + 0);
+        app.sel_extend(1 + 4, 1);
         assert_eq!(app.selected_text().as_deref(), Some("bbbbcc\ndddd"));
         // Click without drag copies nothing.
-        assert!(app.sel_begin(1 + 2, 1 + 0));
+        assert!(app.sel_begin(1 + 2, 1));
         assert_eq!(app.selected_text(), None);
         // Outside the viewport: no selection.
         assert!(!app.sel_begin(0, 0));

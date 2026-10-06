@@ -115,14 +115,9 @@ async fn run(
     // Crossterm reads block; isolate them on a thread, forward as messages.
     let (key_tx, mut key_rx) = mpsc::channel::<Event>(128);
     std::thread::spawn(move || {
-        loop {
-            match event::read() {
-                Ok(ev) => {
-                    if key_tx.blocking_send(ev).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
+        while let Ok(ev) = event::read() {
+            if key_tx.blocking_send(ev).is_err() {
+                break;
             }
         }
     });
@@ -183,11 +178,9 @@ async fn run(
                         MouseEventKind::Down(btn) => {
                             // The `[stop]` button wins over selection.
                             if app.mouse
-                                && btn == MouseButton::Left
-                                && app.click_stop(m.column, m.row)
+                                && ((btn == MouseButton::Left && app.click_stop(m.column, m.row))
+                                    || app.sel_begin(m.column, m.row))
                             {
-                                dirty = true;
-                            } else if app.mouse && app.sel_begin(m.column, m.row) {
                                 dirty = true;
                             }
                         }
@@ -197,15 +190,13 @@ async fn run(
                                 dirty = true;
                             }
                         }
-                        MouseEventKind::Up(_) => {
-                            if app.mouse && app.sel.is_some() {
-                                // take_selected_text always dehighlights
-                                // (copy path and empty click alike).
-                                if let Some(text) = app.take_selected_text() {
-                                    app.flash = copy_to_clipboard(&text);
-                                }
-                                dirty = true;
+                        MouseEventKind::Up(_) if app.mouse && app.sel.is_some() => {
+                            // take_selected_text always dehighlights
+                            // (copy path and empty click alike).
+                            if let Some(text) = app.take_selected_text() {
+                                app.flash = copy_to_clipboard(&text);
                             }
+                            dirty = true;
                         }
                         _ => {}
                     },
@@ -363,20 +354,20 @@ async fn run(
     // In-flight spawned grok prompts hold the last Arcs: try_unwrap then
     // misses, and the final drop kills the child (kill_on_drop) after
     // stdin EOF already asked it to exit. No headless leak either way.
-    if let Some(ctx) = backends.muse {
-        if let Ok(host) = std::sync::Arc::try_unwrap(ctx.host) {
-            host.shutdown().await;
-        }
+    if let Some(ctx) = backends.muse
+        && let Ok(host) = std::sync::Arc::try_unwrap(ctx.host)
+    {
+        host.shutdown().await;
     }
-    if let Some(ctx) = backends.codex {
-        if let Ok(host) = std::sync::Arc::try_unwrap(ctx.host) {
-            host.shutdown().await;
-        }
+    if let Some(ctx) = backends.codex
+        && let Ok(host) = std::sync::Arc::try_unwrap(ctx.host)
+    {
+        host.shutdown().await;
     }
-    if let Some(ctx) = backends.grok {
-        if let Ok(host) = std::sync::Arc::try_unwrap(ctx.host) {
-            host.shutdown().await;
-        }
+    if let Some(ctx) = backends.grok
+        && let Ok(host) = std::sync::Arc::try_unwrap(ctx.host)
+    {
+        host.shutdown().await;
     }
     for slot in backends.agy.iter_mut() {
         if let Some(h) = slot.take() {

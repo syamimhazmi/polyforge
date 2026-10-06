@@ -224,27 +224,27 @@ pub(crate) fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
 
     // Diff modal steals y/n/a/q on the active tab.
     if app.active().pending_diff.is_some() {
-        if let KeyCode::Char(c) = code {
-            if no_mods {
-                match c {
-                    'y' => {
-                        decide_ui(app, DecisionKind::Approve, "approved");
-                        return;
-                    }
-                    'n' => {
-                        decide_ui(app, DecisionKind::Reject, "rejected");
-                        return;
-                    }
-                    'a' => {
-                        decide_ui(app, DecisionKind::ApproveAll, "approved-all");
-                        return;
-                    }
-                    'q' => {
-                        decide_ui(app, DecisionKind::Later, "deferred");
-                        return;
-                    }
-                    _ => {}
+        if let KeyCode::Char(c) = code
+            && no_mods
+        {
+            match c {
+                'y' => {
+                    decide_ui(app, DecisionKind::Approve, "approved");
+                    return;
                 }
+                'n' => {
+                    decide_ui(app, DecisionKind::Reject, "rejected");
+                    return;
+                }
+                'a' => {
+                    decide_ui(app, DecisionKind::ApproveAll, "approved-all");
+                    return;
+                }
+                'q' => {
+                    decide_ui(app, DecisionKind::Later, "deferred");
+                    return;
+                }
+                _ => {}
             }
         }
         if code == KeyCode::Esc {
@@ -492,7 +492,7 @@ pub(crate) fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             }
             KeyCode::Enter => app.choose_session(app.sess_sel),
             KeyCode::Char('d') if no_mods => app.delete_selected_session(),
-            KeyCode::Char(c) if no_mods && c >= '1' && c <= '9' => {
+            KeyCode::Char(c) if no_mods && ('1'..='9').contains(&c) => {
                 let i = c as usize - '1' as usize;
                 if i < app.sess_list.len() {
                     app.choose_session(i);

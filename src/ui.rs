@@ -1697,10 +1697,13 @@ mod tests {
         assert_eq!(short_cwd("/private/tmp/claude/scratchpad/grokui"), "/p/t/c/s/grokui");
         assert_eq!(short_cwd("/tmp/w"), "/t/w");
         assert_eq!(short_cwd(""), "");
-        if let Ok(home) = std::env::var("HOME").map(|h| h.trim_end_matches('/').to_string()) {
-            if !home.is_empty() {
-                assert_eq!(short_cwd(&format!("{home}/Code/polyforge")), "~/C/polyforge");
-            }
+        if let Ok(home) = std::env::var("HOME").map(|h| h.trim_end_matches('/').to_string())
+            && !home.is_empty()
+        {
+            assert_eq!(
+                short_cwd(&format!("{home}/Code/polyforge")),
+                "~/C/polyforge"
+            );
         }
     }
 
