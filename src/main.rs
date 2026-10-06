@@ -215,8 +215,31 @@ fn grey_out(app: &mut App, kind: BackendKind, reason: &str) {
     app.flash = format!("{tag}: {reason}");
 }
 
-/// Bring up the serve/app-server host for `kind` if not running.
+/// Upper bound on one backend bring-up (spawn + handshake, or opening a
+/// tab's session). The event loop awaits these inline, so a server that
+/// never answers would otherwise freeze the UI with no way to quit.
+const BRINGUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn no_reply() -> String {
+    format!(
+        "no reply in {}s — press P to retry",
+        BRINGUP_TIMEOUT.as_secs()
+    )
+}
+
+/// Bring up the serve/app-server host for `kind` if not running. On
+/// timeout the half-started host is dropped, which kills its child.
 async fn ensure_host(
+    backends: &mut Backends,
+    kind: BackendKind,
+    cfg: &Config,
+) -> Result<(), String> {
+    tokio::time::timeout(BRINGUP_TIMEOUT, start_host(backends, kind, cfg))
+        .await
+        .unwrap_or_else(|_| Err(no_reply()))
+}
+
+async fn start_host(
     backends: &mut Backends,
     kind: BackendKind,
     cfg: &Config,
@@ -335,11 +358,35 @@ async fn ensure_agy_tab(
     }
 }
 
+/// [`open_session`] under [`BRINGUP_TIMEOUT`]; a hung server greys out
+/// just this tab.
+async fn open_tab_session(
+    backends: &mut Backends,
+    app: &mut App,
+    tab: usize,
+    cfg: &Config,
+    agy_tx: &mpsc::Sender<ServerMsg>,
+) {
+    let opened = tokio::time::timeout(
+        BRINGUP_TIMEOUT,
+        open_session(backends, app, tab, cfg, agy_tx),
+    )
+    .await;
+    if opened.is_err() {
+        let tag = app.sessions[tab].backend.label();
+        let reason = no_reply();
+        let s = &mut app.sessions[tab];
+        s.tab_degraded = Some(reason.clone());
+        s.push_line(format!("{tag}: {reason}"));
+        app.flash = format!("{tag}: {reason}");
+    }
+}
+
 /// Open (or re-open) the remote session for one tab. Mock tabs need nothing.
 /// A stored remote id resumes the previous session (Q10); a failed resume
 /// falls back to a fresh session and says so. Failures grey out just this
 /// tab with the exact fix.
-async fn open_tab_session(
+async fn open_session(
     backends: &mut Backends,
     app: &mut App,
     tab: usize,
@@ -588,6 +635,25 @@ async fn run(
         app.mode = Mode::Picker;
     }
 
+    // Paint and start reading keys before any backend comes up: bring-up
+    // can take seconds, and the user should see "connecting…", not a
+    // blank screen.
+    terminal.draw(|f| ui::render(f, app))?;
+    // Crossterm reads block; isolate them on a thread, forward as messages.
+    let (key_tx, mut key_rx) = mpsc::channel::<Event>(128);
+    std::thread::spawn(move || {
+        loop {
+            match event::read() {
+                Ok(ev) => {
+                    if key_tx.blocking_send(ev).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
     let mut backends = Backends::default();
     // TypeSafe: optional. Missing key leaves approvals unscored.
     let typesafe = typesafe::Client::from_env();
@@ -627,21 +693,6 @@ async fn run(
         }
         open_tab_session(&mut backends, app, tab, cfg, &agy_tx).await;
     }
-
-    // Crossterm reads block; isolate them on a thread, forward as messages.
-    let (key_tx, mut key_rx) = mpsc::channel::<Event>(128);
-    std::thread::spawn(move || {
-        loop {
-            match event::read() {
-                Ok(ev) => {
-                    if key_tx.blocking_send(ev).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
 
     // Render is the most expensive thing this loop does (full-screen redraw
     // through tmux, 20x/sec unconditionally, is what "feels slow"). Draw
@@ -887,7 +938,12 @@ fn backend_frame(
     slot: &mut Option<LiveBackend>,
     first: Option<ServerMsg>,
 ) -> bool {
-    let Some(msg) = first else { return false };
+    let Some(msg) = first else {
+        // Channel closed: the server exited. Without this the select arm
+        // resolves instantly forever (100% CPU).
+        backend_down(app, kind, slot);
+        return false;
+    };
     let mut bell = false;
     let mut next = Some(msg);
     // Drain the whole burst: one frame per batch, not per delta.
@@ -901,7 +957,21 @@ fn backend_frame(
         };
         bell |= handle_server_msg(app, kind, m);
     }
+    // Grok keeps a sender alive (grok_tx), so its channel never closes:
+    // the host's own flag is what says the server is gone.
+    if slot.as_ref().is_some_and(|ctx| ctx.host.is_closed()) {
+        backend_down(app, kind, slot);
+    }
     bell
+}
+
+/// Drop a dead host and grey out its tabs; P respawns (and resumes).
+fn backend_down(app: &mut App, kind: BackendKind, slot: &mut Option<LiveBackend>) {
+    *slot = None;
+    for s in app.sessions.iter_mut().filter(|s| s.backend == kind) {
+        s.busy = false;
+    }
+    grey_out(app, kind, "server exited — press P to respawn");
 }
 
 /// True when some tab other than `tab` already holds this Claude remote id.

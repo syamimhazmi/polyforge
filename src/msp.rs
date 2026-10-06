@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -148,6 +148,8 @@ pub struct Host {
     next_id: AtomicU64,
     writer: Arc<tokio::sync::Mutex<ChildStdin>>,
     pending: Pending,
+    /// Set by the pump once the server's stdout is gone (exit or crash).
+    closed: Arc<AtomicBool>,
     child: Child,
 }
 
@@ -175,6 +177,8 @@ impl Host {
         let stdout = child.stdout.take().expect("piped stdout");
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let pump_pending = pending.clone();
+        let closed = Arc::new(AtomicBool::new(false));
+        let pump_closed = closed.clone();
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
             let mut scratch = Vec::new();
@@ -212,11 +216,16 @@ impl Host {
                     }
                 }
             }
+            // The server is gone: no reply can arrive, so fail every
+            // waiting call instead of leaving it to hang forever.
+            pump_closed.store(true, Ordering::SeqCst);
+            fail_pending(&pump_pending);
         });
         Ok(Self {
             next_id: AtomicU64::new(1),
             writer: Arc::new(tokio::sync::Mutex::new(stdin)),
             pending,
+            closed,
             child,
         })
     }
@@ -225,6 +234,12 @@ impl Host {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
+        // Closed before (or while) we registered: the pump's drain may have
+        // missed this entry, so fail it here.
+        if self.is_closed() {
+            self.pending.lock().unwrap().remove(&id);
+            return Err(exited());
+        }
         let frame =
             serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         {
@@ -241,6 +256,11 @@ impl Host {
             code: -32000,
             message: "serve call dropped".into(),
         }))
+    }
+
+    /// True once the server has exited; the host is dead and must be respawned.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 
     /// Answer a server→client request (Codex approvals).
@@ -282,6 +302,19 @@ impl Host {
 
     pub async fn shutdown(mut self) {
         let _ = self.child.kill().await;
+    }
+}
+
+fn exited() -> RpcError {
+    RpcError {
+        code: -32000,
+        message: "server exited".into(),
+    }
+}
+
+fn fail_pending(pending: &Pending) {
+    for (_, tx) in pending.lock().unwrap().drain() {
+        let _ = tx.send(Err(exited()));
     }
 }
 
@@ -459,6 +492,27 @@ mod tests {
         .await
         .expect("call held writer while awaiting response");
         host.shutdown().await;
+    }
+
+    /// A server that exits without replying must fail the call, not hang
+    /// it (this froze startup before the first frame).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn call_fails_when_server_exits_without_reply() {
+        let (tx, _events) = mpsc::channel(4);
+        let host = Host::spawn("/bin/sh", &["-c", "read -r line; exit 1"], &[], tx)
+            .await
+            .unwrap();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            host.call("initialize", Value::Null),
+        )
+        .await
+        .expect("call hung after the server exited");
+        assert_eq!(res.unwrap_err().message, "server exited");
+        assert!(host.is_closed());
+        // Calls after the exit fail straight away too.
+        assert!(host.call("session/start", Value::Null).await.is_err());
     }
 
     #[test]
