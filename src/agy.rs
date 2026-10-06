@@ -21,6 +21,14 @@ use tokio::sync::mpsc;
 use crate::app::App;
 use crate::msp::{CappedLine, MAX_NDJSON_LINE_BYTES, ServerMsg, read_capped_line};
 
+/// One event from an agy child, tagged with that child's pid: the main
+/// loop routes it to the tab whose live handle owns the pid.
+#[derive(Debug)]
+pub struct AgyFrame {
+    pub pid: Option<u32>,
+    pub msg: ServerMsg,
+}
+
 /// Prompt channel + owned child for one agy tab.
 pub struct AgyHandle {
     prompt_tx: mpsc::Sender<String>,
@@ -57,7 +65,7 @@ pub async fn spawn_agy(
     bin: &str,
     args: &[String],
     workspace: &str,
-    events_tx: mpsc::Sender<ServerMsg>,
+    events_tx: mpsc::Sender<AgyFrame>,
 ) -> std::io::Result<AgyHandle> {
     let mut child = Command::new(bin)
         .args(args)
@@ -105,9 +113,12 @@ pub async fn spawn_agy(
                         Ok(v) => {
                             let kind = v.get("event").and_then(|e| e.as_str()).unwrap_or("unknown");
                             let _ = stdout_tx
-                                .send(ServerMsg::Notif {
-                                    method: format!("agy/{kind}"),
-                                    params: v,
+                                .send(AgyFrame {
+                                    pid,
+                                    msg: ServerMsg::Notif {
+                                        method: format!("agy/{kind}"),
+                                        params: v,
+                                    },
                                 })
                                 .await;
                         }
@@ -116,29 +127,37 @@ pub async fn spawn_agy(
                 }
                 Ok(CappedLine::Oversize { bytes }) => {
                     let _ = stdout_tx
-                        .send(ServerMsg::Transport(format!(
-                            "agy stdout: line of {bytes} bytes exceeds \
+                        .send(AgyFrame {
+                            pid,
+                            msg: ServerMsg::Transport(format!(
+                                "agy stdout: line of {bytes} bytes exceeds \
                              {MAX_NDJSON_LINE_BYTES}-byte cap, dropped"
-                        )))
+                            )),
+                        })
                         .await;
                 }
                 Ok(CappedLine::InvalidUtf8 { bytes }) => {
                     let _ = stdout_tx
-                        .send(ServerMsg::Transport(format!(
-                            "agy stdout: line of {bytes} bytes is not UTF-8, dropped"
-                        )))
+                        .send(AgyFrame {
+                            pid,
+                            msg: ServerMsg::Transport(format!(
+                                "agy stdout: line of {bytes} bytes is not UTF-8, dropped"
+                            )),
+                        })
                         .await;
                 }
                 Ok(CappedLine::Eof) => break,
                 Err(_) => break,
             }
         }
-        // A dead child must not leave its tab busy forever. Routed by pid
-        // in the main loop (a replaced child's pid no longer matches).
+        // A dead child must not leave its tab busy forever.
         let _ = stdout_tx
-            .send(ServerMsg::Notif {
-                method: "agy/exit".into(),
-                params: serde_json::json!({"pid": pid}),
+            .send(AgyFrame {
+                pid,
+                msg: ServerMsg::Notif {
+                    method: "agy/exit".into(),
+                    params: Value::Null,
+                },
             })
             .await;
     });
@@ -155,25 +174,34 @@ pub async fn spawn_agy(
                         continue;
                     }
                     let _ = events_tx
-                        .send(ServerMsg::Notif {
-                            method: "agy/stderr".into(),
-                            params: Value::String(line),
+                        .send(AgyFrame {
+                            pid,
+                            msg: ServerMsg::Notif {
+                                method: "agy/stderr".into(),
+                                params: Value::String(line),
+                            },
                         })
                         .await;
                 }
                 Ok(CappedLine::Oversize { bytes }) => {
                     let _ = events_tx
-                        .send(ServerMsg::Transport(format!(
-                            "agy stderr: line of {bytes} bytes exceeds \
+                        .send(AgyFrame {
+                            pid,
+                            msg: ServerMsg::Transport(format!(
+                                "agy stderr: line of {bytes} bytes exceeds \
                              {MAX_NDJSON_LINE_BYTES}-byte cap, dropped"
-                        )))
+                            )),
+                        })
                         .await;
                 }
                 Ok(CappedLine::InvalidUtf8 { bytes }) => {
                     let _ = events_tx
-                        .send(ServerMsg::Transport(format!(
-                            "agy stderr: line of {bytes} bytes is not UTF-8, dropped"
-                        )))
+                        .send(AgyFrame {
+                            pid,
+                            msg: ServerMsg::Transport(format!(
+                                "agy stderr: line of {bytes} bytes is not UTF-8, dropped"
+                            )),
+                        })
                         .await;
                 }
                 Ok(CappedLine::Eof) => break,
@@ -201,7 +229,6 @@ pub fn apply_agy_notif(app: &mut App, tab: usize, method: &str, params: &Value) 
     match method {
         "agy/init" => {
             let s = &mut app.sessions[tab];
-            s.pending_agy_init = false;
             if let Some(id) = params.get("conversation_id").and_then(|v| v.as_str()) {
                 if s.remote_id.as_deref() != Some(id) {
                     s.tokens = None;
@@ -404,7 +431,6 @@ mod tests {
     #[test]
     fn init_records_conversation() {
         let mut app = agy_app();
-        app.active_mut().pending_agy_init = true;
         let p: Value = serde_json::json!({
             "event": "init",
             "conversation_id": "c3b66b04-872b-4fbe-a3a4-058a026ef20a",
@@ -415,7 +441,6 @@ mod tests {
             app.active().remote_id.as_deref(),
             Some("c3b66b04-872b-4fbe-a3a4-058a026ef20a")
         );
-        assert!(!app.active().pending_agy_init);
         assert!(app.active().lines.iter().any(|l| l.contains("c3b66b04")));
     }
 
@@ -564,17 +589,17 @@ mod tests {
         .unwrap();
         let pid = h.pid().expect("live child has a pid");
         assert!(h.interrupt());
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let exit_pid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                match rx.recv().await.expect("channel open") {
-                    ServerMsg::Notif { method, params } if method == "agy/exit" => break params,
-                    _ => {}
+                let f = rx.recv().await.expect("channel open");
+                if matches!(&f.msg, ServerMsg::Notif { method, .. } if method == "agy/exit") {
+                    break f.pid;
                 }
             }
         })
         .await
         .expect("exit event");
-        assert_eq!(msg["pid"].as_u64(), Some(u64::from(pid)));
+        assert_eq!(exit_pid, Some(pid));
         h.shutdown().await;
     }
 }

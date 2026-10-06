@@ -167,8 +167,6 @@ pub struct App {
     pub viewport_width: usize,
     /// Transcript store (None = storageless; main attaches it on boot).
     pub store: Option<crate::store::Store>,
-    /// Spawn-order queue for agy init routing (resume matches by id first).
-    pub agy_init_fifo: std::collections::VecDeque<usize>,
     /// `/sessions` chooser state (newest first).
     pub sess_list: Vec<crate::store::StoredSession>,
     pub sess_sel: usize,
@@ -225,7 +223,6 @@ impl App {
             viewport_height: 20,
             viewport_width: DEFAULT_WIDTH,
             store: None,
-            agy_init_fifo: std::collections::VecDeque::new(),
             sess_list: Vec::new(),
             sess_sel: 0,
             pending_agy_kill: Vec::new(),

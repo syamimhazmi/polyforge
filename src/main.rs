@@ -127,7 +127,7 @@ async fn run(
     let typesafe = typesafe::Client::from_env();
     let (risk_tx, mut risk_rx) = mpsc::channel::<RiskMsg>(32);
     // One shared channel for all agy tab children.
-    let (agy_tx, mut agy_rx) = mpsc::channel::<ServerMsg>(256);
+    let (agy_tx, mut agy_rx) = mpsc::channel::<agy::AgyFrame>(256);
     // Likewise for claude tab children.
     let (claude_tx, mut claude_rx) = mpsc::channel::<ServerMsg>(256);
     backends.claude_tx = Some(claude_tx);

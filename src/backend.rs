@@ -1,7 +1,7 @@
 //! Backend lifecycle: the live host handles ([`Backends`]) and the off-loop
 //! bring-up, remote session open and grey-out paths that fill them.
 
-use crate::agy::{AGY_NO_MODAL_WARNING, AgyHandle, push_agy_open_notice, spawn_agy};
+use crate::agy::{AGY_NO_MODAL_WARNING, AgyFrame, AgyHandle, push_agy_open_notice, spawn_agy};
 use crate::app::{App, BackendKind};
 use crate::claude::{ClaudeChildren, spawn_claude};
 use crate::codex::{codex_bringup, codex_resume_thread, codex_start_thread};
@@ -371,7 +371,7 @@ async fn ensure_agy_tab(
     backends: &mut Backends,
     tab: usize,
     cfg: &Config,
-    events_tx: &mpsc::Sender<ServerMsg>,
+    events_tx: &mpsc::Sender<AgyFrame>,
     resume: Option<String>,
 ) -> Result<(), String> {
     if backends.agy.len() <= tab {
@@ -421,7 +421,7 @@ pub(crate) async fn open_tab_session(
     app: &mut App,
     tab: usize,
     cfg: &Config,
-    agy_tx: &mpsc::Sender<ServerMsg>,
+    agy_tx: &mpsc::Sender<AgyFrame>,
 ) {
     let opened = tokio::time::timeout(
         BRINGUP_TIMEOUT,
@@ -458,7 +458,7 @@ async fn open_session(
     app: &mut App,
     tab: usize,
     cfg: &Config,
-    agy_tx: &mpsc::Sender<ServerMsg>,
+    agy_tx: &mpsc::Sender<AgyFrame>,
 ) {
     let (backend, workspace) = (app.sessions[tab].backend, cfg.workspace_root());
     // Resume candidate from the store; cleared so a stale id never lingers.
@@ -509,8 +509,7 @@ async fn open_session(
             {
                 old.shutdown().await;
             }
-            app.sessions[tab].pending_agy_init = false;
-            // Keep expected resume id so init can match by conversation_id.
+            // Keep the resume id; `agy/init` confirms (or replaces) it.
             if let Some(ref id) = resume {
                 app.sessions[tab].remote_id = Some(id.clone());
             }
@@ -521,12 +520,6 @@ async fn open_session(
                     // fires here — fresh or resumed, every open.
                     push_agy_open_notice(&mut app.sessions[tab], had_resume);
                     app.flash = AGY_NO_MODAL_WARNING.to_string();
-                    app.sessions[tab].pending_agy_init = true;
-                    // Resume tabs match by conversation_id; only fresh
-                    // spawns claim a FIFO slot.
-                    if !had_resume {
-                        app.agy_init_fifo.push_back(tab);
-                    }
                 }
                 Err(e) => {
                     app.sessions[tab].remote_id = None;

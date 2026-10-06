@@ -82,8 +82,6 @@ pub struct Session {
     pub sink: Option<std::io::BufWriter<std::fs::File>>,
     /// True when the sink has unflushed appends (idle loops skip flush).
     pub store_dirty: bool,
-    /// Set when an agy child is spawned; cleared when `agy/init` lands.
-    pub pending_agy_init: bool,
     /// Live thought text (any provider). Bounded to its tail; collapsed to
     /// one `◆ Thought for Ns` line on flush, never persisted verbatim.
     pub thought: String,
@@ -150,7 +148,6 @@ impl Session {
             cursor: 0,
             sink: None,
             store_dirty: false,
-            pending_agy_init: false,
             thought: String::new(),
             thought_cut: false,
             thought_since: None,

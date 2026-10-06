@@ -106,7 +106,6 @@ impl App {
         self.outbox.decides.retain(|o| o.tab != tab);
         self.outbox.respawns.retain(|o| o.tab != tab);
         self.outbox.stops.retain(|o| o.tab != tab);
-        self.agy_init_fifo.retain(|&t| t != tab);
         self.queue_claude_kill(tab);
         let backend = BackendKind::parse(&pick.backend).unwrap_or_default();
         let store = self.store.as_ref().expect("chooser needs a store");
@@ -126,7 +125,6 @@ impl App {
             s.tab_degraded = None;
             s.busy = false;
             s.reset_turn_state();
-            s.pending_agy_init = false;
             s.queue.clear();
             s.diff_after = None;
             let _ = s.clear_diff();
@@ -199,7 +197,6 @@ impl App {
         self.outbox.decides.retain(|o| o.tab != tab);
         self.outbox.respawns.retain(|o| o.tab != tab);
         self.outbox.stops.retain(|o| o.tab != tab);
-        self.agy_init_fifo.retain(|&t| t != tab);
         if backend == BackendKind::Agy {
             self.pending_agy_kill.push(tab);
         }
@@ -234,11 +231,6 @@ impl App {
         for st in self.outbox.stops.iter_mut() {
             if st.tab > tab {
                 st.tab -= 1;
-            }
-        }
-        for t in self.agy_init_fifo.iter_mut() {
-            if *t > tab {
-                *t -= 1;
             }
         }
         // pending_agy_kill is deliberately NOT renumbered: entries refer to
@@ -293,7 +285,6 @@ impl App {
         self.outbox.decides.retain(|o| o.tab != tab);
         self.outbox.respawns.retain(|o| o.tab != tab);
         self.outbox.stops.retain(|o| o.tab != tab);
-        self.agy_init_fifo.retain(|&t| t != tab);
         self.queue_claude_kill(tab);
         // Fresh session id on disk too (old files stay for `/sessions`).
         self.attach_fresh_store(tab);
@@ -306,7 +297,6 @@ impl App {
             s.tab_degraded = None;
             s.busy = false;
             s.reset_turn_state();
-            s.pending_agy_init = false;
             s.queue.clear();
             s.diff_after = None;
             let _ = s.clear_diff();

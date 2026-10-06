@@ -1,7 +1,7 @@
 //! Backend to app message handling: receiving frames, per-provider
 //! notification/request routing and the dead-backend path.
 
-use crate::agy::apply_agy_notif;
+use crate::agy::{AgyFrame, apply_agy_notif};
 use crate::app::{App, BackendKind, DecisionKind, OutboxDecide};
 use crate::backend::{Backends, LiveBackend, grey_out};
 use crate::claude::{apply_claude_notif, claude_frame_matches};
@@ -97,21 +97,24 @@ pub(crate) fn claude_frame_current(backends: &Backends, msg: &ServerMsg) -> bool
     claude_frame_matches(live, params["generation"].as_u64())
 }
 
-/// Agy frames, plus the pump's synthetic `agy/exit`: it names the dead
-/// child by pid, so only the tab whose live handle still owns that pid is
-/// touched (a replaced or closed child matches nothing).
-pub(crate) fn handle_agy_msg(app: &mut App, backends: &Backends, msg: ServerMsg) -> bool {
-    if let ServerMsg::Notif { method, params } = &msg
-        && method == "agy/exit"
-    {
-        let pid = params.get("pid").and_then(|v| v.as_u64());
-        let tab = backends
-            .agy
-            .iter()
-            .position(|h| pid.is_some() && h.as_ref().and_then(|h| h.pid()).map(u64::from) == pid);
-        return tab.is_some_and(|t| apply_agy_notif(app, t, method, params));
-    }
-    handle_server_msg(app, BackendKind::Agy, msg)
+/// Agy frames route by the sending child's pid: only the agy tab whose
+/// live handle owns it is touched. Agy frames carry no session id after
+/// `init`, so a replaced, closed or switched-away child matches nothing
+/// and is dropped, never attributed to the active tab.
+pub(crate) fn handle_agy_msg(app: &mut App, backends: &Backends, frame: AgyFrame) -> bool {
+    let ServerMsg::Notif { method, params } = frame.msg else {
+        return handle_server_msg(app, BackendKind::Agy, frame.msg);
+    };
+    let tab = backends
+        .agy
+        .iter()
+        .position(|h| frame.pid.is_some() && h.as_ref().and_then(|h| h.pid()) == frame.pid)
+        .filter(|&t| {
+            app.sessions
+                .get(t)
+                .is_some_and(|s| s.backend == BackendKind::Agy)
+        });
+    tab.is_some_and(|t| apply_agy_notif(app, t, &method, &params))
 }
 
 /// A stop is in flight: an approval that arrives now is declined through
@@ -137,54 +140,19 @@ pub(crate) fn handle_server_msg(app: &mut App, kind: BackendKind, msg: ServerMsg
     let tag = kind.label();
     match msg {
         ServerMsg::Notif { method, params } => {
-            let tab = match (kind, method.as_str()) {
-                // Prefer conversation_id match (resume), else spawn-order
-                // FIFO, else the sole waiting agy tab.
-                (BackendKind::Agy, "agy/init") => tab_for_session(app, kind, &params)
-                    .or_else(|| {
-                        while let Some(t) = app.agy_init_fifo.pop_front() {
-                            if app.sessions.get(t).is_some_and(|s| {
-                                s.backend == BackendKind::Agy && s.pending_agy_init
-                            }) {
-                                return Some(t);
-                            }
-                        }
-                        None
-                    })
-                    .or_else(|| {
-                        let waiting: Vec<usize> = app
-                            .sessions
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, s)| s.backend == BackendKind::Agy && s.remote_id.is_none())
-                            .map(|(i, _)| i)
-                            .collect();
-                        (waiting.len() == 1).then_some(waiting[0])
-                    })
-                    .unwrap_or(app.active),
-                (BackendKind::Grok, _) => match tab_for_session(app, kind, &params) {
-                    Some(tab) => tab,
-                    None => return false,
-                },
-                // S2-F1: muse/codex frames naming an unknown (or no)
-                // session are dropped, never attributed to the active
-                // tab — a wrong-tab approval modal is worse than a
-                // dropped transcript line.
-                (BackendKind::Muse | BackendKind::Codex | BackendKind::Claude, _) => {
-                    match tab_for_session(app, kind, &params) {
-                        Some(tab) => tab,
-                        None => return false,
-                    }
-                }
-                _ => tab_for_session(app, kind, &params).unwrap_or(app.active),
+            // S2-F1: frames naming an unknown (or no) session are
+            // dropped, never attributed to the active tab — a wrong-tab
+            // approval modal is worse than a dropped transcript line.
+            let Some(tab) = tab_for_session(app, kind, &params) else {
+                return false;
             };
             let bell = match kind {
                 BackendKind::Muse => provider::apply_notif(app, tab, &method, &params),
                 BackendKind::Codex => apply_codex_notif(app, tab, &method, &params),
                 BackendKind::Grok => apply_grok_notif(app, tab, &method, &params),
-                BackendKind::Agy => apply_agy_notif(app, tab, &method, &params),
                 BackendKind::Claude => apply_claude_notif(app, tab, &method, &params),
-                BackendKind::Mock => false,
+                // Agy routes by pid in handle_agy_msg; mock has no wire.
+                BackendKind::Agy | BackendKind::Mock => false,
             };
             decline_if_stopping(app, tab);
             bell
@@ -248,13 +216,13 @@ pub(crate) fn handle_server_msg(app: &mut App, kind: BackendKind, msg: ServerMsg
 
 /// Route a frame to the tab whose remote session it names (muse:
 /// `sessionId`; codex: `threadId`, falling back to `conversationId`).
+/// Agy routes by child pid instead ([`handle_agy_msg`]).
 fn tab_for_session(app: &App, kind: BackendKind, params: &serde_json::Value) -> Option<usize> {
     let keys: &[&str] = match kind {
         BackendKind::Muse | BackendKind::Grok => &["sessionId"],
         BackendKind::Codex => &["threadId", "conversationId"],
-        BackendKind::Agy => &["conversation_id"],
         BackendKind::Claude => &["session_id"],
-        BackendKind::Mock => return None,
+        BackendKind::Agy | BackendKind::Mock => return None,
     };
     let sid = keys.iter().filter_map(|k| params.get(k)?.as_str()).next()?;
     app.sessions
@@ -504,17 +472,119 @@ mod tests {
         assert!(calm.outbox.decides.is_empty());
     }
 
-    /// The synthetic agy exit names a pid; with no live handle owning it
-    /// nothing is touched (replaced/closed children are ignored).
+    /// The stop-time decline answers the tab the approval names, even
+    /// when it isn't active: the active tab's own card stays open.
     #[test]
-    fn agy_exit_for_unknown_pid_is_ignored() {
-        let mut app = busy_tab(BackendKind::Agy);
-        let backends = Backends::default();
-        let msg = ServerMsg::Notif {
-            method: "agy/exit".into(),
-            params: serde_json::json!({"pid": 4242}),
+    fn stop_decline_on_background_tab_leaves_active_card() {
+        let mut app = busy_tab(BackendKind::Muse);
+        let mut s = crate::app::Session::new("s2");
+        s.backend = BackendKind::Muse;
+        s.remote_id = Some("sess-2".into());
+        s.busy = true;
+        app.sessions.push(s);
+        app.active = 1;
+        app.request_stop();
+        app.active = 0;
+        assert!(app.sessions[1].stopping.is_some());
+        app.active_mut().stage_diff(PendingDiff {
+            file: "edit".into(),
+            body: "body".into(),
+        });
+        app.active_mut().pending_approval = Some(PendingApproval {
+            approval_id: "ap-0".into(),
+            requirement_id: serde_json::Value::Null,
+            choices: Vec::new(),
+        });
+        handle_server_msg(
+            &mut app,
+            BackendKind::Muse,
+            ServerMsg::Notif {
+                method: "approval/requested".into(),
+                params: serde_json::json!({
+                    "sessionId": "sess-2",
+                    "toolName": "bash",
+                    "approvalId": "ap-1",
+                    "availableChoices": [
+                        {"choiceId": "c-deny", "decision": "denied", "scope": "once", "label": "Deny"},
+                    ],
+                }),
+            },
+        );
+        assert_eq!(app.active, 0);
+        let bg = &app.sessions[1];
+        assert!(bg.pending_diff.is_none() && bg.pending_approval.is_none());
+        assert!(bg.lines.iter().any(|l| l == "stop: declined bash approval"));
+        assert_eq!(app.outbox.decides.len(), 1);
+        assert_eq!(app.outbox.decides[0].tab, 1);
+        assert_eq!(app.outbox.decides[0].choice_id, "c-deny");
+        let fg = &app.sessions[0];
+        assert_eq!(fg.pending_diff.as_ref().unwrap().file, "edit");
+        assert_eq!(fg.pending_approval.as_ref().unwrap().approval_id, "ap-0");
+    }
+
+    /// Agy frames route by the sending child's pid. Agy output carries no
+    /// session id, so before this a background agy tab's frames landed on
+    /// whatever tab was active (and a stray init rebound its session id).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agy_frames_route_by_child_pid() {
+        use crate::agy::spawn_agy;
+        use serde_json::{Value, json};
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let sleep = ["-c".to_string(), "sleep 30".to_string()];
+        let child = spawn_agy("/bin/sh", &sleep, "/tmp", tx).await.unwrap();
+        let pid = child.pid();
+        // Tab 0: active claude tab. Tab 1: busy agy tab owning `child`.
+        let mut app = busy_tab(BackendKind::Claude);
+        let mut s = crate::app::Session::new("s2");
+        s.backend = BackendKind::Agy;
+        s.busy = true;
+        app.sessions.push(s);
+        let mut backends = Backends {
+            agy: vec![None, Some(child)],
+            ..Default::default()
         };
-        assert!(!handle_agy_msg(&mut app, &backends, msg));
-        assert!(app.active().busy);
+        let frame = |pid, method: &str, params| AgyFrame {
+            pid,
+            msg: ServerMsg::Notif {
+                method: method.into(),
+                params,
+            },
+        };
+        let result = |text: &str| json!({"result": {"status": "SUCCESS", "response": text}});
+        // Unknown (closed/replaced) or missing pid: dropped, nothing touched.
+        for f in [
+            frame(Some(4242), "agy/init", json!({"conversation_id": "stray"})),
+            frame(Some(4242), "agy/result", result("stray")),
+            frame(None, "agy/exit", Value::Null),
+        ] {
+            assert!(!handle_agy_msg(&mut app, &backends, f));
+        }
+        assert!(app.sessions.iter().all(|s| s.busy && s.lines.is_empty()));
+        assert_eq!(app.sessions[0].remote_id.as_deref(), Some("sess-1"));
+        assert!(app.sessions[1].remote_id.is_none());
+        // The live child's frames reach its own tab, not the active one.
+        let init = frame(pid, "agy/init", json!({"conversation_id": "conv-1"}));
+        handle_agy_msg(&mut app, &backends, init);
+        assert!(handle_agy_msg(
+            &mut app,
+            &backends,
+            frame(pid, "agy/result", result("hi"))
+        ));
+        assert_eq!(app.sessions[1].remote_id.as_deref(), Some("conv-1"));
+        assert!(!app.sessions[1].busy);
+        assert!(app.sessions[1].lines.iter().any(|l| l == "hi"));
+        assert!(app.sessions[0].busy && app.sessions[0].lines.is_empty());
+        assert_eq!(app.sessions[0].remote_id.as_deref(), Some("sess-1"));
+        // Tab switched to another backend while the old child lives on.
+        app.sessions[1].backend = BackendKind::Claude;
+        app.sessions[1].busy = true;
+        assert!(!handle_agy_msg(
+            &mut app,
+            &backends,
+            frame(pid, "agy/exit", Value::Null)
+        ));
+        assert!(app.sessions[1].busy);
+        backends.agy[1].take().unwrap().shutdown().await;
     }
 }

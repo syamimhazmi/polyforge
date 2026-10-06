@@ -1,7 +1,7 @@
 //! Outbox draining: performs the provider work the synchronous `App` queued
 //! (respawns, submits, stops, decisions).
 
-use crate::agy::agy_submit;
+use crate::agy::{AgyFrame, agy_submit};
 use crate::app::{App, BackendKind};
 use crate::backend::{BRINGUP_TIMEOUT, Backends, muse_start_fresh, no_reply, open_tab_session};
 use crate::claude::{claude_interrupt, claude_send, claude_submit};
@@ -9,7 +9,6 @@ use crate::codex;
 use crate::codex::{codex_interrupt, codex_respond};
 use crate::config::Config;
 use crate::grok::{grok_cancel, grok_respond, grok_submit};
-use crate::msp::ServerMsg;
 use crate::provider::{muse_decide, muse_interrupt, muse_submit};
 use tokio::sync::mpsc;
 
@@ -19,7 +18,7 @@ pub(crate) async fn drain_outbox(
     app: &mut App,
     backends: &mut Backends,
     cfg: &Config,
-    agy_tx: &mpsc::Sender<ServerMsg>,
+    agy_tx: &mpsc::Sender<AgyFrame>,
 ) -> bool {
     let mut did = false;
     // Kill replaced/closed claude children before respawns: a re-attach
@@ -289,6 +288,7 @@ mod tests {
     use crate::app;
     use crate::backend::{Backends, LiveBackend};
     use crate::msp;
+    use crate::msp::ServerMsg;
     use crate::server_msg::handle_server_msg;
     use crate::test_support::busy_tab;
     use std::time::Duration;
@@ -634,5 +634,44 @@ mod tests {
         assert!(!s.session_deferred);
         assert!(!s.busy);
         assert!(s.tab_degraded.as_deref().unwrap().contains("muse login"));
+    }
+
+    /// A failed deferred start sends nothing more: no `turn/start` reaches
+    /// the host and the tab shows the start error only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_muse_start_failure_sends_no_turn() {
+        let (tx, rx) = mpsc::channel(4);
+        let script = r#"read -r l; echo '{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"no credentials"}}'; while read -r l; do printf '{"method":"observed","params":%s}\n' "$l"; done"#;
+        let host = msp::Host::spawn("/bin/sh", &["-c", script], &[], tx)
+            .await
+            .unwrap();
+        let mut backends = Backends {
+            muse: Some(LiveBackend {
+                host: std::sync::Arc::new(host),
+                rx,
+            }),
+            ..Default::default()
+        };
+        let mut app = deferred_muse_app();
+        let before = app.active().lines.len();
+        let (agy_tx, _agy_rx) = mpsc::channel(1);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            drain_outbox(&mut app, &mut backends, &Config::default(), &agy_tx).await;
+        })
+        .await
+        .expect("drain timed out");
+        let rx = &mut backends.muse.as_mut().unwrap().rx;
+        let sent = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+        assert!(
+            sent.is_err(),
+            "host received a frame after the failed start: {sent:?}"
+        );
+        assert_eq!(
+            app.active().lines.len(),
+            before + 1,
+            "{:?}",
+            app.active().lines
+        );
     }
 }
