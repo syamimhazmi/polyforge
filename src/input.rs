@@ -1,7 +1,7 @@
 //! Key and mouse input handling plus the terminal side effects it triggers
 //! (bell, mouse capture, clipboard).
 
-use crate::app::{App, BackendKind, DecisionKind, Mode, OutboxDecide};
+use crate::app::{App, BackendKind, DecisionKind, Mode, OutboxDecide, PendingApproval};
 use crate::claude::{map_claude_decision, queue_claude_frame};
 use crate::codex::map_codex_decision;
 use crate::grok::map_grok_decision;
@@ -57,117 +57,52 @@ pub(crate) fn decide_ui(app: &mut App, kind: DecisionKind, label: &str) {
                 ring_bell();
             }
         }
-        BackendKind::Muse => {
-            let approval = app.active().pending_approval.clone();
-            match approval {
-                Some(a) => match map_decision(&a, kind) {
-                    Some((choice_id, feedback)) => {
-                        app.outbox.decides.push(OutboxDecide {
-                            tab,
-                            backend,
-                            approval_id: a.approval_id,
-                            requirement_id: a.requirement_id,
-                            choice_id,
-                            feedback,
-                        });
-                        if app.muse_approved(label) {
-                            ring_bell();
-                        }
-                    }
-                    None => {
-                        // S2-F2: a negative decision must always deny on
-                        // the wire. With no deny choice, closing the card
-                        // would fake a denial the server never received
-                        // (it may treat silence as consent), so keep the
-                        // card open and say so loudly. Positive decisions
-                        // still close locally: nothing is approved
-                        // server-side, so closing is fail-closed.
-                        if matches!(kind, DecisionKind::Reject | DecisionKind::Later) {
-                            app.flash = format!(
-                                "muse: cannot send `{label}` — server offered no deny path (card kept open; nothing denied)"
-                            );
-                            ring_bell();
-                        } else {
-                            app.muse_approved(label);
-                            app.flash = format!(
-                                "muse: closed locally — server offered no way to send `{label}`"
-                            );
-                            ring_bell();
-                        }
-                    }
-                },
-                None => {
-                    if app.muse_approved(label) {
-                        ring_bell();
-                    }
+        BackendKind::Muse => decide_remote(
+            app,
+            label,
+            |a| map_decision(a, kind).map(|(c, f)| (a.requirement_id.clone(), c, f)),
+            |app, _| {
+                // S2-F2: a negative decision must always deny on the wire.
+                // With no deny choice, closing the card would fake a denial
+                // the server never received (it may treat silence as
+                // consent), so keep the card open and say so loudly.
+                // Positive decisions still close locally: nothing is
+                // approved server-side, so closing is fail-closed.
+                if matches!(kind, DecisionKind::Reject | DecisionKind::Later) {
+                    app.flash = format!(
+                        "muse: cannot send `{label}` — server offered no deny path (card kept open; nothing denied)"
+                    );
+                } else {
+                    app.muse_approved(label);
+                    app.flash =
+                        format!("muse: closed locally — server offered no way to send `{label}`");
                 }
-            }
-        }
-        BackendKind::Codex => {
-            let approval = app.active().pending_approval.clone();
-            match approval {
-                Some(a) => match map_codex_decision(&a, kind) {
-                    Some((req_id, decision)) => {
-                        app.outbox.decides.push(OutboxDecide {
-                            tab,
-                            backend,
-                            approval_id: a.approval_id,
-                            requirement_id: req_id,
-                            choice_id: decision,
-                            feedback: None,
-                        });
-                        if app.approved("codex", label) {
-                            ring_bell();
-                        }
-                    }
-                    None => {
-                        app.approved("codex", label);
-                        app.flash = format!(
-                            "codex: closed locally — server offered no way to send `{label}`"
-                        );
-                        ring_bell();
-                    }
-                },
-                None => {
-                    if app.approved("codex", label) {
-                        ring_bell();
-                    }
-                }
-            }
-        }
-        BackendKind::Grok => {
-            let approval = app.active().pending_approval.clone();
-            match approval {
-                Some(a) => match map_grok_decision(&a, kind) {
-                    Some((req_id, payload)) => {
-                        app.outbox.decides.push(OutboxDecide {
-                            tab,
-                            backend,
-                            approval_id: a.approval_id,
-                            requirement_id: req_id,
-                            choice_id: payload.to_string(),
-                            feedback: None,
-                        });
-                        if app.approved("grok", label) {
-                            ring_bell();
-                        }
-                    }
-                    None => {
-                        grok::queue_grok_cancelled(app, tab, a.requirement_id);
-                        app.approved("grok", "cancelled");
-                        app.flash = format!(
-                            "grok: cancelled — server offered no matching option for `{label}`"
-                        );
-                        ring_bell();
-                    }
-                },
-                None => {
-                    if app.approved("grok", label) {
-                        ring_bell();
-                    }
-                }
-            }
-        }
+                ring_bell();
+            },
+        ),
+        BackendKind::Codex => decide_remote(
+            app,
+            label,
+            |a| map_codex_decision(a, kind).map(|(r, d)| (r, d, None)),
+            |app, _| {
+                app.approved("codex", label);
+                app.flash =
+                    format!("codex: closed locally — server offered no way to send `{label}`");
+                ring_bell();
+            },
+        ),
+        BackendKind::Grok => decide_remote(
+            app,
+            label,
+            |a| map_grok_decision(a, kind).map(|(r, p)| (r, p.to_string(), None)),
+            |app, a| {
+                grok::queue_grok_cancelled(app, tab, a.requirement_id);
+                app.approved("grok", "cancelled");
+                app.flash =
+                    format!("grok: cancelled — server offered no matching option for `{label}`");
+                ring_bell();
+            },
+        ),
         BackendKind::Claude => {
             if let Some(a) = app.active().pending_approval.clone() {
                 let sid = a.requirement_id["session_id"]
@@ -194,6 +129,41 @@ pub(crate) fn decide_ui(app: &mut App, kind: DecisionKind, label: &str) {
                 "agy: approvals aren't interactive — vendor policy decides (see transcript)"
                     .to_string();
         }
+    }
+}
+
+/// Shared muse/codex/grok decide path. `map` turns the open card into the
+/// wire decision `(requirement_id, choice_id, feedback)`; a mapped decision
+/// is queued and the card closes. `fallback` runs when the server offered
+/// no matching choice. With no card open, any stale diff just closes.
+fn decide_remote(
+    app: &mut App,
+    label: &str,
+    map: impl FnOnce(&PendingApproval) -> Option<(serde_json::Value, String, Option<String>)>,
+    fallback: impl FnOnce(&mut App, PendingApproval),
+) {
+    let (tab, backend) = (app.active, app.active().backend);
+    let Some(a) = app.active().pending_approval.clone() else {
+        if app.approved(backend.label(), label) {
+            ring_bell();
+        }
+        return;
+    };
+    match map(&a) {
+        Some((requirement_id, choice_id, feedback)) => {
+            app.outbox.decides.push(OutboxDecide {
+                tab,
+                backend,
+                approval_id: a.approval_id,
+                requirement_id,
+                choice_id,
+                feedback,
+            });
+            if app.approved(backend.label(), label) {
+                ring_bell();
+            }
+        }
+        None => fallback(app, a),
     }
 }
 
