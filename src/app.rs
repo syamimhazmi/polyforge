@@ -307,6 +307,16 @@ impl App {
                             prompt,
                         });
                     }
+                    // Host still coming up: hold the prompt, send on open.
+                    None if s.connecting.is_some() => {
+                        s.busy = true;
+                        let held = s.held_prompt.get_or_insert_default();
+                        if !held.is_empty() {
+                            held.push_str("\n\n");
+                        }
+                        held.push_str(&prompt);
+                        self.flash = format!("{}: prompt sends when connected", backend.label());
+                    }
                     None => {
                         let tag = backend.label();
                         let why = degraded.unwrap_or_else(|| format!("{tag} session unavailable"));
@@ -337,6 +347,12 @@ impl App {
         let s = &mut self.sessions[tab];
         // A card must be answered first (Esc defers it instead).
         if !s.busy || s.pending_diff.is_some() {
+            return;
+        }
+        if s.held_prompt.is_some() {
+            s.drop_held_prompt();
+            self.flash = "stopped".to_string();
+            self.stick_to_bottom();
             return;
         }
         let now = std::time::Instant::now();
@@ -508,6 +524,22 @@ mod tests {
     use super::*;
     use crate::app::outbox::STOPPED_LINE;
     use crate::app::test_support::bottom_app;
+
+    /// Esc on a tab holding a prompt (still connecting) drops it locally:
+    /// nothing reached the backend, so no stop goes out.
+    #[test]
+    fn stop_drops_prompt_held_while_connecting() {
+        let mut app = App::new();
+        let s = app.active_mut();
+        s.backend = BackendKind::Grok;
+        s.connecting = Some((1, None));
+        s.input = "hi".to_string();
+        app.submit();
+        assert_eq!(app.active().held_prompt.as_deref(), Some("hi"));
+        app.request_stop();
+        let s = app.active();
+        assert!(app.outbox.stops.is_empty() && !s.busy && s.held_prompt.is_none());
+    }
 
     #[test]
     fn boot_opens_exactly_one_tab() {

@@ -66,6 +66,7 @@ pub(crate) fn grey_out(app: &mut App, kind: BackendKind, reason: &str) {
             s.connecting = None;
             s.tab_degraded = Some(reason.to_string());
             s.push_line(format!("{tag}: {reason}"));
+            s.drop_held_prompt();
         }
     }
     app.flash = format!("{tag}: {reason}");
@@ -342,22 +343,34 @@ pub(crate) fn finish_bringup(
                     for n in o.notes {
                         s.push_line(n);
                     }
-                    let Some(id) = o.id else {
-                        s.session_deferred = true;
-                        return;
-                    };
-                    if prev_id.as_deref() != Some(id.as_str()) {
-                        s.tokens = None;
+                    match o.id {
+                        None => s.session_deferred = true,
+                        Some(id) => {
+                            if prev_id.as_deref() != Some(id.as_str()) {
+                                s.tokens = None;
+                            }
+                            s.remote_id = Some(id);
+                            if o.resumed {
+                                s.push_line(format!("{tag}: resumed previous session"));
+                            }
+                            app.save_tab_meta(tab);
+                        }
                     }
-                    s.remote_id = Some(id);
-                    if o.resumed {
-                        s.push_line(format!("{tag}: resumed previous session"));
+                    // The drain (same loop pass) sends what was typed early.
+                    let s = &mut app.sessions[tab];
+                    if let Some(prompt) = s.held_prompt.take() {
+                        let backend = s.backend;
+                        app.outbox.submits.push(crate::app::OutboxSubmit {
+                            tab,
+                            backend,
+                            prompt,
+                        });
                     }
-                    app.save_tab_meta(tab);
                 }
                 Err(reason) => {
                     s.tab_degraded = Some(reason.clone());
                     s.push_line(format!("{tag}: {reason}"));
+                    s.drop_held_prompt();
                     app.flash = format!("{tag}: {reason}");
                 }
             }
@@ -475,6 +488,8 @@ async fn open_session(
     }
     s.tab_degraded = None;
     s.connecting = None;
+    // A respawn (P, picker) may switch backend: never forward early text.
+    s.drop_held_prompt();
     let tag = backend.label();
     let fail = |app: &mut App, reason: &str| {
         let s = &mut app.sessions[tab];
@@ -575,6 +590,53 @@ mod tests {
     use super::*;
     use crate::app;
     use crate::drain::drain_outbox;
+
+    /// A muse tab still connecting at boot: a prompt typed meanwhile is
+    /// held, then queued for the drain once the session opens.
+    #[test]
+    fn prompt_typed_while_connecting_sends_on_open() {
+        let (mut app, mut backends) = (App::new(), Backends::default());
+        let s = app.active_mut();
+        s.backend = BackendKind::Muse;
+        s.connecting = Some((7, None));
+        s.input = "hi".to_string();
+        app.submit();
+        assert!(app.outbox.submits.is_empty(), "held, not sent yet");
+        assert!(app.active().busy);
+        let done = BringDone::Session {
+            token: 7,
+            prev_id: None,
+            res: Ok(Opened {
+                id: None,
+                resumed: false,
+                notes: vec![],
+            }),
+        };
+        finish_bringup(&mut app, &mut backends, &Config::default(), done);
+        assert_eq!(app.outbox.submits.len(), 1);
+        assert_eq!(app.outbox.submits[0].prompt, "hi");
+        assert!(app.active().session_deferred && app.active().held_prompt.is_none());
+    }
+
+    /// A failed bring-up drops the held prompt and frees the tab.
+    #[test]
+    fn failed_open_drops_held_prompt() {
+        let (mut app, mut backends) = (App::new(), Backends::default());
+        let s = app.active_mut();
+        s.backend = BackendKind::Codex;
+        s.connecting = Some((3, None));
+        s.input = "hi".to_string();
+        app.submit();
+        let done = BringDone::Session {
+            token: 3,
+            prev_id: None,
+            res: Err("boom".to_string()),
+        };
+        finish_bringup(&mut app, &mut backends, &Config::default(), done);
+        let s = app.active();
+        assert!(app.outbox.submits.is_empty() && !s.busy && s.held_prompt.is_none());
+        assert!(s.lines.iter().any(|l| l.contains("prompt not sent")));
+    }
 
     /// A tab leaving agy kills its old child on the next open instead of
     /// leaving it running until the tab returns to agy or closes.

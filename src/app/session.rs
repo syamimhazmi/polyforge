@@ -63,6 +63,8 @@ pub struct Session {
     /// Bring-up in flight (token, resume id), run off the event loop; the
     /// result applies only while the token still matches.
     pub connecting: Option<(u64, Option<String>)>,
+    /// Prompt submitted while `connecting`: sent once the session opens.
+    pub held_prompt: Option<String>,
     pub input: String,
     /// Char-index cursor inside `input` (insert mode).
     pub cursor: usize,
@@ -137,6 +139,7 @@ impl Session {
             session_deferred: false,
             tab_degraded: None,
             connecting: None,
+            held_prompt: None,
             store_id: None,
             created_at: 0,
             updated_at: 0,
@@ -166,6 +169,15 @@ impl Session {
 
     /// Forget per-turn stop state (tab reset / session replace) so a stale
     /// stop can never emit a line on the fresh transcript.
+    /// Drop the prompt held while connecting (stop, failed bring-up,
+    /// respawn): the tab goes idle and says the prompt never went out.
+    pub fn drop_held_prompt(&mut self) {
+        if self.held_prompt.take().is_some() {
+            self.busy = false;
+            self.push_line(format!("{}: prompt not sent", self.backend.label()));
+        }
+    }
+
     pub fn reset_turn_state(&mut self) {
         self.stopping = None;
         self.sealed = false;
