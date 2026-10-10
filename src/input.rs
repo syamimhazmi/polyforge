@@ -192,6 +192,12 @@ pub(crate) fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
     // as Char('G')+SHIFT). A lone SHIFT must not break single-key bindings.
     let no_mods = mods.is_empty() || mods == KeyModifiers::SHIFT;
 
+    // Ctrl+C in every mode: stop the running turn, again to quit.
+    if ctrl && code == KeyCode::Char('c') {
+        app.ctrl_c();
+        return;
+    }
+
     // Diff modal steals y/n/a/q on the active tab.
     if app.active().pending_diff.is_some() {
         if let KeyCode::Char(c) = code
@@ -225,7 +231,6 @@ pub(crate) fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
 
     match app.mode {
         Mode::Normal => match code {
-            KeyCode::Char('c') if ctrl => app.should_quit = true,
             KeyCode::Char('q') if no_mods => app.should_quit = true,
             KeyCode::Char('j') if no_mods && app.vim => {
                 clear_pending_g(app);
@@ -431,7 +436,6 @@ pub(crate) fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         Mode::Picker => match code {
             KeyCode::Esc => cancel_picker(app),
             KeyCode::Char('[') if ctrl => cancel_picker(app),
-            KeyCode::Char('c') if ctrl && app.onboarding => app.should_quit = true,
             KeyCode::Char('q') if no_mods && app.onboarding => app.should_quit = true,
             KeyCode::Char('j') | KeyCode::Down if no_mods => {
                 app.picker_sel = (app.picker_sel + 1) % BackendKind::ALL.len();
@@ -833,6 +837,31 @@ mod tests {
         handle_key(&mut app, KeyCode::Char('n'), NONE); // no search: flash, no panic
         assert!(!app.flash.is_empty());
         handle_key(&mut app, KeyCode::Char('q'), NONE);
+        assert!(app.should_quit);
+    }
+
+    /// Ctrl+C: first press stops the running turn and arms quit; a
+    /// second press quits; a press after the window only re-arms.
+    #[test]
+    fn ctrl_c_stops_then_quits() {
+        let ctrl = KeyModifiers::CONTROL;
+        let mut app = App::new();
+        app.active_mut().busy = true;
+        handle_key(&mut app, KeyCode::Char('c'), ctrl);
+        assert!(!app.should_quit);
+        assert!(!app.active().busy, "first press stops the turn");
+        assert!(app.flash.contains("Ctrl+C again"));
+        handle_key(&mut app, KeyCode::Char('c'), ctrl);
+        assert!(app.should_quit);
+
+        // Idle, in Insert mode, after the window: re-arms instead of quitting.
+        let mut app = App::new();
+        app.mode = Mode::Insert;
+        app.quit_armed = Some(std::time::Instant::now() - crate::app::QUIT_WINDOW);
+        handle_key(&mut app, KeyCode::Char('c'), ctrl);
+        assert!(!app.should_quit);
+        assert!(app.active().input.is_empty(), "Ctrl+C never types a 'c'");
+        handle_key(&mut app, KeyCode::Char('c'), ctrl);
         assert!(app.should_quit);
     }
 

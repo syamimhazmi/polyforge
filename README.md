@@ -68,7 +68,7 @@ Needs a real tty (alternate screen + mouse). Inside tmux: wheel and
 
 | mode | keys |
 | ---- | ---- |
-| NORMAL (default keys) | arrows line · `PgUp/PgDn` half-page · `Home/End` top/bottom · `/` search · `n/N` next/prev · `Space`/`Enter` insert · digits/`Tab` tabs · `P` provider · `R` fresh session · `m` mouse toggle · `q` quit |
+| NORMAL (default keys) | arrows line · `PgUp/PgDn` half-page · `Home/End` top/bottom · `/` search · `n/N` next/prev · `Space`/`Enter` insert · digits/`Tab` tabs · `P` provider · `R` fresh session · `m` mouse toggle · `q` quit · `Ctrl-c` stop turn, twice to quit (any mode) |
 | NORMAL·vim (`/vim`) | `j/k` line · `Ctrl-u/d` half-page · `g`/`G` top/bottom · `Space`/`i`/`a` insert (rest as above; `Enter` does nothing) |
 | INSERT | type · `←/→` move · `Enter` send · `Esc`/`Ctrl-[` normal · `/sessions` `/new` `/tab new` `/tab close` `/theme` `/vim` `/help` commands |
 | SEARCH | `Enter` find · `Esc` cancel |

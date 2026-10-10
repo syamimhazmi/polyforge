@@ -47,8 +47,9 @@ highlight is what gets copied. Toggle mouse capture entirely with `m`
 - Every launch opens **one tab with a FRESH session**. Nothing from a
   previous run is replayed automatically.
 - Quit with `q` (Normal mode). Quitting ends all live backend
-  connections; stored transcripts stay on disk (see §7). (`Ctrl-c`
-  also ends the process from the terminal, skipping graceful shutdown.)
+  connections; stored transcripts stay on disk (see §7). `Ctrl-c`
+  works in any mode: the first press stops the running turn (if any),
+  a second press within 2 seconds quits.
 
 Zero-quota UI practice: set `provider = "mock"` in the config (see §8)
 and everything runs offline.
@@ -86,10 +87,11 @@ From top to bottom:
    label give way first. A pending diff shows a static
    `◆ awaiting approval` there instead (no `[stop]`; answer the card
    first).
-   **Stopping a turn**: press `Esc` (Normal mode) or click `[stop]`. The
-   row shows `Stopping…` with its own timer and the transcript gets
-   `■ stopped` once the turn ends. If the backend never ends the turn,
-   press `Esc` / click again to force it: the tab goes idle with
+   **Stopping a turn**: press `Esc` (Normal mode), `Ctrl-c` (any mode)
+   or click `[stop]`. The row shows `Stopping…` with its own timer and
+   the transcript gets `■ stopped` once the turn ends. If the backend
+   never ends the turn, press `Esc` / click again to force it: the tab
+   goes idle with
    `■ stopped (forced; late output may still arrive)` and stays idle
    until your next prompt. An approval that arrives while stopping is
    declined automatically (`stop: declined <tool> approval`). How each

@@ -33,6 +33,9 @@ pub const MAX_SESSIONS: usize = 3;
 /// First user prompt kept as the `/sessions` title (chars).
 pub const TITLE_LEN: usize = 48;
 
+/// How long after a Ctrl+C a second press still quits.
+pub const QUIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
@@ -162,6 +165,9 @@ pub struct App {
     pub mouse: bool,
     pub pending_g: bool,
     pub should_quit: bool,
+    /// When the last Ctrl+C was pressed: a second press within
+    /// QUIT_WINDOW quits; the first only stops the running turn.
+    pub quit_armed: Option<std::time::Instant>,
     pub flash: String,
     pub viewport_height: usize,
     pub viewport_width: usize,
@@ -219,6 +225,7 @@ impl App {
             mouse: true,
             pending_g: false,
             should_quit: false,
+            quit_armed: None,
             flash: String::new(),
             viewport_height: 20,
             viewport_width: DEFAULT_WIDTH,
@@ -337,6 +344,25 @@ impl App {
         }
         self.mode = Mode::Normal;
         self.stick_to_bottom();
+    }
+
+    /// Ctrl+C: the first press stops the active tab's running turn (if
+    /// any) and arms quit; a second press within QUIT_WINDOW quits.
+    pub fn ctrl_c(&mut self) {
+        let now = std::time::Instant::now();
+        if self.quit_armed.is_some_and(|t| now.duration_since(t) < QUIT_WINDOW) {
+            self.should_quit = true;
+            return;
+        }
+        self.quit_armed = Some(now);
+        self.flash.clear();
+        self.request_stop();
+        let hint = "press Ctrl+C again to quit";
+        self.flash = if !self.flash.is_empty() {
+            format!("{} — {hint}", self.flash)
+        } else {
+            hint.to_string()
+        };
     }
 
     /// Stop the active tab's running turn. First press asks the backend to
