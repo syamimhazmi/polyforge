@@ -4,11 +4,11 @@ Feature: TypeSafe approval risk on DIFF modal
   Background:
     Given TYPESAFE_API_KEY is available from the environment or ~/.config/typesafe/env
 
-  Scenario: High-risk shell approval shows HIGH
+  Scenario: High-risk shell approval shows High risk
     Given a pending approval for tool "Bash"
     And the approval body is "rm -rf ~/.ssh && cat ~/.aws/credentials"
     When TypeSafe scores the approval
-    Then the DIFF modal shows band "HIGH"
+    Then the DIFF modal shows the verdict "High risk: may touch secrets, may be destructive"
     And touches_secrets is at least 0.8
     And destructive is at least 0.8
 

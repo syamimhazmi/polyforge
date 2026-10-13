@@ -36,6 +36,9 @@ pub const TITLE_LEN: usize = 48;
 /// How long after a Ctrl+C a second press still quits.
 pub const QUIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long a status-bar flash stays up after it last changed.
+pub const FLASH_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
@@ -169,6 +172,11 @@ pub struct App {
     /// QUIT_WINDOW quits; the first only stops the running turn.
     pub quit_armed: Option<std::time::Instant>,
     pub flash: String,
+    /// The flash text last seen by [`App::expire_flash`] and when it
+    /// appeared; a flash unchanged for FLASH_TTL is cleared.
+    flash_seen: Option<(String, std::time::Instant)>,
+    /// `?` in the DIFF modal: show the raw risk scores under the verdict.
+    pub risk_details: bool,
     pub viewport_height: usize,
     pub viewport_width: usize,
     /// Transcript store (None = storageless; main attaches it on boot).
@@ -227,6 +235,8 @@ impl App {
             should_quit: false,
             quit_armed: None,
             flash: String::new(),
+            flash_seen: None,
+            risk_details: false,
             viewport_height: 20,
             viewport_width: DEFAULT_WIDTH,
             store: None,
@@ -346,11 +356,37 @@ impl App {
         self.stick_to_bottom();
     }
 
+    /// Clear the flash once it has been up, unchanged, for FLASH_TTL.
+    /// Any new text restarts the clock. True when it was just cleared.
+    pub fn expire_flash(&mut self, now: std::time::Instant) -> bool {
+        if self.flash.is_empty() {
+            self.flash_seen = None;
+            return false;
+        }
+        match &self.flash_seen {
+            Some((text, at)) if *text == self.flash => {
+                if now.duration_since(*at) < FLASH_TTL {
+                    return false;
+                }
+                self.flash.clear();
+                self.flash_seen = None;
+                true
+            }
+            _ => {
+                self.flash_seen = Some((self.flash.clone(), now));
+                false
+            }
+        }
+    }
+
     /// Ctrl+C: the first press stops the active tab's running turn (if
     /// any) and arms quit; a second press within QUIT_WINDOW quits.
     pub fn ctrl_c(&mut self) {
         let now = std::time::Instant::now();
-        if self.quit_armed.is_some_and(|t| now.duration_since(t) < QUIT_WINDOW) {
+        if self
+            .quit_armed
+            .is_some_and(|t| now.duration_since(t) < QUIT_WINDOW)
+        {
             self.should_quit = true;
             return;
         }
@@ -547,6 +583,22 @@ fn muse_mark(decision: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    /// A flash stays FLASH_TTL after it last changed, then clears once.
+    #[test]
+    fn flash_expires_after_ttl_and_new_text_restarts_the_clock() {
+        let t0 = std::time::Instant::now();
+        let mut app = App::new();
+        app.flash = "copied".into();
+        assert!(!app.expire_flash(t0));
+        assert!(!app.expire_flash(t0 + FLASH_TTL / 2));
+        app.flash = "stopped".into();
+        assert!(!app.expire_flash(t0 + FLASH_TTL));
+        assert_eq!(app.flash, "stopped", "new text restarted the clock");
+        assert!(app.expire_flash(t0 + FLASH_TTL * 2));
+        assert!(app.flash.is_empty());
+        assert!(!app.expire_flash(t0 + FLASH_TTL * 3));
+    }
+
     use super::*;
     use crate::app::outbox::STOPPED_LINE;
     use crate::app::test_support::bottom_app;

@@ -101,7 +101,8 @@ fn short_cwd(path: &str) -> String {
 }
 
 /// Header row: shortened workspace on the left, compact tabs (and the
-/// active tab's token count) on the right. Inactive tabs drop to `○2`
+/// active tab's token count) on the right. Tab markers: `◆` awaiting
+/// approval, `●` busy, `○` idle. Inactive tabs drop to `○2`
 /// short form when the row is tight; nothing ever overflows.
 fn render_header(f: &mut Frame, app: &App, th: Theme, area: Rect) {
     if area.height == 0 {
@@ -118,7 +119,11 @@ fn render_header(f: &mut Frame, app: &App, th: Theme, area: Rect) {
         .map(|t| crate::activity::format_tokens_short(t).replace(".0k", "k"));
     let tab = |i: usize, short: bool| -> Vec<Span<'static>> {
         let s = &app.sessions[i];
-        let (dot, dot_color) = if s.busy {
+        // ◆ = waiting on your approval, so a card on a background tab
+        // is not missed.
+        let (dot, dot_color) = if s.pending_diff.is_some() {
+            ("◆", th.warn)
+        } else if s.busy {
             ("●", th.tab_busy)
         } else {
             ("○", th.muted)
@@ -853,13 +858,13 @@ fn mode_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         Mode::Picker if app.onboarding => vec![
             ("j/k", "move"),
             ("Enter", "start"),
-            ("1-5", "quick"),
+            ("1-6", "quick"),
             ("Esc", "quit"),
         ],
         Mode::Picker => vec![
             ("j/k", "move"),
             ("Enter", "switch"),
-            ("1-5", "quick"),
+            ("1-6", "quick"),
             ("Esc", "cancel"),
         ],
         Mode::Sessions => vec![
@@ -873,11 +878,11 @@ fn mode_hints(app: &App) -> Vec<(&'static str, &'static str)> {
 }
 
 /// Shortcuts row under the input box: mode badge and Grok-style key hints
-/// on the left; busy state, scroll position, mouse and the flash message
-/// on the right. Tight rows drop the hints first, then the right-side
-/// extras; the flash is kept last.
+/// on the left; on the right the flash message, then how far the view is
+/// above the live tail and `mouse off`, each shown only when it says
+/// something. Tight rows drop the right-side extras first, then clip the
+/// flash; the first two hints always stay.
 fn render_shortcuts(f: &mut Frame, app: &App, th: Theme, area: Rect) {
-    let s = app.active();
     let width = area.width as usize;
     let n = |s: &str| s.chars().count();
     let badge = format!(" {} ", app.mode.label());
@@ -888,51 +893,55 @@ fn render_shortcuts(f: &mut Frame, app: &App, th: Theme, area: Rect) {
             .bg(th.mode_color(app.mode))
             .add_modifier(Modifier::BOLD),
     );
-    // Right side, most expendable last: mouse, scroll, busy, then flash.
-    let total = s.total_rows;
+    let muted = Style::default().fg(th.muted);
     let flash = crate::app::sanitize_text(&app.flash); // S3-F1: agent text
     let mut right: Vec<(String, Style)> = Vec::new();
     if !flash.is_empty() {
         right.push((flash, Style::default().fg(th.warn)));
     }
-    right.push(if s.busy {
-        (
-            "[busy]".to_string(),
-            Style::default().fg(th.running).add_modifier(Modifier::BOLD),
-        )
-    } else {
-        ("[idle]".to_string(), Style::default().fg(th.muted))
-    });
-    right.push((
-        format!(
-            "{}/{}",
-            s.scroll.min(total.saturating_sub(1)) + 1,
-            total.max(1)
-        ),
-        Style::default().fg(th.muted),
-    ));
-    right.push((
-        format!("mouse:{}", if app.mouse { "on" } else { "off" }),
-        Style::default().fg(th.muted),
-    ));
+    let below = app.rows_below();
+    if below > 0 {
+        let unit = if below == 1 { "line" } else { "lines" };
+        right.push((format!("↓ {below} more {unit}"), muted));
+    }
+    if !app.mouse {
+        right.push(("mouse off".to_string(), muted));
+    }
+    let hints = mode_hints(app);
+    let sep = "  │  ";
+    let hint_w = |k: usize| -> usize {
+        hints[..k]
+            .iter()
+            .enumerate()
+            .map(|(i, (key, desc))| n(key) + 1 + n(desc) + if i > 0 { n(sep) } else { 0 })
+            .sum()
+    };
+    let kept_hints = hint_w(hints.len().min(2));
+    let left_fixed = n(&badge) + 1;
     let right_w = |r: &[(String, Style)]| r.iter().map(|(t, _)| n(t) + 2).sum::<usize>();
-    let has_flash = !app.flash.is_empty();
-    while right.len() > 1 && n(&badge) + right_w(&right) > width {
+    while right.len() > 1 && left_fixed + kept_hints + 2 + right_w(&right) > width {
         right.pop();
     }
-    // A flash wider than the row is clipped instead of overflowing.
-    if let Some((t, _)) = right.first_mut().filter(|_| has_flash) {
-        let room = width.saturating_sub(n(&badge) + 2);
+    // What is left is clipped rather than pushing out the kept hints.
+    if let Some((t, _)) = right.first_mut() {
+        let room = width.saturating_sub(left_fixed + kept_hints + 2 + 2);
         if n(t) > room {
-            *t = t.chars().take(room).collect();
+            *t = match room {
+                0 => String::new(),
+                r => format!("{}…", t.chars().take(r - 1).collect::<String>()),
+            };
         }
     }
-    let rw = right_w(&right).min(width);
+    right.retain(|(t, _)| !t.is_empty());
+    let rw = if right.is_empty() {
+        0
+    } else {
+        right_w(&right).min(width)
+    };
     // Left hints get what is left; whole hints only, dropped from the end.
-    let sep = "  │  ";
-    let mut budget = width.saturating_sub(n(&badge) + 1 + rw + 2);
+    let mut budget = width.saturating_sub(left_fixed + rw);
     let mut left = vec![badge_span, Span::raw(" ")];
-    for (i, (key, desc)) in mode_hints(app).into_iter().enumerate() {
+    for (i, (key, desc)) in hints.into_iter().enumerate() {
         let need = n(key) + 1 + n(desc) + if i > 0 { n(sep) } else { 0 };
         if need > budget {
             break;
@@ -947,12 +956,12 @@ fn render_shortcuts(f: &mut Frame, app: &App, th: Theme, area: Rect) {
                 .fg(th.text_secondary)
                 .add_modifier(Modifier::BOLD),
         ));
-        left.push(Span::styled(
-            format!(":{desc}"),
-            Style::default().fg(th.muted),
-        ));
+        left.push(Span::styled(format!(":{desc}"), muted));
     }
     f.render_widget(Paragraph::new(Line::from(left)), area);
+    if rw == 0 {
+        return;
+    }
     let mut spans = Vec::new();
     for (i, (t, st)) in right.into_iter().enumerate() {
         if i > 0 {
@@ -1005,11 +1014,14 @@ fn render_turn_status(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
         .filter(|&n| n > 0)
         .map(|n| format!("⇣{}", format_tokens_short(n)));
     let spinner = format!("{TURN_INDENT}{}", spinner_frame(since(s.turn_since)));
+    // In a one-phase turn both timers read the same; show it once.
+    let turn_t = format_secs(since(s.turn_since));
+    let phase_t = Some(format_secs(phase_t)).filter(|t| *t != turn_t);
     let row = plan_turn_row(
         area.width as usize,
         label,
-        &format_secs(phase_t),
-        &format_secs(since(s.turn_since)),
+        phase_t.as_deref(),
+        &turn_t,
         tokens.as_deref(),
     );
     let mut left = vec![Span::styled(spinner, Style::default().fg(th.running))];
@@ -1072,7 +1084,7 @@ struct TurnRow {
 fn plan_turn_row(
     width: usize,
     label: &str,
-    phase_t: &str,
+    phase_t: Option<&str>,
     turn: &str,
     tokens: Option<&str>,
 ) -> TurnRow {
@@ -1105,6 +1117,13 @@ fn plan_turn_row(
             let keep = max.saturating_sub(1);
             format!("{}…", s.chars().take(keep).collect::<String>())
         }
+    };
+    let Some(phase_t) = phase_t else {
+        return TurnRow {
+            label: clip(label, avail.saturating_sub(1)),
+            timer: None,
+            right,
+        };
     };
     let with_timer = 1 + n(label) + 1 + n(phase_t);
     let (label, timer) = if with_timer <= avail {
@@ -1232,20 +1251,47 @@ fn render_cmd_popup(f: &mut Frame, app: &App, th: Theme, input_area: Rect) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// Unified-diff line color: adds green, removals red, hunk headers muted.
+/// Bodies that are not diffs (shell commands, tool calls) stay plain.
+fn diff_line_style(line: &str, th: Theme) -> Style {
+    if line.starts_with("+++") || line.starts_with("---") {
+        Style::default()
+            .fg(th.text_secondary)
+            .add_modifier(Modifier::BOLD)
+    } else if line.starts_with('+') {
+        Style::default().fg(th.ok)
+    } else if line.starts_with('-') {
+        Style::default().fg(th.err)
+    } else if line.starts_with("@@") {
+        Style::default().fg(th.muted)
+    } else {
+        Style::default().fg(th.text_primary)
+    }
+}
+
+/// Added and removed line counts of a unified diff (file headers skipped).
+fn diff_stats(body: &str) -> (usize, usize) {
+    body.lines().fold((0, 0), |(a, d), l| {
+        if l.starts_with('+') && !l.starts_with("+++") {
+            (a + 1, d)
+        } else if l.starts_with('-') && !l.starts_with("---") {
+            (a, d + 1)
+        } else {
+            (a, d)
+        }
+    })
+}
+
+/// The approval card: colored diff on top, the risk verdict under it, and
+/// the keys in the bottom border so they show even when the diff is cut.
+/// Height fits the content (up to 80% of the screen).
 fn render_diff_modal(f: &mut Frame, app: &App, th: Theme) {
-    let area = centered(f.area(), 76, 60);
-    f.render_widget(Clear, area);
     let s = app.active();
     let Some(diff) = s.pending_diff.as_ref() else {
         return;
     };
-    let risk = match s.approval_risk.as_ref() {
-        Some(j) => j.summary_line(),
-        None if s.risk_spawned_gen.is_some() => "risk … scoring".to_string(),
-        None => String::new(),
-    };
-    // The modal chrome takes the risk band color so severity reads at a
-    // glance (green/yellow/red); unscored approvals stay neutral.
+    // The chrome takes the risk band color so severity reads at a glance
+    // (green/yellow/red); unscored approvals stay neutral.
     let band_color = s
         .approval_risk
         .as_ref()
@@ -1254,43 +1300,129 @@ fn render_diff_modal(f: &mut Frame, app: &App, th: Theme) {
     // S3-F1 render defense: the card body/file are agent-controlled.
     let body = crate::app::sanitize_text(&diff.body);
     let file = crate::app::sanitize_text(&diff.file);
-    let text = if risk.is_empty() {
-        format!(
-            "{}\n\n{}",
-            body, "y approve · n reject · a approve-all · q later"
-        )
+    let mut footer: Vec<Line> = Vec::new();
+    match s.approval_risk.as_ref() {
+        Some(j) => {
+            footer.push(Line::from(Span::styled(
+                j.verdict(),
+                Style::default().fg(band_color).add_modifier(Modifier::BOLD),
+            )));
+            if app.risk_details {
+                footer.push(Line::from(Span::styled(
+                    j.summary_line(),
+                    Style::default().fg(th.muted),
+                )));
+            }
+        }
+        None if s.risk_spawned_gen.is_some() => {
+            footer.push(Line::from(Span::styled(
+                "Checking risk…",
+                Style::default().fg(th.muted),
+            )));
+        }
+        None => {}
+    }
+
+    let screen = f.area();
+    let w = (screen.width * 76 / 100).max(screen.width.min(40));
+    // Borders plus one column of padding each side.
+    let inner_w = w.saturating_sub(4).max(1) as usize;
+    // Pre-wrapped so the row count (and so the card height) is exact.
+    let body_lines: Vec<Line> = body
+        .lines()
+        .flat_map(|l| {
+            let style = diff_line_style(l, th);
+            crate::app::Session::wrap_line(l, inner_w)
+                .into_iter()
+                .map(move |chunk| Line::from(Span::styled(chunk, style)))
+        })
+        .collect();
+    let footer_h = if footer.is_empty() {
+        0
     } else {
-        format!(
-            "{}\n\n{}\n\n{}",
-            body, risk, "y approve · n reject · a approve-all · q later"
+        footer.len() + 1
+    };
+    let want = body_lines.len() + footer_h + 2;
+    let h = (want as u16)
+        .min(screen.height * 80 / 100)
+        .max(screen.height.min(5));
+    let area = Rect::new(
+        screen.x + (screen.width - w) / 2,
+        screen.y + (screen.height - h) / 2,
+        w,
+        h,
+    );
+    f.render_widget(Clear, area);
+
+    let (adds, dels) = diff_stats(&body);
+    let mut title = vec![Span::styled(
+        format!(" {file} "),
+        Style::default().fg(th.path),
+    )];
+    if adds + dels > 0 {
+        title.push(Span::styled(format!("+{adds}"), Style::default().fg(th.ok)));
+        title.push(Span::raw(" "));
+        title.push(Span::styled(
+            format!("−{dels} "),
+            Style::default().fg(th.err),
+        ));
+    }
+    let key = |k: &'static str| {
+        Span::styled(
+            k,
+            Style::default()
+                .fg(th.text_primary)
+                .add_modifier(Modifier::BOLD),
         )
     };
-    // Filename reads in the path accent; the band tag takes the risk
-    // color so severity is visible in the title alone.
-    let mut title_spans = vec![
-        Span::styled(" DIFF — ", Style::default().fg(th.text_secondary)),
-        Span::styled(file, Style::default().fg(th.path)),
+    let desc = |d: &'static str| Span::styled(d, Style::default().fg(th.muted));
+    let mut keys = vec![
+        Span::raw(" "),
+        key("y"),
+        desc(" approve  "),
+        key("n"),
+        desc(" reject  "),
+        key("a"),
+        desc(" approve all  "),
+        key("q"),
+        desc(" not now "),
     ];
-    if let Some(j) = s.approval_risk.as_ref().filter(|_| !risk.is_empty()) {
-        title_spans.push(Span::styled(
-            format!(" — {} ", j.band.label()),
-            Style::default().fg(band_color).add_modifier(Modifier::BOLD),
-        ));
-    } else {
-        title_spans.push(Span::raw(" "));
+    if s.approval_risk.is_some() {
+        keys.push(desc(" "));
+        keys.push(key("?"));
+        keys.push(desc(if app.risk_details {
+            " hide scores "
+        } else {
+            " scores "
+        }));
     }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(band_color))
-        .title(Line::from(title_spans));
-    f.render_widget(
-        Paragraph::new(text)
-            .style(Style::default().fg(th.text_primary))
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+        .padding(Padding::horizontal(1))
+        .title(Line::from(title))
+        .title_bottom(Line::from(keys));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let footer_h = (footer_h as u16).min(inner.height);
+    let body_area = Rect {
+        height: inner.height - footer_h,
+        ..inner
+    };
+    f.render_widget(Paragraph::new(body_lines), body_area);
+    if footer_h > 0 {
+        let mut lines = vec![Line::default()];
+        lines.extend(footer);
+        f.render_widget(
+            Paragraph::new(lines),
+            Rect {
+                y: inner.y + body_area.height,
+                height: footer_h,
+                ..inner
+            },
+        );
+    }
 }
 
 fn render_picker_modal(f: &mut Frame, app: &App, th: Theme) {
@@ -1460,18 +1592,15 @@ mod tests {
         let mut app = App::new();
         app.sessions[0].lines.push("> hi".to_string());
         let rows = screen_rows(&mut app, 80, 24);
-        assert!(rows.iter().any(|r| r.contains("[idle]")));
         assert!(rows.iter().all(|r| !r.contains("Thinking")));
+        assert!(rows.iter().any(|r| r.contains("○ s1:mock")), "idle marker");
         app.sessions[0].busy = true;
         app.sessions[0].sync_activity();
         let rows = screen_rows(&mut app, 80, 24);
+        assert!(rows.iter().any(|r| r.contains("● s1:mock")), "busy marker");
         // Turn-status row sits above the input box; the shortcuts row is last.
-        let status = rows
-            .iter()
-            .position(|r| r.contains("[busy]"))
-            .expect("busy");
-        assert_eq!(status, rows.len() - 1);
-        assert!(rows.iter().all(|r| !r.contains("[idle]")));
+        let status = rows.len() - 1;
+        assert!(rows[status].contains(" NORMAL "), "{:?}", rows[status]);
         let turn = rows
             .iter()
             .position(|r| r.contains("[stop]"))
@@ -1482,12 +1611,149 @@ mod tests {
             rows[turn].chars().nth(4).map(|c| c.is_alphanumeric()),
             Some(false)
         );
-        assert!(rows[turn].contains("Thinking… 0."), "{:?}", rows[turn]);
-        // The right side is the turn timer, then the stop button + margin.
+        // One phase so far: its timer equals the turn timer, shown once
+        // on the right before the stop button + margin.
+        assert!(rows[turn].contains("Thinking…"), "{:?}", rows[turn]);
+        assert_eq!(rows[turn].matches("0.").count(), 1, "{:?}", rows[turn]);
         assert!(rows[turn].ends_with("s [stop]  "), "{:?}", rows[turn]);
         // Live thinking block in the transcript.
         assert!(rows.iter().any(|r| r.contains("◆ Thinking…")));
         assert!(!rows[status].contains("Thinking"));
+    }
+
+    fn diff_app(body: &str) -> App {
+        let mut app = App::new();
+        app.sessions[0].lines.push("> hi".to_string());
+        app.sessions[0].busy = true;
+        app.sessions[0].stage_diff(crate::app::PendingDiff {
+            file: "src/draft.rs".into(),
+            body: body.into(),
+        });
+        app
+    }
+
+    const DRAFT_DIFF: &str =
+        "--- a/src/draft.rs\n+++ b/src/draft.rs\n@@\n+pub fn draft() {\n-old()\n+}\n";
+
+    #[test]
+    fn diff_card_colors_lines_and_counts_changes_in_the_title() {
+        let th = Theme::get(ThemeKind::GrokNight);
+        let mut app = diff_app(DRAFT_DIFF);
+        let buf = screen_buf(&mut app, 100, 30);
+        let rows: Vec<String> = (0..30)
+            .map(|y| (0..100).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let fg_at = |needle: &str| {
+            let (y, r) = rows
+                .iter()
+                .enumerate()
+                .find(|(_, r)| r.contains(needle))
+                .expect(needle);
+            let x = r[..r.find(needle).unwrap()].chars().count() as u16;
+            buf[(x, y as u16)].fg
+        };
+        assert_eq!(fg_at("+pub fn draft"), th.ok);
+        assert_eq!(fg_at("-old()"), th.err);
+        assert_eq!(fg_at("@@"), th.muted);
+        let top = rows
+            .iter()
+            .position(|r| r.contains(" src/draft.rs +2 −1 "))
+            .expect("title");
+        let bottom = rows
+            .iter()
+            .position(|r| r.contains("y approve") && r.contains("q not now"));
+        // Card fits its 6 diff lines: border + body + border, no padding.
+        assert_eq!(bottom, Some(top + 7), "{rows:#?}");
+    }
+
+    #[test]
+    fn diff_card_shows_plain_verdict_and_scores_on_question_mark() {
+        let mut app = diff_app(DRAFT_DIFF);
+        app.sessions[0].approval_risk = Some(crate::typesafe::ApprovalJudgment::compose(
+            0.2, 0.9, 0.05, 0.05,
+        ));
+        let rows = screen_rows(&mut app, 100, 30);
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("Low risk: no secrets touched, nothing destructive"))
+        );
+        assert!(
+            rows.iter().all(|r| !r.contains("secrets 0.05")),
+            "scores hidden"
+        );
+        assert!(rows.iter().any(|r| r.contains("? scores")));
+        crate::input::handle_key(
+            &mut app,
+            crossterm::event::KeyCode::Char('?'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let rows = screen_rows(&mut app, 100, 30);
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("risk LOW") && r.contains("secrets 0.05"))
+        );
+        assert!(rows.iter().any(|r| r.contains("? hide scores")));
+        assert!(app.active().pending_diff.is_some(), "? does not decide");
+    }
+
+    #[test]
+    fn header_marks_a_background_tab_awaiting_approval() {
+        let mut app = App::new();
+        app.sessions[0].lines.push("> hi".to_string());
+        app.open_tab();
+        app.sessions[0].stage_diff(crate::app::PendingDiff {
+            file: "a.rs".into(),
+            body: "+x".into(),
+        });
+        let rows = screen_rows(&mut app, 80, 24);
+        assert!(rows[0].contains("◆ s1:mock"), "{:?}", rows[0]);
+        assert!(rows[0].contains("○ s2:mock"), "{:?}", rows[0]);
+    }
+
+    #[test]
+    fn new_tab_opens_on_the_welcome_dashboard() {
+        let mut app = App::new();
+        app.sessions[0].lines.push("> hi".to_string());
+        app.open_tab();
+        let rows = screen_rows(&mut app, 100, 30);
+        assert!(rows.iter().any(|r| r.contains("backend")), "{rows:#?}");
+        assert!(rows.iter().all(|r| !r.contains("(fresh)")));
+    }
+
+    #[test]
+    fn status_bar_shows_scroll_and_mouse_only_when_not_default() {
+        let mut app = App::new();
+        for i in 0..60 {
+            app.sessions[0].push_line(format!("line {i}"));
+        }
+        let _ = screen_rows(&mut app, 100, 24); // measures the viewport
+        app.stick_to_bottom();
+        let rows = screen_rows(&mut app, 100, 24);
+        assert!(!rows[23].contains("more line"), "{:?}", rows[23]);
+        app.scroll_lines(-5);
+        app.mouse = false;
+        let rows = screen_rows(&mut app, 100, 24);
+        assert!(
+            rows[23].contains("↓ 5 more lines  mouse off"),
+            "{:?}",
+            rows[23]
+        );
+    }
+
+    #[test]
+    fn long_flash_is_clipped_and_the_first_hints_stay() {
+        let mut app = App::new();
+        app.sessions[0].push_line("> hi".to_string());
+        app.mode = Mode::Picker;
+        app.flash = "codex: a very long failure reason that would fill the whole row".into();
+        let rows = screen_rows(&mut app, 72, 24);
+        let last = &rows[23];
+        assert!(last.contains("j/k:move  │  Enter:switch"), "{last:?}");
+        assert!(
+            last.contains("codex: a very") && last.contains('…'),
+            "{last:?}"
+        );
+        assert_eq!(last.chars().count(), 72);
     }
 
     #[test]
@@ -1615,7 +1881,7 @@ mod tests {
         assert_eq!(fg("muse: working…"), Some(th.muted));
         assert_eq!(fg("plain note"), Some(th.text_primary));
         // Outcomes win over the generic backend dimming.
-        assert_eq!(fg("codex: turn failed (see flash)"), Some(th.err));
+        assert_eq!(fg("codex: turn failed: {}"), Some(th.err));
     }
 
     /// Every theme renders the full chrome without panicking (tiny
@@ -1721,7 +1987,7 @@ mod tests {
     fn turn_row_sides_never_overlap_when_narrow() {
         let n = |s: &str| s.chars().count();
         for w in 6..=100usize {
-            let r = plan_turn_row(w, "Responding", "12s", "1m 05s", Some("⇣12.3k"));
+            let r = plan_turn_row(w, "Responding", Some("12s"), "1m 05s", Some("⇣12.3k"));
             let left = 4 + 1 + 1 + n(&r.label) + r.timer.as_ref().map_or(0, |t| 1 + n(t));
             let right = r.right.as_ref().map_or(0, |p| {
                 (if p.is_empty() { 0 } else { n(p) + 1 }) + STOP_LABEL.len() + 2
@@ -1733,14 +1999,14 @@ mod tests {
             );
         }
         // Shedding order: tokens go before the turn timer, timer before label.
-        let r = plan_turn_row(40, "Responding", "12s", "1m 05s", Some("⇣12.3k"));
+        let r = plan_turn_row(40, "Responding", Some("12s"), "1m 05s", Some("⇣12.3k"));
         assert_eq!(r.right.as_deref(), Some("1m 05s ⇣12.3k"));
         assert_eq!(r.timer.as_deref(), Some("12s"));
-        let r = plan_turn_row(23, "Responding", "12s", "1m 05s", Some("⇣12.3k"));
+        let r = plan_turn_row(23, "Responding", Some("12s"), "1m 05s", Some("⇣12.3k"));
         assert_eq!(r.right.as_deref(), Some("1m 05s"));
-        let r = plan_turn_row(16, "Responding", "12s", "1m 05s", Some("⇣12.3k"));
+        let r = plan_turn_row(16, "Responding", Some("12s"), "1m 05s", Some("⇣12.3k"));
         assert_eq!(r.right.as_deref(), Some(""));
-        let r = plan_turn_row(8, "Responding", "12s", "1m 05s", None);
+        let r = plan_turn_row(8, "Responding", Some("12s"), "1m 05s", None);
         assert_eq!(r.right, None);
     }
 
@@ -1898,8 +2164,9 @@ mod tests {
         let last = rows.last().expect("row");
         assert!(last.contains(" NORMAL "), "{last:?}");
         assert!(last.contains("j/k:move  │  Space/i/a:type"), "{last:?}");
+        // Defaults (live tail, mouse on, idle) say nothing on the right.
         assert!(
-            last.contains("[idle]") && last.contains("mouse:"),
+            !last.contains("[idle]") && !last.contains("mouse"),
             "{last:?}"
         );
         assert!(!last.contains("Esc:stop"), "{last:?}");
@@ -1907,17 +2174,8 @@ mod tests {
         app.sessions[0].sync_activity();
         let rows = screen_rows(&mut app, 100, 30);
         let last = rows.last().expect("row");
-        assert!(
-            last.contains("Esc:stop") && last.contains("[busy]"),
-            "{last:?}"
-        );
-        // Narrow: hints give way first, the right side stays.
-        let rows = screen_rows(&mut app, 40, 12);
-        let last = rows.last().expect("row");
-        assert!(
-            last.contains("[busy]") && last.chars().count() == 40,
-            "{last:?}"
-        );
+        assert!(last.contains("Esc:stop"), "{last:?}");
+        assert!(!last.contains("[busy]"), "{last:?}");
         // INSERT hints.
         app.mode = Mode::Insert;
         let rows = screen_rows(&mut app, 100, 30);

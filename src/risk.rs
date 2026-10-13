@@ -71,11 +71,8 @@ pub(crate) fn apply_risk_msg(app: &mut App, msg: RiskMsg) {
             if s.pending_diff.is_none() || s.risk_gen != token {
                 return;
             }
-            let line = judgment.summary_line();
+            // The DIFF modal shows the verdict; no flash duplicate.
             s.approval_risk = Some(judgment);
-            if tab == app.active {
-                app.flash = line;
-            }
         }
         RiskMsg::Failed { tab, token, err } => {
             let Some(s) = app.sessions.get_mut(tab) else {
@@ -113,7 +110,10 @@ mod tests {
             },
         );
         assert_eq!(app.active().approval_risk.as_ref(), Some(&j));
-        assert!(app.flash.contains("HIGH"));
+        assert!(
+            app.flash.is_empty(),
+            "the modal shows the verdict, no flash"
+        );
 
         // Stale token after clear: ignored.
         let _ = app.active_mut().clear_diff();

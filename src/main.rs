@@ -200,6 +200,7 @@ async fn run(
                         }
                         _ => {}
                     },
+                    Event::Resize(..) => dirty = true,
                     _ => {}
                 }
                 apply_mouse_capture(app)?;
@@ -291,6 +292,9 @@ async fn run(
                 }
                 let a = app.active();
                 if a.busy && a.pending_diff.is_none() {
+                    dirty = true;
+                }
+                if app.expire_flash(std::time::Instant::now()) {
                     dirty = true;
                 }
             }

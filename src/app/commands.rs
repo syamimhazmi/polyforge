@@ -175,7 +175,7 @@ impl App {
             "  /theme [name] — switch theme, bare cycles (saved to config)".to_string(),
             "  /vim — toggle vim keymap (saved to config)".to_string(),
             format!(
-                "keys (Normal mode): {move_keys} · P provider · R fresh · Esc stop turn · q quit"
+                "keys (Normal mode): {move_keys} · P provider · R fresh · Esc or Ctrl-C stop turn · Ctrl-C twice quits · q quit"
             ),
         ] {
             self.active_mut().push_line(l);

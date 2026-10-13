@@ -132,7 +132,45 @@ impl ApprovalJudgment {
         ))
     }
 
-    /// One-line summary for the DIFF modal / flash.
+    /// Plain-language verdict for the DIFF modal; the raw numbers stay
+    /// in [`Self::summary_line`] (shown on `?`).
+    pub fn verdict(&self) -> String {
+        let band = match self.band {
+            RiskBand::Low => "Low risk",
+            RiskBand::Med => "Medium risk",
+            RiskBand::High => "High risk",
+        };
+        // Same 0.40..0.60 coin-flip band that sets `uncertain`.
+        let says = |p: f64, yes: &'static str, unsure: &'static str, no: &'static str| {
+            if p >= 0.60 {
+                yes
+            } else if p >= 0.40 {
+                unsure
+            } else {
+                no
+            }
+        };
+        let secrets = says(
+            self.touches_secrets,
+            "may touch secrets",
+            "unclear if it touches secrets",
+            "no secrets touched",
+        );
+        let destroy = says(
+            self.destructive,
+            "may be destructive",
+            "unclear if it is destructive",
+            "nothing destructive",
+        );
+        let unsure = if self.uncertain {
+            " (low confidence)"
+        } else {
+            ""
+        };
+        format!("{band}{unsure}: {secrets}, {destroy}")
+    }
+
+    /// Raw scores, one line (the DIFF modal's `?` details).
     pub fn summary_line(&self) -> String {
         let flag = if self.uncertain { "?" } else { "" };
         format!(
@@ -654,6 +692,10 @@ mod tests {
         assert_eq!(low.band, RiskBand::Low);
         assert!(!low.uncertain);
         assert!(low.summary_line().starts_with("risk LOW"));
+        assert_eq!(
+            low.verdict(),
+            "Low risk: no secrets touched, nothing destructive"
+        );
 
         let med = ApprovalJudgment::compose(1.0, 0.8, 0.2, 0.3);
         assert_eq!(med.band, RiskBand::Med);
@@ -662,10 +704,18 @@ mod tests {
         assert_eq!(high.band, RiskBand::High);
         assert!(!high.uncertain);
         assert!(high.summary_line().contains("HIGH"));
+        assert_eq!(
+            high.verdict(),
+            "High risk: may touch secrets, may be destructive"
+        );
 
         let unsure = ApprovalJudgment::compose(1.0, 0.3, 0.5, 0.1);
         assert!(unsure.uncertain);
         assert!(unsure.summary_line().contains('?'));
+        assert_eq!(
+            unsure.verdict(),
+            "Medium risk (low confidence): unclear if it touches secrets, nothing destructive"
+        );
     }
 
     #[test]

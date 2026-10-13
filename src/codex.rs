@@ -185,8 +185,10 @@ pub fn apply_codex_notif(app: &mut App, tab: usize, method: &str, params: &Value
         "turn/failed" | "thread/realtime/error" => {
             let s = &mut app.sessions[tab];
             s.flush_thought();
-            s.push_line("codex: turn failed (see flash)".to_string());
-            app.flash = format!("codex: {}", truncate(&params.to_string(), 300));
+            // The flash expires, so the reason also goes in the transcript.
+            let reason = truncate(&params.to_string(), 300);
+            s.push_line(format!("codex: turn failed: {reason}"));
+            app.flash = format!("codex: {reason}");
             false
         }
         "error" => {

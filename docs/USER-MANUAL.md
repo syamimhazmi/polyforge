@@ -63,9 +63,9 @@ From top to bottom:
    opens. Left: the workspace, Grok-style (`~/C/p/polyforge`: every
    component but the last cut to its first character). Right: one entry
    per tab, `○ s1:muse │ ● s2:grok`, then the active tab's context size
-   (`28k`) once the backend has reported one. `●` means the tab is busy
-   (an answer streams in even while you look at another tab); `○` means
-   idle. The active tab is bold. On narrow terminals inactive tabs
+   (`28k`) once the backend has reported one. `◆` means the tab is
+   waiting for your approval; `●` means it is busy (an answer streams in
+   even while you look at another tab); `○` means idle. The active tab is bold. On narrow terminals inactive tabs
    shorten to `○ 2`, then the count drops.
 2. **Transcript** — the active tab's conversation, oldest at top, with
    no border: text starts at column 5 (column 2 is the rail column) and
@@ -79,7 +79,8 @@ From top to bottom:
    search work on the rendered text, so markers like `**` are not copied.
 3. **Turn-status row** — while a tab works, a row appears just above the
    input box: `    ⠋ Thinking… 3.2s` (or `Responding…`, timed per phase)
-   with the whole turn's timer on the right, then the session's context
+   with the whole turn's timer on the right (the phase timer is hidden
+   while the two read the same), then the session's context
    size `⇣12.3k` (tokens, latest report from the backend; hidden until
    one arrives) and a `[stop]` button; it disappears when the tab is
    idle. Timers show one decimal under a minute (`5.2s`), then
@@ -113,9 +114,11 @@ From top to bottom:
    title names the backend and tab (`grok · s1 ─`).
 5. **Shortcuts row** — the mode badge, then the keys available in the
    current mode (`i:insert  │  /:search  │  Esc:stop  │  …`; `Esc:stop`
-   shows only while the tab is busy). On the right: `[busy]`/`[idle]`,
-   scroll position, mouse state, and the latest notice (`flash`). On
-   narrow terminals the key hints give way first.
+   shows only while the tab is busy). On the right: the latest notice
+   (`flash`, cleared after 5 seconds), `↓ 12 more lines` while you are
+   scrolled up from the live tail, and `mouse off` when mouse capture is
+   off. On narrow terminals the right side gives way first; the first two
+   key hints always stay.
 
 ## 3. Modes and keys
 
@@ -209,15 +212,20 @@ A failed re-attach starts fresh and says so in the transcript.
 
 ### DIFF modal — approve agent writes
 
-When an agent wants to change files, a centered card shows the file and
-the diff, and it steals `y/n/a/q`:
+When an agent wants to change files, a centered card shows the file,
+its added/removed line counts, and the diff (`+` lines green, `-` lines
+red). With a TypeSafe key, a plain verdict sits under the diff (`Low
+risk: no secrets touched, nothing destructive`) and the card border takes
+the risk color. The keys are listed in the card's bottom border. It
+steals `y/n/a/q`:
 
 | key | action |
 | --- | ------ |
 | `y` | approve this change |
 | `n` | reject this change |
 | `a` | approve this and all following changes |
-| `q` / `Esc` | later — close the card without deciding |
+| `q` / `Esc` | not now — close the card without approving |
+| `?` | show or hide the raw risk scores |
 
 On muse this answers the live approval; on codex `q`/Later maps to wire
 `denied` when the server offers those choices. Permissions and free-text
