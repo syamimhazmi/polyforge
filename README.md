@@ -72,7 +72,7 @@ Needs a real tty (alternate screen + mouse). Inside tmux: wheel and
 | NORMAL·vim (`/vim`) | `j/k` line · `Ctrl-u/d` half-page · `g`/`G` top/bottom · `Space`/`i`/`a` insert (rest as above; `Enter` does nothing) |
 | INSERT | type · `←/→` move · `Enter` send · `Esc`/`Ctrl-[` normal · `/sessions` `/new` `/tab new` `/tab close` `/theme` `/vim` `/help` commands |
 | SEARCH | `Enter` find · `Esc` cancel |
-| PICKER | `j/k` move · `Enter` switch · `1-5` quick · `Esc` cancel |
+| PICKER | `j/k` move · `Enter` switch · `1-6` quick · `Esc` cancel |
 | SESSIONS | `j/k` move · `Enter` view + continue · `d` delete · `1-9` quick · `Esc` cancel |
 | DIFF modal | `y` approve · `n` reject · `a` approve-all · `q`/`Esc` later |
 
@@ -119,7 +119,7 @@ provider = "muse"   # default backend: muse | codex | agy | grok | claude | mock
 # permission_mode = "acceptEdits"  # omitted = your Claude settings' default; unallowed tools ask y/n
 ```
 
-Press `P` on any tab for the provider picker (`j/k` + `Enter`, `1-5`
+Press `P` on any tab for the provider picker (`j/k` + `Enter`, `1-6`
 quick-pick, `Esc` cancels): the tab respawns under the chosen backend with
 a FRESH session — history never carries over. The header row shows each tab's
 backend (`s1:muse`).

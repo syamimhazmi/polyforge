@@ -25,6 +25,11 @@ impl App {
         (self.viewport_height.max(2) / 2) as i32
     }
 
+    /// Transcript rows below the viewport (0 = at the live tail).
+    pub fn rows_below(&self) -> usize {
+        self.max_scroll().saturating_sub(self.active().scroll)
+    }
+
     pub fn scroll_top(&mut self) {
         self.set_scroll(0);
     }

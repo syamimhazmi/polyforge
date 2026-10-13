@@ -220,6 +220,10 @@ pub(crate) fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                     decide_ui(app, DecisionKind::Later, "deferred");
                     return;
                 }
+                '?' => {
+                    app.risk_details = !app.risk_details;
+                    return;
+                }
                 _ => {}
             }
         }
@@ -323,7 +327,9 @@ pub(crate) fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             KeyCode::Char('m') if no_mods => {
                 clear_pending_g(app);
                 app.mouse = !app.mouse;
-                app.flash = format!("mouse {}", if app.mouse { "on" } else { "off" });
+                // Off shows as a standing `mouse off` in the status bar;
+                // on is the default, so only the switch back is flashed.
+                app.flash = if app.mouse { "mouse on" } else { "" }.to_string();
             }
             KeyCode::Char('P') if no_mods => {
                 clear_pending_g(app);
@@ -445,8 +451,12 @@ pub(crate) fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                     (app.picker_sel + BackendKind::ALL.len() - 1) % BackendKind::ALL.len();
             }
             KeyCode::Enter => pick_backend(app, BackendKind::ALL[app.picker_sel].0),
-            KeyCode::Char(c) if no_mods && ['1', '2', '3', '4', '5'].contains(&c) => {
-                let i = (c as usize - '1' as usize).min(BackendKind::ALL.len() - 1);
+            KeyCode::Char(c)
+                if no_mods
+                    && c.to_digit(10)
+                        .is_some_and(|d| (1..=BackendKind::ALL.len() as u32).contains(&d)) =>
+            {
+                let i = c as usize - '1' as usize;
                 pick_backend(app, BackendKind::ALL[i].0);
             }
             _ => {}
@@ -618,6 +628,16 @@ mod tests {
         assert_eq!(app.outbox.decides[0].choice_id, "denied");
     }
 
+    /// Every backend has a quick key, the sixth (claude) included.
+    #[test]
+    fn picker_digit_six_picks_the_sixth_backend() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('P'), SHIFT);
+        handle_key(&mut app, KeyCode::Char('6'), NONE);
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.active().backend, BackendKind::ALL[5].0);
+    }
+
     /// P opens the picker; j/k move; Enter respawns the tab fresh.
     #[test]
     fn picker_respawns_tab_fresh() {
@@ -632,8 +652,7 @@ mod tests {
         let s = app.active();
         assert_eq!(s.backend, BackendKind::Codex);
         assert!(s.remote_id.is_none());
-        assert_eq!(s.lines.len(), 1); // marker only: history never carries over
-        assert!(s.lines[0].contains("fresh"));
+        assert!(s.lines.is_empty()); // history never carries over
         assert_eq!(app.outbox.respawns.len(), 1);
         assert_eq!(app.outbox.respawns[0].backend, BackendKind::Codex);
     }
@@ -650,8 +669,7 @@ mod tests {
         let s = app.active();
         assert_eq!(s.backend, BackendKind::Codex);
         assert!(s.remote_id.is_none());
-        assert_eq!(s.lines.len(), 1); // marker only: history never carries over
-        assert!(s.lines[0].contains("fresh"));
+        assert!(s.lines.is_empty()); // history never carries over
         assert_eq!(app.outbox.respawns.len(), 1);
         assert_eq!(app.outbox.respawns[0].backend, BackendKind::Codex);
     }

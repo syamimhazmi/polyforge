@@ -169,11 +169,8 @@ impl App {
         self.sessions.push(s);
         self.active = self.sessions.len() - 1;
         self.attach_fresh_store(self.active);
+        // No marker line: an empty tab shows the welcome dashboard.
         let backend = self.sessions[self.active].backend;
-        {
-            let s = self.active_mut();
-            s.push_line(format!("--- {} session (fresh) ---", backend.label()));
-        }
         self.save_tab_meta(self.active);
         self.outbox.respawns.push(OutboxRespawn {
             tab: self.active,
@@ -307,7 +304,6 @@ impl App {
             s.total_rows = 0;
             s.scroll = 0;
             s.clear_stream_drafts();
-            s.push_line(format!("--- {} session (fresh) ---", backend.label()));
         }
         self.outbox.respawns.push(OutboxRespawn { tab, backend });
         self.mode = Mode::Normal;
@@ -431,12 +427,11 @@ mod tests {
         let new_id = app.sessions[0].store_id.clone().expect("id");
         assert_ne!(old_id, new_id, "respawn must mint a fresh session id");
         let store = app.store.as_ref().expect("store");
-        // Old session intact for `/sessions`; new one holds the marker.
+        // Old session intact for `/sessions`; the new one starts empty
+        // (the tab shows the welcome dashboard).
         let old = store.load_transcript(&old_id);
         assert!(old.iter().any(|l| l == "scratch"));
-        let fresh = store.load_transcript(&new_id);
-        assert_eq!(fresh.len(), 1);
-        assert!(fresh[0].starts_with("--- mock session (fresh) ---"));
+        assert!(store.load_transcript(&new_id).is_empty());
         assert!(app.sessions[0].remote_id.is_none());
         assert_eq!(store.list_sessions("").len(), 2);
         let _ = std::fs::remove_dir_all(dir);
@@ -547,8 +542,7 @@ mod tests {
         let s = app.active();
         assert_eq!(s.backend, BackendKind::Codex, "same backend, new session");
         assert!(s.remote_id.is_none());
-        assert_eq!(s.lines.len(), 1);
-        assert!(s.lines[0].contains("fresh"));
+        assert!(s.lines.is_empty(), "empty: the welcome dashboard shows");
         assert_eq!(app.outbox.respawns.len(), 1);
         assert!(app.outbox.submits.is_empty(), "never sent to a backend");
     }
