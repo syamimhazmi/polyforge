@@ -198,6 +198,12 @@ pub(crate) fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         return;
     }
 
+    // The help overlay closes on any key, which does nothing else.
+    if app.help_open {
+        app.help_open = false;
+        return;
+    }
+
     // Diff modal steals y/n/a/q on the active tab.
     if app.active().pending_diff.is_some() {
         if let KeyCode::Char(c) = code
@@ -323,6 +329,10 @@ pub(crate) fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             KeyCode::Esc if no_mods => {
                 clear_pending_g(app);
                 app.request_stop();
+            }
+            KeyCode::Char('?') if no_mods => {
+                clear_pending_g(app);
+                app.help_open = true;
             }
             KeyCode::Char('m') if no_mods => {
                 clear_pending_g(app);

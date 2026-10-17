@@ -157,30 +157,9 @@ impl App {
         }
     }
 
-    /// UI-only command help (never persisted: detached from the sink).
+    /// Open the help overlay (drawn over the transcript, never stored).
     fn show_help(&mut self) {
-        let sink = self.active_mut().sink.take();
-        let move_keys = if self.vim {
-            "j/k line · g/G top/bottom · Space/i/a type"
-        } else {
-            "arrows/HOME/END/PgUp/PgDn · Space/Enter types · /vim for vim keys"
-        };
-        for l in [
-            "commands (Insert mode, Enter sends):".to_string(),
-            "  /sessions [query] — browse previous sessions, Enter views + continues, d deletes"
-                .to_string(),
-            "  /new — fresh session in this tab (same as R)".to_string(),
-            "  /tab new — open a tab (max 3), same backend as current".to_string(),
-            "  /tab close — close this tab, killing its session".to_string(),
-            "  /theme [name] — switch theme, bare cycles (saved to config)".to_string(),
-            "  /vim — toggle vim keymap (saved to config)".to_string(),
-            format!(
-                "keys (Normal mode): {move_keys} · P provider · R fresh · Esc or Ctrl-C stop turn · Ctrl-C twice quits · q quit"
-            ),
-        ] {
-            self.active_mut().push_line(l);
-        }
-        self.active_mut().sink = sink;
+        self.help_open = true;
     }
 }
 

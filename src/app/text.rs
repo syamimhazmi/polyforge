@@ -90,16 +90,6 @@ fn consume_until_st(it: &mut std::iter::Peekable<std::str::Chars>) {
     }
 }
 
-/// Short display id for the `/sessions` list (store ids are ASCII
-/// `millis-pid-seq`, so byte slicing is safe).
-pub fn short_id(id: &str) -> String {
-    if id.len() <= 8 {
-        id.to_string()
-    } else {
-        id[id.len() - 8..].to_string()
-    }
-}
-
 /// Display-column of the first `chars` chars of `s` (wide-char aware).
 /// Test-only for now: the render path splits pre-wrapped chunks by chars.
 #[cfg(test)]
@@ -131,12 +121,6 @@ mod tests {
     use super::*;
     use crate::app::App;
     use crate::app::session::Session;
-
-    #[test]
-    fn short_id_shows_id_tail() {
-        assert_eq!(short_id("abc"), "abc");
-        assert_eq!(short_id("1789516800000-1234-5"), "0-1234-5");
-    }
 
     /// Wide chars occupy two columns in both directions.
     #[test]

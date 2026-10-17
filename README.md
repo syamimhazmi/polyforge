@@ -59,7 +59,8 @@ Enter, /sessions, Enter  next time: this workspace's sessions; Enter continues o
 ```
 
 Empty tabs open on a welcome dashboard (logo, backend status, workspace,
-theme, keymap, first keys); the first transcript line replaces it.
+theme, keymap, first keys); the first transcript line replaces it. Each
+tab is named after its first prompt. Press `?` for the full key list.
 
 Needs a real tty (alternate screen + mouse). Inside tmux: wheel and
 `Ctrl-u/d` scroll the TUI viewport — tmux copy-mode is never involved.
@@ -68,7 +69,7 @@ Needs a real tty (alternate screen + mouse). Inside tmux: wheel and
 
 | mode | keys |
 | ---- | ---- |
-| NORMAL (default keys) | arrows line · `PgUp/PgDn` half-page · `Home/End` top/bottom · `/` search · `n/N` next/prev · `Space`/`Enter` insert · digits/`Tab` tabs · `P` provider · `R` fresh session · `m` mouse toggle · `q` quit · `Ctrl-c` stop turn, twice to quit (any mode) |
+| NORMAL (default keys) | arrows line · `PgUp/PgDn` half-page · `Home/End` top/bottom · `/` search · `n/N` next/prev · `Space`/`Enter` insert · digits/`Tab` tabs · `P` provider · `R` fresh session · `m` mouse toggle · `?` help · `q` quit · `Ctrl-c` stop turn, twice to quit (any mode) |
 | NORMAL·vim (`/vim`) | `j/k` line · `Ctrl-u/d` half-page · `g`/`G` top/bottom · `Space`/`i`/`a` insert (rest as above; `Enter` does nothing) |
 | INSERT | type · `←/→` move · `Enter` send · `Esc`/`Ctrl-[` normal · `/sessions` `/new` `/tab new` `/tab close` `/theme` `/vim` `/help` commands |
 | SEARCH | `Enter` find · `Esc` cancel |
@@ -122,7 +123,8 @@ provider = "muse"   # default backend: muse | codex | agy | grok | claude | mock
 Press `P` on any tab for the provider picker (`j/k` + `Enter`, `1-6`
 quick-pick, `Esc` cancels): the tab respawns under the chosen backend with
 a FRESH session — history never carries over. The header row shows each tab's
-backend (`s1:muse`).
+name and backend (`add a draft… · muse`). Backends whose CLI is not on
+`PATH` are marked `not installed`.
 
 ## What each backend does
 

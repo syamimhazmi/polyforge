@@ -85,6 +85,12 @@ async fn run(
     // Theme likewise (`/theme` switches + saves; typos fall back).
     app.theme = cfg.theme_kind();
     app.workspace = cfg.workspace_root();
+    // Checked once at boot so the picker can mark backends not installed.
+    app.backend_missing = BackendKind::ALL
+        .iter()
+        .map(|(b, _)| *b)
+        .filter(|b| cfg.bin_for(*b).is_some_and(|bin| !config::on_path(&bin)))
+        .collect();
     // Fresh boot: exactly one tab with a NEW session id (previous sessions
     // stay on disk for `/sessions`). Storageless falls back to no store.
     if let Some(store) = store::Store::open() {
