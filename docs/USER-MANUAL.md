@@ -62,11 +62,13 @@ From top to bottom:
    welcome screen; it appears once the tab has content or a second tab
    opens. Left: the workspace, Grok-style (`~/C/p/polyforge`: every
    component but the last cut to its first character). Right: one entry
-   per tab, `○ s1:muse │ ● s2:grok`, then the active tab's context size
+   per tab, `○ add a draft… · muse │ ● s2 · grok`, then the active tab's context size
    (`28k`) once the backend has reported one. `◆` means the tab is
    waiting for your approval; `●` means it is busy (an answer streams in
    even while you look at another tab); `○` means idle. The active tab is bold. On narrow terminals inactive tabs
-   shorten to `○ 2`, then the count drops.
+   shorten to `○ 2`, then the count drops. A tab is named after its
+   first prompt (shortened to about 20 characters), or `s1`, `s2`, … until
+   it has one.
 2. **Transcript** — the active tab's conversation, oldest at top, with
    no border: text starts at column 5 (column 2 is the rail column) and
    keeps a 2-column right margin. Your prompts show as `❯ …` on a dark
@@ -111,7 +113,7 @@ From top to bottom:
    is not kept. The current turn's transcript rows also get a pulsing
    `┃` rail in column 2.
 4. **Input box** — rounded box with a `❯` prompt. Its bottom-right
-   title names the backend and tab (`grok · s1 ─`).
+   title names the backend and tab (`grok · add a draft… ─`).
 5. **Shortcuts row** — the mode badge, then the keys available in the
    current mode (`i:insert  │  /:search  │  Esc:stop  │  …`; `Esc:stop`
    shows only while the tab is busy). On the right: the latest notice
@@ -139,6 +141,7 @@ The mode badge tells you where keystrokes go.
 | `R` | respawn active tab with a FRESH session, same backend |
 | `Esc` | stop the running turn (press again to force) |
 | `m` | mouse capture on/off |
+| `?` | help overlay (any key closes it) |
 | `q` | quit |
 
 **Vim keymap** (off by default): type `/vim` (Insert mode) to enable
@@ -164,7 +167,7 @@ Input starting with `/` is a **command**, never sent to the agent:
 | `/tab close` | close this tab, killing its session |
 | `/theme [name]` | switch theme — `groknight` (default) or `tokyonight`; bare `/theme` cycles (saved to config) |
 | `/vim` | toggle the vim keymap (saved to config) |
-| `/help` | print the command + key summary into the transcript |
+| `/help` | open the help overlay with every command and key (same as `?`; any key closes it) |
 
 Unknown `/…` input flashes the command list instead of sending anything.
 
@@ -175,25 +178,28 @@ cancels.
 
 ### PICKER — switch provider (`P`)
 
-`j/k` move, `Enter` switches, `1-4` quick-picks, `Esc` cancels.
+`j/k` move, `Enter` switches, `1-6` quick-picks, `Esc` cancels.
+Each row shows the backend and what it is; `current` marks the tab's
+backend and `not installed` marks one whose CLI was not found on `PATH`
+(or at its configured `bin`) when polyforge started.
 Switching **always starts a fresh session** — history never carries over.
 The tab's old session stays stored and browsable via `/sessions`.
 
-| # | backend |
-| - | ------- |
-| 1 | mock — offline fake, no quota |
-| 2 | muse — Muse Spark via `muse serve` |
-| 3 | codex — Codex via `codex app-server` |
-| 4 | agy — Antigravity via `agy` (visible, ungated — see §6) |
-| 5 | grok — Grok via `grok agent stdio` (ACP — see §6) |
-| 6 | claude — Claude Code via `claude -p` (stream-json — see §6) |
+| # | backend | shown as |
+| - | ------- | -------- |
+| 1 | mock | offline practice, no quota |
+| 2 | muse | Muse Spark (`muse serve`) |
+| 3 | codex | OpenAI Codex (`codex app-server`) |
+| 4 | agy | Antigravity, edits files without asking (see §6) |
+| 5 | grok | Grok (`grok agent stdio`, ACP — see §6) |
+| 6 | claude | Claude Code (`claude -p` stream-json — see §6) |
 
 ### SESSIONS — continue a previous session (`/sessions`)
 
-Session management follows the grok CLI. The list mirrors
-`grok sessions list`: one row per session with id, backend, created and
-updated timestamps, and summary (first-prompt title, else the first
-transcript line). Only sessions started in the current workspace
+Session management follows the grok CLI. Each row shows the session's
+title (its first prompt, else the first transcript line) and when it was
+last used (`2 min ago`, `yesterday`, `4 days ago`, then the date).
+Sessions that never got a prompt are not listed. Only sessions started in the current workspace
 (`workspace` in config, else the directory you launched from) are
 listed, so projects never collide. Rows are grouped by provider — the
 active tab's provider first — and ordered most-active-first within each

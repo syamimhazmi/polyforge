@@ -66,10 +66,22 @@ pub fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-/// Compact `MM-DD HH:MM` (UTC) for the `/sessions` columns.
-pub fn fmt_short(millis: u64) -> String {
-    let full = fmt_time(millis);
-    full.get(5..).unwrap_or(&full).to_string()
+/// How long ago `then` was, for the `/sessions` list: `just now`,
+/// `5 min ago`, `3 h ago`, `yesterday`, `4 days ago`, then the date.
+/// Legacy zero timestamps show nothing.
+pub fn fmt_ago(then: u64, now: u64) -> String {
+    if then == 0 {
+        return String::new();
+    }
+    let mins = now.saturating_sub(then) / 60_000;
+    match mins {
+        0 => "just now".to_string(),
+        1..60 => format!("{mins} min ago"),
+        60..1440 => format!("{} h ago", mins / 60),
+        1440..2880 => "yesterday".to_string(),
+        2880..10_080 => format!("{} days ago", mins / 1440),
+        _ => fmt_time(then)[..10].to_string(),
+    }
 }
 
 /// `YYYY-MM-DD HH:MM` (UTC) for the `/sessions` list. No chrono dependency:
@@ -254,10 +266,16 @@ impl Store {
             if BackendKind::parse(&meta.backend).is_none() || meta.workspace != workspace {
                 continue;
             }
-            let preview = self
-                .first_line(id)
-                .map(|l| truncate(&l, PREVIEW_LEN))
-                .unwrap_or_else(|| "(no lines yet)".to_string());
+            let first = self.first_line(id);
+            // Never used: no prompt and nothing but (at most) the old
+            // `--- <backend> session (fresh) ---` marker.
+            let unused = first
+                .as_deref()
+                .is_none_or(|l| l.starts_with("--- ") && l.ends_with(" (fresh) ---"));
+            if meta.title.is_empty() && unused {
+                continue;
+            }
+            let preview = first.map(|l| truncate(&l, PREVIEW_LEN)).unwrap_or_default();
             out.push(StoredSession {
                 id: id.to_string(),
                 backend: meta.backend,
@@ -603,15 +621,46 @@ mod tests {
         let listed = store.list_sessions("/ws");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, "..");
-        assert_eq!(listed[0].preview, "(no lines yet)");
+        assert_eq!(listed[0].preview, "");
         assert!(store.load_transcript("..").is_empty());
         assert!(!store.delete_session(".."));
     }
 
     #[test]
-    fn fmt_short_truncates_to_day_time() {
-        assert_eq!(fmt_short(1_789_516_800_000), "09-16 00:00");
-        assert_eq!(fmt_short(0), "01-01 00:00");
+    fn fmt_ago_buckets() {
+        let now = 1_789_516_800_000;
+        let ago = |mins: u64| fmt_ago(now - mins * 60_000, now);
+        assert_eq!(ago(0), "just now");
+        assert_eq!(ago(5), "5 min ago");
+        assert_eq!(ago(180), "3 h ago");
+        assert_eq!(ago(60 * 30), "yesterday");
+        assert_eq!(ago(60 * 24 * 4), "4 days ago");
+        assert_eq!(ago(60 * 24 * 30), "2026-08-17");
+        assert_eq!(fmt_ago(0, now), "", "legacy zero timestamp");
+    }
+
+    #[test]
+    fn list_hides_sessions_that_were_never_used() {
+        let (store, _g) = tmp_store();
+        let mut meta = test_meta();
+        meta.title = String::new();
+        // No prompt and no lines; no prompt and only the old marker.
+        store.save_meta("empty", &meta);
+        store.save_meta("marker", &meta);
+        let mut sink = store.open_sink("marker").expect("sink");
+        append_line(&mut sink, "--- mock session (fresh) ---");
+        drop(sink);
+        // Untitled but with real lines (pre-title sessions) still lists.
+        store.save_meta("legacy", &meta);
+        let mut sink = store.open_sink("legacy").expect("sink");
+        append_line(&mut sink, "> hello");
+        drop(sink);
+        let ids: Vec<String> = store
+            .list_sessions("/ws")
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(ids, vec!["legacy".to_string()]);
     }
 
     #[test]

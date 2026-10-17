@@ -248,10 +248,41 @@ impl Config {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| ".".to_string())
     }
+
+    /// The CLI a backend runs (None for the built-in mock).
+    pub fn bin_for(&self, kind: crate::app::BackendKind) -> Option<String> {
+        use crate::app::BackendKind;
+        match kind {
+            BackendKind::Mock => None,
+            BackendKind::Muse => Some(self.muse_bin()),
+            BackendKind::Codex => Some(self.codex_bin()),
+            BackendKind::Agy => Some(self.agy_bin()),
+            BackendKind::Grok => Some(self.grok_bin()),
+            BackendKind::Claude => Some(self.claude_bin()),
+        }
+    }
+}
+
+/// Whether `bin` resolves to a file: a path is checked as given, a bare
+/// name against each `$PATH` directory.
+pub fn on_path(bin: &str) -> bool {
+    if bin.contains('/') {
+        return std::path::Path::new(bin).is_file();
+    }
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn on_path_finds_paths_and_bare_names() {
+        assert!(super::on_path("/bin/sh"));
+        assert!(super::on_path("sh"));
+        assert!(!super::on_path("polyforge-no-such-cli"));
+        assert!(!super::on_path("/no/such/dir/sh"));
+    }
+
     use super::*;
 
     #[test]

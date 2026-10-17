@@ -120,6 +120,25 @@ pub struct Session {
 }
 
 impl Session {
+    /// Tab name in the header and input box: the first prompt, shortened
+    /// at a word boundary, or `s1` until there is one.
+    pub fn tab_label(&self) -> String {
+        const MAX: usize = 20;
+        let t = self.title.trim();
+        if t.is_empty() {
+            return self.name.clone();
+        }
+        if t.chars().count() <= MAX {
+            return t.to_string();
+        }
+        let cut: String = t.chars().take(MAX - 1).collect();
+        let cut = match cut.rfind(' ') {
+            Some(i) if i >= MAX / 2 => &cut[..i],
+            _ => cut.as_str(),
+        };
+        format!("{}…", cut.trim_end())
+    }
+
     pub fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),

@@ -17,7 +17,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph},
 };
 
 use crate::app::{App, Mode};
@@ -70,6 +70,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
     }
     if app.mode == Mode::Sessions {
         render_sessions_modal(f, app, th);
+    }
+    if app.help_open {
+        render_help_overlay(f, app, th);
     }
 }
 
@@ -128,11 +131,6 @@ fn render_header(f: &mut Frame, app: &App, th: Theme, area: Rect) {
         } else {
             ("○", th.muted)
         };
-        let label = if i == app.active || !short {
-            format!("{}:{}", s.name, s.backend.label())
-        } else {
-            format!("{}", i + 1)
-        };
         let style = if i == app.active {
             Style::default()
                 .fg(th.tab_active)
@@ -140,10 +138,19 @@ fn render_header(f: &mut Frame, app: &App, th: Theme, area: Rect) {
         } else {
             Style::default().fg(th.text_secondary)
         };
-        vec![
-            Span::styled(dot, Style::default().fg(dot_color)),
-            Span::styled(format!(" {label}"), style),
-        ]
+        let mut spans = vec![Span::styled(dot, Style::default().fg(dot_color))];
+        if i == app.active || !short {
+            // S3-F1: the label is the user's first prompt.
+            let label = crate::app::sanitize_text(&s.tab_label());
+            spans.push(Span::styled(format!(" {label}"), style));
+            spans.push(Span::styled(
+                format!(" · {}", s.backend.label()),
+                Style::default().fg(th.muted),
+            ));
+        } else {
+            spans.push(Span::styled(format!(" {}", i + 1), style));
+        }
+        spans
     };
     let build = |short: bool, with_tokens: bool| -> Vec<Span<'static>> {
         let mut spans = Vec::new();
@@ -641,16 +648,8 @@ const LOGO_GLYPHS: [[&str; 6]; 9] = [
 fn render_welcome(f: &mut Frame, app: &App, th: Theme, area: Rect) {
     use crate::app::{BackendKind, MAX_SESSIONS};
     let s = app.active();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(th.border))
-        .title(Line::from(Span::styled(
-            format!(" {} welcome ", s.name),
-            Style::default().fg(th.text_secondary),
-        )));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    // Frameless, like the transcript it stands in for.
+    let inner = area;
 
     let mut lines: Vec<Line> = Vec::new();
     let logo_w: usize = LOGO_GLYPHS.iter().map(|g| g[0].chars().count()).sum();
@@ -729,10 +728,14 @@ fn render_welcome(f: &mut Frame, app: &App, th: Theme, area: Rect) {
             Style::default().fg(th.text_primary),
         )],
     ));
+    let open = app.sessions.len();
     lines.push(row(
         "tabs",
         vec![Span::styled(
-            format!("{}/{MAX_SESSIONS}", app.sessions.len()),
+            format!(
+                "{open} {} open (max {MAX_SESSIONS})",
+                if open == 1 { "tab" } else { "tabs" }
+            ),
             Style::default().fg(th.text_primary),
         )],
     ));
@@ -761,8 +764,8 @@ fn render_welcome(f: &mut Frame, app: &App, th: Theme, area: Rect) {
         key("/theme"),
         desc(" palette"),
         sep(),
-        key("/help"),
-        desc(" all"),
+        key("?"),
+        desc(" help"),
         sep(),
         key("q"),
         desc(" quit"),
@@ -1158,7 +1161,10 @@ fn render_input(f: &mut Frame, app: &mut App, th: Theme, area: Rect) {
     let title = Line::from(vec![
         Span::styled(s.backend.label(), Style::default().fg(th.subtle)),
         Span::styled(" · ", Style::default().fg(th.dot)),
-        Span::styled(s.name.clone(), Style::default().fg(th.muted)),
+        Span::styled(
+            crate::app::sanitize_text(&s.tab_label()),
+            Style::default().fg(th.muted),
+        ),
         Span::styled(
             " ─",
             Style::default().fg(if focused { th.border_active } else { th.border }),
@@ -1346,12 +1352,7 @@ fn render_diff_modal(f: &mut Frame, app: &App, th: Theme) {
     let h = (want as u16)
         .min(screen.height * 80 / 100)
         .max(screen.height.min(5));
-    let area = Rect::new(
-        screen.x + (screen.width - w) / 2,
-        screen.y + (screen.height - h) / 2,
-        w,
-        h,
-    );
+    let area = centered_box(screen, w, h);
     f.render_widget(Clear, area);
 
     let (adds, dels) = diff_stats(&body);
@@ -1425,139 +1426,288 @@ fn render_diff_modal(f: &mut Frame, app: &App, th: Theme) {
     }
 }
 
+/// A `w`×`h` box centered on `screen`, clamped to it.
+fn centered_box(screen: Rect, w: u16, h: u16) -> Rect {
+    let w = w.min(screen.width);
+    let h = h.min(screen.height);
+    Rect::new(
+        screen.x + (screen.width - w) / 2,
+        screen.y + (screen.height - h) / 2,
+        w,
+        h,
+    )
+}
+
+/// Rounded modal chrome with one column of padding each side.
+fn modal_block(th: Theme, title: String) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(th.border_active))
+        .padding(Padding::horizontal(1))
+        .title(Line::from(Span::styled(
+            title,
+            Style::default().fg(th.text_secondary),
+        )))
+}
+
+/// `s` cut to `max` columns with a trailing `…` when it does not fit.
+fn clip_cols(s: &str, max: usize) -> String {
+    if char_count(s) <= max {
+        s.to_string()
+    } else if max == 0 {
+        String::new()
+    } else {
+        format!("{}…", s.chars().take(max - 1).collect::<String>())
+    }
+}
+
+/// Provider picker: one row per backend (quick key, name, what it is,
+/// and whether it is the current one or not installed), sized to fit.
 fn render_picker_modal(f: &mut Frame, app: &App, th: Theme) {
     use crate::app::BackendKind;
-    let area = centered(f.area(), 60, 40);
-    f.render_widget(Clear, area);
-    let cur = app.sessions[app.active].backend;
-    let lines: Vec<Line> = BackendKind::ALL
+    let cur = app.active().backend;
+    let status = |b: BackendKind| {
+        if app.backend_missing.contains(&b) {
+            Some(("not installed", th.warn))
+        } else if b == cur && !app.onboarding {
+            Some(("current", th.skill))
+        } else {
+            None
+        }
+    };
+    let name_w = BackendKind::ALL
+        .iter()
+        .map(|(b, _)| b.label().len())
+        .max()
+        .unwrap_or(0);
+    let desc_w = BackendKind::ALL
+        .iter()
+        .map(|(_, d)| char_count(d))
+        .max()
+        .unwrap_or(0);
+    let mut lines: Vec<Line> = BackendKind::ALL
         .iter()
         .enumerate()
         .map(|(i, (b, desc))| {
-            let cursor = if i == app.picker_sel { "> " } else { "  " };
             let selected = i == app.picker_sel;
-            let row = if selected {
+            let name = if selected {
                 Style::default()
                     .fg(th.tab_active)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(th.text_primary)
             };
-            let mut spans = vec![Span::styled(format!("{cursor}{}: {desc}", i + 1), row)];
-            if *b == cur && !app.onboarding {
+            let mut spans = vec![
+                Span::styled(
+                    if selected { "› " } else { "  " },
+                    Style::default().fg(th.tab_active),
+                ),
+                Span::styled(format!("{}  ", i + 1), Style::default().fg(th.muted)),
+                Span::styled(format!("{:<name_w$}  ", b.label()), name),
+                Span::styled(
+                    format!("{desc:<desc_w$}"),
+                    Style::default().fg(th.text_secondary),
+                ),
+            ];
+            if let Some((label, color)) = status(*b) {
                 spans.push(Span::styled(
-                    " (current)",
-                    if selected {
-                        row
-                    } else {
-                        Style::default().fg(th.skill)
-                    },
+                    format!("  {label}"),
+                    Style::default().fg(color),
                 ));
             }
             Line::from(spans)
         })
         .collect();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(th.border_active))
-        .title(Line::from(Span::styled(
-            if app.onboarding {
-                " WELCOME — choose a provider to start (saved; P switches later) "
-            } else {
-                " PROVIDER — switch starts a fresh session "
-            },
-            Style::default().fg(th.text_secondary),
-        )));
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        if app.onboarding {
+            "Saved to your config. Press P to switch later."
+        } else {
+            "Switching starts a fresh session; this one stays in /sessions."
+        },
+        Style::default().fg(th.muted),
+    )));
+    let w = lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 4;
+    let area = centered_box(f.area(), w, lines.len() as u16 + 2);
+    f.render_widget(Clear, area);
+    let title = if app.onboarding {
+        " Choose a provider "
+    } else {
+        " Switch provider "
+    };
     f.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(lines).block(modal_block(th, title.to_string())),
         area,
     );
 }
 
+/// `/sessions`: this workspace's sessions grouped by backend, each row a
+/// title and how long ago it was used. Scrolls to keep the selection in
+/// view.
 fn render_sessions_modal(f: &mut Frame, app: &App, th: Theme) {
-    use crate::app::short_id;
-    use crate::store::fmt_short;
-    let area = centered(f.area(), 78, 60);
-    f.render_widget(Clear, area);
-    // Columns mirror `grok sessions list`: id + created + updated + summary.
-    // Rows arrive grouped by provider (active tab's first); each group
-    // gets a header in the skill accent.
+    use crate::store::{fmt_ago, now_millis};
+    let screen = f.area();
+    let now = now_millis();
     let cur = app.active().backend.label();
-    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
-        format!("  {}", crate::app::sanitize_text(&app.workspace)),
-        Style::default().fg(th.text_secondary),
-    ))];
+    let n = app.sess_list.len();
+    let num_w = n.to_string().len();
+    // S3-F1: titles/previews come from stored transcripts.
+    let rows: Vec<(String, String)> = app
+        .sess_list
+        .iter()
+        .map(|s| {
+            let title = if s.title.is_empty() {
+                &s.preview
+            } else {
+                &s.title
+            };
+            (crate::app::sanitize_text(title), fmt_ago(s.updated_at, now))
+        })
+        .collect();
+    let ago_w = rows.iter().map(|(_, a)| char_count(a)).max().unwrap_or(0);
+    // Cursor + number + gaps + time; the title gets the rest, up to 90%
+    // of the screen.
+    let fixed = 2 + num_w + 2 + 2 + ago_w;
+    let max_title = (screen.width as usize * 9 / 10).saturating_sub(fixed + 4);
+    let title_w = rows
+        .iter()
+        .map(|(t, _)| char_count(t))
+        .max()
+        .unwrap_or(0)
+        .clamp(24, max_title.max(1));
+    let mut lines: Vec<Line> = Vec::new();
+    let mut sel_line = 0;
     for (i, s) in app.sess_list.iter().enumerate() {
         if i == 0 || app.sess_list[i - 1].backend != s.backend {
-            let tag = if s.backend == cur { " (this tab)" } else { "" };
-            lines.push(Line::from(Span::styled(
-                format!("── {}{tag} ──", s.backend),
+            if i > 0 {
+                lines.push(Line::default());
+            }
+            let mut head = vec![Span::styled(
+                s.backend.clone(),
                 Style::default().fg(th.skill).add_modifier(Modifier::BOLD),
-            )));
+            )];
+            if s.backend == cur {
+                head.push(Span::styled(" (this tab)", Style::default().fg(th.muted)));
+            }
+            lines.push(Line::from(head));
         }
         let selected = i == app.sess_sel;
-        let cursor = if selected { "> " } else { "  " };
-        // S3-F1: preview/title come from stored transcripts.
-        let summary = if s.title.is_empty() {
-            crate::app::sanitize_text(&s.preview)
-        } else {
-            crate::app::sanitize_text(&s.title)
-        };
-        let row = if selected {
+        if selected {
+            sel_line = lines.len();
+        }
+        let title_style = if selected {
             Style::default()
                 .fg(th.tab_active)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(th.text_primary)
         };
-        lines.push(Line::from(Span::styled(
-            format!(
-                "{cursor}{}: {} {}→{} {}",
-                i + 1,
-                short_id(&s.id),
-                fmt_short(s.created_at),
-                fmt_short(s.updated_at),
-                summary,
+        let (title, ago) = &rows[i];
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                Style::default().fg(th.tab_active),
             ),
-            row,
-        )));
+            Span::styled(
+                format!("{:>num_w$}  ", i + 1),
+                Style::default().fg(th.muted),
+            ),
+            Span::styled(
+                format!("{:<title_w$}  ", clip_cols(title, title_w)),
+                title_style,
+            ),
+            Span::styled(format!("{ago:>ago_w$}"), Style::default().fg(th.muted)),
+        ]));
     }
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(th.border_active))
-        .title(Line::from(Span::styled(
-            " SESSIONS — Enter views + continues · d deletes · Esc cancels ",
-            Style::default().fg(th.text_secondary),
-        )));
+    let w = (fixed + title_w + 4) as u16;
+    let h = (lines.len() as u16 + 2).min(screen.height * 8 / 10).max(3);
+    let area = centered_box(screen, w, h);
+    f.render_widget(Clear, area);
+    let inner_h = h.saturating_sub(2) as usize;
+    let offset = sel_line.saturating_sub(inner_h.saturating_sub(1));
+    let place = crate::app::sanitize_text(&tilde_home(&app.workspace));
+    let title = clip_cols(
+        &format!(" Sessions in {place} "),
+        (w as usize).saturating_sub(4),
+    );
     f.render_widget(
         Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
+            .block(modal_block(th, title))
+            .scroll((offset as u16, 0)),
         area,
     );
 }
 
-fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
-    let h = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - pct_x) / 2),
-            Constraint::Percentage(pct_x),
-            Constraint::Percentage((100 - pct_x) / 2),
+/// `/help` or `?`: commands and keys over the transcript; any key closes.
+fn render_help_overlay(f: &mut Frame, app: &App, th: Theme) {
+    let head = |t: &'static str| {
+        Line::from(Span::styled(
+            t,
+            Style::default()
+                .fg(th.text_primary)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let mut rows: Vec<(&str, &str)> = Vec::new();
+    let mut lines = vec![head("Commands (type in INSERT mode, Enter runs)")];
+    for (template, _, desc) in crate::app::SLASH_COMMANDS {
+        rows.push((template, desc));
+    }
+    let cmd_end = rows.len();
+    let keys: &[(&str, &str)] = if app.vim {
+        &[
+            ("j/k  Ctrl-u/d  g/G", "scroll"),
+            ("Space/i/a", "type a prompt"),
+            ("/  n  N", "search, next, previous"),
+            ("1-3  Tab", "switch tab"),
+            ("P", "switch provider"),
+            ("R", "fresh session"),
+            ("m", "mouse on/off"),
+            ("Esc  Ctrl-C", "stop the turn"),
+            ("q  Ctrl-C twice", "quit"),
+        ]
+    } else {
+        &[
+            ("↑/↓  PgUp/PgDn  Home/End", "scroll"),
+            ("Space/Enter", "type a prompt"),
+            ("/  n  N", "search, next, previous"),
+            ("1-3  Tab", "switch tab"),
+            ("P", "switch provider"),
+            ("R", "fresh session"),
+            ("m", "mouse on/off"),
+            ("Esc  Ctrl-C", "stop the turn"),
+            ("q  Ctrl-C twice", "quit"),
+        ]
+    };
+    rows.extend_from_slice(keys);
+    let key_w = rows.iter().map(|(k, _)| char_count(k)).max().unwrap_or(0);
+    let row = |(k, d): (&str, &str)| {
+        Line::from(vec![
+            Span::styled(
+                format!("  {k:<key_w$}  "),
+                Style::default().fg(th.tab_active),
+            ),
+            Span::styled(d.to_string(), Style::default().fg(th.text_secondary)),
         ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - pct_y) / 2),
-            Constraint::Percentage(pct_y),
-            Constraint::Percentage((100 - pct_y) / 2),
-        ])
-        .split(h[1])[1]
+    };
+    lines.extend(rows[..cmd_end].iter().map(|r| row(*r)));
+    lines.push(Line::default());
+    lines.push(head("Keys (NORMAL mode)"));
+    lines.extend(rows[cmd_end..].iter().map(|r| row(*r)));
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "Mouse: the wheel scrolls; drag to select and copy.",
+        Style::default().fg(th.muted),
+    )));
+    let w = lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 4;
+    let area = centered_box(f.area(), w, lines.len() as u16 + 2);
+    f.render_widget(Clear, area);
+    let block = modal_block(th, " Help ".to_string()).title_bottom(Line::from(Span::styled(
+        " any key closes ",
+        Style::default().fg(th.muted),
+    )));
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn char_count(s: &str) -> usize {
@@ -1593,11 +1743,17 @@ mod tests {
         app.sessions[0].lines.push("> hi".to_string());
         let rows = screen_rows(&mut app, 80, 24);
         assert!(rows.iter().all(|r| !r.contains("Thinking")));
-        assert!(rows.iter().any(|r| r.contains("○ s1:mock")), "idle marker");
+        assert!(
+            rows.iter().any(|r| r.contains("○ s1 · mock")),
+            "idle marker"
+        );
         app.sessions[0].busy = true;
         app.sessions[0].sync_activity();
         let rows = screen_rows(&mut app, 80, 24);
-        assert!(rows.iter().any(|r| r.contains("● s1:mock")), "busy marker");
+        assert!(
+            rows.iter().any(|r| r.contains("● s1 · mock")),
+            "busy marker"
+        );
         // Turn-status row sits above the input box; the shortcuts row is last.
         let status = rows.len() - 1;
         assert!(rows[status].contains(" NORMAL "), "{:?}", rows[status]);
@@ -1706,8 +1862,8 @@ mod tests {
             body: "+x".into(),
         });
         let rows = screen_rows(&mut app, 80, 24);
-        assert!(rows[0].contains("◆ s1:mock"), "{:?}", rows[0]);
-        assert!(rows[0].contains("○ s2:mock"), "{:?}", rows[0]);
+        assert!(rows[0].contains("◆ s1 · mock"), "{:?}", rows[0]);
+        assert!(rows[0].contains("○ s2 · mock"), "{:?}", rows[0]);
     }
 
     #[test]
@@ -1754,6 +1910,125 @@ mod tests {
             "{last:?}"
         );
         assert_eq!(last.chars().count(), 72);
+    }
+
+    #[test]
+    fn tabs_are_named_after_their_first_prompt() {
+        let mut app = App::new();
+        app.sessions[0].push_line("> hi".to_string());
+        app.sessions[0].title = "add a draft function to the parser".to_string();
+        app.open_tab();
+        let rows = screen_rows(&mut app, 100, 24);
+        assert!(
+            rows[0].contains("○ add a draft… · mock │ ○ s2 · mock"),
+            "{:?}",
+            rows[0]
+        );
+        app.active = 0;
+        let rows = screen_rows(&mut app, 100, 24);
+        assert!(
+            rows.iter().any(|r| r.contains("mock · add a draft… ─╯")),
+            "input box title"
+        );
+    }
+
+    #[test]
+    fn help_opens_as_an_overlay_and_any_key_closes_it() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = App::new();
+        app.sessions[0].push_line("> hi".to_string());
+        app.mode = Mode::Insert;
+        app.active_mut().input = "/help".to_string();
+        app.submit();
+        assert!(app.help_open);
+        assert_eq!(
+            app.active().lines,
+            vec!["> hi".to_string()],
+            "not in the transcript"
+        );
+        let rows = screen_rows(&mut app, 100, 40);
+        assert!(rows.iter().any(|r| r.contains("╭ Help")));
+        assert!(rows.iter().any(|r| r.contains("/sessions [query]")));
+        assert!(rows.iter().any(|r| r.contains("any key closes")));
+        crate::input::handle_key(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(!app.help_open);
+        assert!(!app.should_quit, "the closing key does nothing else");
+        crate::input::handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+        assert!(app.help_open, "? opens it from NORMAL");
+    }
+
+    #[test]
+    fn picker_fits_its_rows_and_marks_current_and_missing_backends() {
+        let mut app = App::new();
+        app.sessions[0].push_line("> hi".to_string());
+        app.backend_missing = vec![crate::app::BackendKind::Codex];
+        app.mode = Mode::Picker;
+        let rows = screen_rows(&mut app, 120, 40);
+        let top = rows
+            .iter()
+            .position(|r| r.contains("╭ Switch provider"))
+            .expect("title");
+        let row = |name: &str| {
+            rows.iter()
+                .find(|r| r.contains(&format!("  {name} ")))
+                .expect(name)
+        };
+        assert!(row("mock").contains("current"));
+        assert!(row("codex").contains("not installed"));
+        assert!(row("agy").contains("edits files without asking"));
+        assert!(!row("muse").contains("current") && !row("muse").contains("not installed"));
+        // 6 backends + blank + note between the borders: no empty rows.
+        assert!(rows[top + 9].contains('╰'), "{:#?}", &rows[top..top + 10]);
+    }
+
+    #[test]
+    fn sessions_list_shows_titles_and_age_without_ids() {
+        let now = crate::store::now_millis();
+        let mut app = App::new();
+        app.sessions[0].push_line("> hi".to_string());
+        app.workspace = "/w/proj".to_string();
+        let stored =
+            |id: &str, backend: &str, title: &str, mins: u64| crate::store::StoredSession {
+                id: id.to_string(),
+                backend: backend.to_string(),
+                remote_id: None,
+                created_at: now - mins * 60_000,
+                updated_at: now - mins * 60_000,
+                title: title.to_string(),
+                preview: String::new(),
+            };
+        app.sess_list = vec![
+            stored("1789516800000-55476-1", "mock", "add a draft function", 2),
+            stored("1789516800000-55476-0", "codex", "fix the parser", 60 * 30),
+        ];
+        app.mode = Mode::Sessions;
+        let rows = screen_rows(&mut app, 100, 30);
+        assert!(rows.iter().any(|r| r.contains("╭ Sessions in /w/proj")));
+        assert!(rows.iter().any(|r| r.contains("mock (this tab)")));
+        let first = rows
+            .iter()
+            .find(|r| r.contains("add a draft function"))
+            .expect("row");
+        assert!(
+            first.contains("› 1") && first.contains("2 min ago"),
+            "{first:?}"
+        );
+        let second = rows
+            .iter()
+            .find(|r| r.contains("fix the parser"))
+            .expect("row");
+        assert!(second.contains("yesterday"), "{second:?}");
+        assert!(rows.iter().all(|r| !r.contains("55476")), "no raw ids");
+    }
+
+    #[test]
+    fn welcome_is_frameless_and_counts_open_tabs() {
+        let mut app = App::new();
+        let rows = screen_rows(&mut app, 100, 30);
+        assert!(rows.iter().any(|r| r.contains("1 tab open (max 3)")));
+        assert!(rows.iter().any(|r| r.contains("? help")));
+        // Only the input box has rounded corners.
+        assert_eq!(rows.iter().filter(|r| r.contains('╭')).count(), 1);
     }
 
     #[test]
@@ -1856,12 +2131,21 @@ mod tests {
             (0..80).map(|x| buf[(x, 0)].symbol()).collect::<String>()
         };
         let mut app = App::new();
-        assert!(!top_row(&mut app).contains("s1:mock"), "no tab bar at boot");
+        assert!(
+            !top_row(&mut app).contains("s1 · mock"),
+            "no tab bar at boot"
+        );
         app.sessions[0].push_line("> hello".to_string());
-        assert!(top_row(&mut app).contains("s1:mock"), "content shows tabs");
+        assert!(
+            top_row(&mut app).contains("s1 · mock"),
+            "content shows tabs"
+        );
         let mut app = App::new();
         app.open_tab();
-        assert!(top_row(&mut app).contains("s1:mock"), "two tabs show tabs");
+        assert!(
+            top_row(&mut app).contains("s1 · mock"),
+            "two tabs show tabs"
+        );
     }
 
     /// Transcript role colors follow grok-build semantics per theme.
@@ -2046,13 +2330,13 @@ mod tests {
         let rows = screen_rows(&mut app, 100, 30);
         assert!(rows[0].starts_with("  /t/w/proj"), "{:?}", rows[0]);
         assert!(
-            rows[0].contains("○ s1:mock │ ● s2:mock │ 28k"),
+            rows[0].contains("○ s1 · mock │ ● s2 · mock │ 28k"),
             "{:?}",
             rows[0]
         );
         // Tight row: inactive tabs shorten to their index, never overflow.
         let rows = screen_rows(&mut app, 30, 12);
-        assert!(rows[0].contains("○ s1:mock │ ● 2"), "{:?}", rows[0]);
+        assert!(rows[0].contains("○ s1 · mock │ ● 2"), "{:?}", rows[0]);
         assert_eq!(rows[0].chars().count(), 30);
     }
 

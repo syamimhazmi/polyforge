@@ -19,7 +19,7 @@ use outbox::FORCED_STOP_LINE;
 pub use outbox::{Outbox, OutboxDecide, OutboxRespawn, OutboxStop, OutboxSubmit};
 use selection::Selection;
 pub use session::{Session, take_u64};
-pub use text::{sanitize_text, short_id, wrap_rows};
+pub use text::{sanitize_text, wrap_rows};
 
 /// In-memory scrollback cap per session (older lines spill nowhere in M1).
 pub const MAX_LINES: usize = 50_000;
@@ -107,21 +107,12 @@ pub enum BackendKind {
 
 impl BackendKind {
     pub const ALL: [(BackendKind, &'static str); 6] = [
-        (BackendKind::Mock, "mock — offline fake (no quota)"),
-        (BackendKind::Muse, "muse — Muse Spark via `muse serve`"),
-        (BackendKind::Codex, "codex — Codex via `codex app-server`"),
-        (
-            BackendKind::Agy,
-            "agy — Antigravity via `agy` (visible, ungated)",
-        ),
-        (
-            BackendKind::Grok,
-            "grok — Grok via `grok agent stdio` (ACP)",
-        ),
-        (
-            BackendKind::Claude,
-            "claude — Claude Code via `claude -p` (stream-json)",
-        ),
+        (BackendKind::Mock, "offline practice, no quota"),
+        (BackendKind::Muse, "Muse Spark"),
+        (BackendKind::Codex, "OpenAI Codex"),
+        (BackendKind::Agy, "Antigravity, edits files without asking"),
+        (BackendKind::Grok, "Grok"),
+        (BackendKind::Claude, "Claude Code"),
     ];
 
     pub fn label(self) -> &'static str {
@@ -177,6 +168,10 @@ pub struct App {
     flash_seen: Option<(String, std::time::Instant)>,
     /// `?` in the DIFF modal: show the raw risk scores under the verdict.
     pub risk_details: bool,
+    /// `/help` or `?`: the help overlay is open; the next key closes it.
+    pub help_open: bool,
+    /// Backends whose CLI was not found at boot (picker marks them).
+    pub backend_missing: Vec<BackendKind>,
     pub viewport_height: usize,
     pub viewport_width: usize,
     /// Transcript store (None = storageless; main attaches it on boot).
@@ -237,6 +232,8 @@ impl App {
             flash: String::new(),
             flash_seen: None,
             risk_details: false,
+            help_open: false,
+            backend_missing: Vec::new(),
             viewport_height: 20,
             viewport_width: DEFAULT_WIDTH,
             store: None,
@@ -528,7 +525,7 @@ impl App {
                     if pinned {
                         s.scroll = s.total_rows.saturating_sub(vh);
                     }
-                    done = Some(s.name.clone());
+                    done = Some(s.tab_label());
                 }
             }
         }

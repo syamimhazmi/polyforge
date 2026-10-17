@@ -2,7 +2,6 @@
 
 use super::outbox::OutboxRespawn;
 use super::session::Session;
-use super::text::short_id;
 use super::{App, BackendKind, MAX_SESSIONS, Mode};
 
 impl App {
@@ -58,25 +57,28 @@ impl App {
             .iter()
             .position(|s| s.store_id.as_deref() == Some(pick.id.as_str()))
         {
-            self.flash = format!(
-                "session is open in {} — /tab close it first",
-                self.sessions[tab].name
-            );
+            self.flash = format!("session is open in tab {} — /tab close it first", tab + 1);
             return;
         }
         let Some(store) = self.store.as_ref() else {
             self.flash = "no session store (storageless)".to_string();
             return;
         };
+        let name = if pick.title.is_empty() {
+            &pick.preview
+        } else {
+            &pick.title
+        };
+        let name = crate::app::sanitize_text(&name.chars().take(40).collect::<String>());
         if store.delete_session(&pick.id) {
-            self.flash = format!("deleted session {}", short_id(&pick.id));
+            self.flash = format!("deleted \"{name}\"");
             self.sess_list.remove(self.sess_sel);
             self.sess_sel = self.sess_sel.min(self.sess_list.len().saturating_sub(1));
             if self.sess_list.is_empty() {
                 self.mode = Mode::Normal;
             }
         } else {
-            self.flash = format!("deleted nothing ({})", short_id(&pick.id));
+            self.flash = format!("could not delete \"{name}\"");
         }
     }
 
@@ -433,7 +435,8 @@ mod tests {
         assert!(old.iter().any(|l| l == "scratch"));
         assert!(store.load_transcript(&new_id).is_empty());
         assert!(app.sessions[0].remote_id.is_none());
-        assert_eq!(store.list_sessions("").len(), 2);
+        // The new, still-unused session stays out of `/sessions`.
+        assert_eq!(store.list_sessions("").len(), 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -637,12 +640,12 @@ mod tests {
         app.open_session_chooser(String::new());
         assert_eq!(app.mode, Mode::Sessions);
         app.delete_selected_session();
-        assert!(app.flash.contains("open in s1"));
+        assert!(app.flash.contains("open in tab 1"), "{}", app.flash);
         assert_eq!(app.sess_list.len(), 1, "guarded: files stay");
         // After closing the reference (fresh id), delete succeeds.
         app.sessions[0].store_id = Some("other".to_string());
         app.delete_selected_session();
-        assert!(app.flash.contains("deleted session"));
+        assert!(app.flash.starts_with("deleted \""), "{}", app.flash);
         assert!(app.sess_list.is_empty());
         assert_eq!(app.mode, Mode::Normal, "empty chooser closes");
         let store = app.store.as_ref().expect("store");
